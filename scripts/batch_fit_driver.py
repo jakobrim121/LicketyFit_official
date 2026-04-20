@@ -17,7 +17,7 @@ from iminuit import Minuit
 
 geometry_path = "/eos/user/j/jrimmer/Geometry"
 
-sys.path.insert(0, "./")
+
 sys.path.insert(0, "../LicketyFit")
 sys.path.insert(0, geometry_path)
 sys.path.insert(0, "../")
@@ -338,8 +338,8 @@ def evaluate_neg_log_likelihood(obs_pes, obs_ts, emitter, x0, y0, z0, cx, cy, le
     sigma_t0 = get_t0_prior_sigma(obs_pes, obs_ts)
     t0_penalty = abs(0.5 * (t0 / sigma_t0) ** 2)
 
-    return float(nll + t0_penalty)
-    #return float(nll)
+    # return float(nll + t0_penalty)
+    return float(nll)
 
 
 def select_best_initial_seed(obs_pes, obs_ts, init_param_sets):
@@ -620,7 +620,7 @@ def main():
             wcte_mapping[i][1] * 100 + wcte_mapping[i][2] - 1
         )
 
-    hall = Device.open_file(geometry_path + "../tables/wcte_bldg157.geo")
+    hall = Device.open_file(geometry_path + "../wcte_bldg157.geo")
     WCD = hall.wcds[0]
 
     emitter_model = Emitter(
