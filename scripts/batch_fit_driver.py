@@ -15,7 +15,7 @@ import multiprocessing as mp
 import numpy as np
 from iminuit import Minuit
 
-geometry_path = "/eos/user/j/jrimmer/Geometry"
+geometry_path = "/eos/user/j/jrimmer/Geometry/"
 
 
 sys.path.insert(0, "../LicketyFit")
@@ -620,7 +620,7 @@ def main():
             wcte_mapping[i][1] * 100 + wcte_mapping[i][2] - 1
         )
 
-    hall = Device.open_file(geometry_path + "../wcte_bldg157.geo")
+    hall = Device.open_file(geometry_path + "examples/wcte_bldg157.geo")
     WCD = hall.wcds[0]
 
     emitter_model = Emitter(

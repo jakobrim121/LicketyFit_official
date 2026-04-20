@@ -1,2 +1,8 @@
 tables/E_vs_dist.npy
 tables/E_vs_dist_cm.npy
+__pycache__/
+*.pyc
+*.pyo
+*.nbc
+*.nbi
+.sys.v#*
