@@ -52,7 +52,7 @@ NCALL_MIGRAD = 70000
 RUN = 1580
 BEAM_P = 280
 
-N_EVENTS = 30000
+N_EVENTS = 10000
 
 # =============================================================================
 # LIKELIHOOD TERM TOGGLES
@@ -69,7 +69,7 @@ N_EVENTS = 30000
 #   - If timing is enabled, t0 is left free.
 #   - USE_T0_PRIOR is optional and is only applied when timing is enabled.
 USE_CHARGE_LIKELIHOOD = True
-USE_TIMING_LIKELIHOOD = False
+USE_TIMING_LIKELIHOOD = True
 USE_T0_PRIOR = False
 
 if (not USE_CHARGE_LIKELIHOOD) and (not USE_TIMING_LIKELIHOOD):
@@ -87,10 +87,6 @@ else:
 
 
 
-# INPUT_FILE = (
-#     f"/eos/user/j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/"
-#     f"1kmu-_{ENERGY_TRUE}MeV_x0y424z0.npz"
-# )
 
 
 OUTPUT_FILE = (
@@ -108,13 +104,26 @@ OUTPUT_FILE = (
 # setting them to np.nan for PMTs outside the selected ring set.
 RING_MASK_MODE = "both"
 
+# Get the config file to mask out PMTs that are not in operation
+
+fname = '/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/production_v1_0/'+str(RUN)+'/WCTE_merged_production_R'+str(RUN)+'.root'
+with uproot.open(fname) as f:
+    
+    
+    t_c = f['Configuration']
+    arr_config = t_c.arrays(library="ak")
+
+GOOD_WCTE_PMTS = np.asarray(arr_config["good_wcte_pmts"][0], dtype=int)
+INACTIVE_SLOTS = [27, 32, 45, 74, 77, 79, 85, 91, 99,9, 67]
 
 
+GOOD_WCTE_PMTS_SET = set(np.asarray(GOOD_WCTE_PMTS, dtype=int).tolist())
+INACTIVE_SLOTS_SET = set(int(s) for s in INACTIVE_SLOTS)
 
 # =============================================================================
 # DETECTOR CONFIGURATION
 # =============================================================================
-INACTIVE_SLOTS = [27, 32, 45, 74, 77, 79, 85, 91, 99,9, 67]
+
 
 OUTER_RING = np.array([0, 7, 19, 34, 50, 66, 82, 83, 105, 94, 95, 71, 72, 56, 40, 24, 11, 3, 18])
 INNER_RING = np.array([1, 8, 35, 51, 67, 84, 69, 70, 55, 39, 23, 10, 2, 20, 36, 52, 68, 53, 54, 38, 22, 21, 37, 9])
@@ -264,60 +273,88 @@ def sim_to_event(
     n_earliest_for_t0=10,
 ):
     """
-    Convert one simulated event into the LicketyFit Event class.
+    Convert one data event into the LicketyFit Event class.
 
-    If shift_times=True, estimate the global event time offset using the median
-    of the TOF-corrected times from the 10 earliest hits.
+    Critical design:
+      - PMT statuses are fixed by the detector/run configuration.
+      - PMT statuses are NOT determined by which PMTs happened to have hits
+        in this individual event.
+      - Therefore obs_pes, obs_ts, P_LOCATIONS, DIRECTION_ZS, MPMT_SLOTS,
+        and RING_KEEP_MASK all have consistent lengths/orderings.
     """
-    slots = []
-    pmt_pos_ids = []
-    charges = []
-    times = []
     vw = 223.0598645833333  # mm/ns
 
-    # Convert WCSim PMT numbering into WCTE PMT numbering.
-    for i in range(len(sim_data[:, 0])):
-        sim_pmt = sim_data[i][0]
-        wcte_pmt = sim_pmt
-
-        slots.append(int(wcte_pmt / 100))
-        pmt_pos_ids.append(int(wcte_pmt % 100))
-        charges.append(float(sim_data[i][1]))
-        times.append(float(sim_data[i][2]))
-
     ev = Event(0, 0, n_mpmt_total)
-    ev.set_mpmt_status(list(range(n_mpmt_total)), True)
 
-    # Build the PMT activity pattern once for this event.
-    wcte_pmt_ids = []
+    # Start with everything off.
+    ev.set_mpmt_status(list(range(n_mpmt_total)), False)
 
-    for i_mpmt in range(n_mpmt_total):
-        if i_mpmt in INACTIVE_SLOTS:
-            ev.set_pmt_status(i_mpmt, list(range(ev.npmt_per_mpmt)), False)
-        else:
-            ev.set_pmt_status(i_mpmt, list(range(ev.npmt_per_mpmt)), True)
+    active_wcte_pmt_ids = []
 
-            for i_pmt in range(19):
-                wcte_pmt_ids.append(i_mpmt * 100 + i_pmt)
+    # ------------------------------------------------------------------
+    # Fixed detector/run PMT status pattern.
+    # This is independent of event hits.
+    # ------------------------------------------------------------------
+    for slot in range(n_mpmt_total):
 
-    # Fill the per-PMT hit times and charges.
-    for s, p, q, t in zip(slots, pmt_pos_ids, charges, times):
-        ev.hit_times[s][p].append(t)
-        ev.hit_charges[s][p].append(q)
+        if slot in INACTIVE_SLOTS_SET:
+            continue
 
-    # ------------------------------------------------------------
+        slot_has_good_pmt = False
+
+        for pmt_pos_id in range(ev.npmt_per_mpmt):
+            wcte_pmt = int(slot * 100 + pmt_pos_id)
+
+            if wcte_pmt in GOOD_WCTE_PMTS_SET:
+                ev.set_pmt_status(slot, [pmt_pos_id], True)
+                slot_has_good_pmt = True
+                active_wcte_pmt_ids.append(wcte_pmt)
+
+        if slot_has_good_pmt:
+            ev.set_mpmt_status([slot], True)
+
+    # ------------------------------------------------------------------
+    # Fill hits only if they belong to configured-good PMTs.
+    # ------------------------------------------------------------------
+    for i in range(len(sim_data[:, 0])):
+
+        wcte_pmt = int(sim_data[i, 0])
+
+        slot = int(wcte_pmt // 100)
+        pmt_pos_id = int(wcte_pmt % 100)
+
+        if slot < 0 or slot >= ev.n_mpmt:
+            continue
+
+        if pmt_pos_id < 0 or pmt_pos_id >= ev.npmt_per_mpmt:
+            continue
+
+        if not ev.mpmt_status[slot]:
+            continue
+
+        if not ev.pmt_status[slot][pmt_pos_id]:
+            continue
+
+        ev.hit_charges[slot][pmt_pos_id].append(float(sim_data[i, 1]))
+        ev.hit_times[slot][pmt_pos_id].append(float(sim_data[i, 2]))
+
+    # ------------------------------------------------------------------
     # TIME SHIFTING
-    # ------------------------------------------------------------
+    # ------------------------------------------------------------------
     if shift_times:
 
         bp_loc = np.array([0.0, 0.0, -1350.0])
-
         early_hits = []
 
-        # Collect all hit times, along with their TOF-corrected estimates
-        # of the particle start time at the beam pipe.
         for i_mpmt in range(ev.n_mpmt):
+
+            if not ev.mpmt_status[i_mpmt]:
+                continue
+
             for i_pmt in range(ev.npmt_per_mpmt):
+
+                if not ev.pmt_status[i_mpmt][i_pmt]:
+                    continue
 
                 if len(ev.hit_times[i_mpmt][i_pmt]) == 0:
                     continue
@@ -326,14 +363,6 @@ def sim_to_event(
                 r = np.linalg.norm(pmt_loc - bp_loc)
 
                 for t in ev.hit_times[i_mpmt][i_pmt]:
-
-                    # Estimate event start time:
-                    #
-                    # observed hit time = event start time + photon TOF
-                    #
-                    # so:
-                    #
-                    # event start time estimate = observed hit time - r / vw
                     t0_est = float(t) - r / vw
 
                     early_hits.append({
@@ -346,28 +375,23 @@ def sim_to_event(
 
         if len(early_hits) > 0:
 
-            # Sort by raw observed hit time.
             early_hits = sorted(early_hits, key=lambda x: x["time"])
 
-            # Use the 10 earliest hits, or fewer if the event has fewer hits.
             n_use = min(n_earliest_for_t0, len(early_hits))
             earliest_hits = early_hits[:n_use]
 
-            # Median of the TOF-corrected earliest hit times.
             time_offset = np.median([hit["t0_est"] for hit in earliest_hits])
 
-            # Shift all hit times so that the estimated particle start time
-            # at the beam pipe is approximately t = 0.
             for i_mpmt in range(ev.n_mpmt):
                 for i_pmt in range(ev.npmt_per_mpmt):
                     ev.hit_times[i_mpmt][i_pmt] = [
                         t - time_offset for t in ev.hit_times[i_mpmt][i_pmt]
                     ]
 
-            # Optional bookkeeping.
             ev.global_time_offset = time_offset
 
-    return ev, np.asarray(wcte_pmt_ids, dtype=int)
+    return ev, np.asarray(active_wcte_pmt_ids, dtype=int)
+
 
 
 def build_observables_from_event(ev, pe_scale=143):
@@ -924,15 +948,24 @@ def main():
         event = event[time_mask]
 
         ev, pmt_ids = sim_to_event(event, WCD, n_mpmt_total=106, pe_scale=143)
-
+        
         if P_LOCATIONS is None or DIRECTION_ZS is None:
-            # The PMT ordering is fixed, so the geometry and ring mask only need
-            # to be built once.
             P_LOCATIONS, DIRECTION_ZS, MPMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(ev, WCD, "est")
-            mpmt_ids = pmt_ids // 100
-            RING_KEEP_MASK = np.isin(mpmt_ids, ALL_RING)
+
+            MPMT_SLOTS = np.asarray(MPMT_SLOTS, dtype=int)
+            RING_KEEP_MASK = np.isin(MPMT_SLOTS, ALL_RING)
+
+#         if P_LOCATIONS is None or DIRECTION_ZS is None:
+#             # The PMT ordering is fixed, so the geometry and ring mask only need
+#             # to be built once.
+#             P_LOCATIONS, DIRECTION_ZS, MPMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(ev, WCD, "est")
+#             mpmt_ids = pmt_ids // 100
+#             RING_KEEP_MASK = np.isin(MPMT_SLOTS, ALL_RING)
+            
+            
 
         obs_pes, obs_ts = build_observables_from_event(ev, pe_scale=143)
+        
         obs_pes, obs_ts = apply_ring_mask_to_observables(
             obs_pes,
             obs_ts,
