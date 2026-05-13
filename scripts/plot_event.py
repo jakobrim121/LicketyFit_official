@@ -1,10 +1,10 @@
 import numpy as np
 import matplotlib
 import sys
-sys.path.insert(0, "../../event_display")
+sys.path.insert(0, "../event_display")
 from EventDisplay import EventDisplay
 
-sys.path.insert(0, "../../LicketyFit")
+sys.path.insert(0, "../LicketyFit")
 
 #sys.path.insert(0, "../../")
 #matplotlib.use('Agg')
