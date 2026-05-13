@@ -1,10 +1,28 @@
 import os
 from functools import lru_cache
-
+from pathlib import Path
 import numpy as np
 from numba import njit
-import pickle
 
+
+# # Directory containing this .py file
+# HERE = Path(__file__).resolve().parent
+
+# # Path to the directory containing the module you want to import
+# OTHER_MODULE_DIR = (HERE / "../LicketyFit").resolve()
+
+# if str(OTHER_MODULE_DIR) not in sys.path:
+#     sys.path.insert(0, str(OTHER_MODULE_DIR))
+    
+# OTHER_MODULE_DIR = (HERE / "../tables").resolve()
+
+# if str(OTHER_MODULE_DIR) not in sys.path:
+#     sys.path.insert(0, str(OTHER_MODULE_DIR))
+
+# OTHER_MODULE_DIR = (HERE / "../scripts").resolve()
+
+# if str(OTHER_MODULE_DIR) not in sys.path:
+#     sys.path.insert(0, str(OTHER_MODULE_DIR))
 
 # -----------------------------------------------------------------------------
 # Table loading
@@ -34,7 +52,7 @@ def _ensure_tables_loaded():
 
     cang_paths = [
         "../tables/mu_cAng_vs_E_n1344.npy",
-       # os.path.join(base_dir, "mu_cAng_vs_E_n1344.npy"),
+        os.path.join(base_dir, "mu_cAng_vs_E_n1344.npy"),
     ]
     evsd_paths = [
         "/eos/experiment/wcte/wcte_tests/mPMT_led_events/LicketyFit_stuff/E_vs_dist_cm.npy",
@@ -45,12 +63,6 @@ def _ensure_tables_loaded():
     rdep_paths = [
         "../tables/n_vs_E_vs_r_v1.npy",
     ]
-    sec_e_ang = [
-        "../tables/delta_e_angular_pdf_table.npz",
-    ]
-    rel_mpmt_eff_path = "../tables/rel_mpmt_eff.dict"
-    
-   
 
     c_ang_vs_E = _load_first_existing(cang_paths, allow_pickle=False)
     E_vs_dist = _load_first_existing(evsd_paths, allow_pickle=True)
@@ -61,16 +73,6 @@ def _ensure_tables_loaded():
     # single row from these tables, so loading them repeatedly is wasted work.
     energy_rows = [np.asarray(row[:, 1], dtype=np.float64) for row in E_vs_dist]
     distance_rows = [np.asarray(row[:, 0], dtype=np.float64) * 10.0 for row in E_vs_dist]
-    
-    with open(rel_mpmt_eff_path, 'rb') as f:
-        
-        rel_mpmt_eff = pickle.load(f)
-        
-    tri_exsitu = rel_mpmt_eff['tri_exsitu']
-    tri_insitu = rel_mpmt_eff['tri_insitu']
-    
-    wut_insitu = rel_mpmt_eff['wut_insitu']
-    wut_exsitu = rel_mpmt_eff['wut_exsitu']
 
     _TABLES = {
         "c_ang": np.asarray(c_ang_vs_E[:, 0], dtype=np.float64),
@@ -78,10 +80,6 @@ def _ensure_tables_loaded():
         "overall_distances": np.asarray(overall_distances, dtype=np.float64),
         "energy_rows": energy_rows,
         "distance_rows": distance_rows,
-        "tri_exsitu": tri_exsitu,
-        "tri_insitu": tri_insitu,
-        "wut_insitu": wut_insitu,
-        "wut_exsitu": wut_exsitu
 #         "r_rdep": np.asarray(rdep[:, 0], dtype=np.float64),
 #         "E_rdep": np.asarray(rdep[:, 1], dtype=np.float64),
 #         "n_rdep": np.asarray(rdep[:, 2], dtype=np.float64),
@@ -98,10 +96,6 @@ def get_energy_distance_tables():
     t = _ensure_tables_loaded()
     return t["overall_distances"], t["energy_rows"], t["distance_rows"]
 
-
-def get_rel_mpmt_eff_tables():
-    t = _ensure_tables_loaded()
-    return t["tri_exsitu"], t["tri_insitu"], t["wut_insitu"], t["wut_exsitu"]
 
 # def get_rdep_tables():
 #     t = _ensure_tables_loaded()
