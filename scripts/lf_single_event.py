@@ -69,7 +69,7 @@ DEFAULT_EXTRA_SYS_PATHS = [
     "../tables",
 
     DEFAULT_GEOMETRY_PATH,
-    "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/",
+    #"/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/",
     
 ]
 
