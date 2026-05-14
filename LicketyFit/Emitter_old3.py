@@ -1335,7 +1335,7 @@ class Emitter:
         # efficiency remain separate, as in the old model.
         # ------------------------------------------------------------------
         self.use_analytic_primary_ngeo = True
-        self.primary_ngeo_pmt_radius_mm = 60 #37.0
+        self.primary_ngeo_pmt_radius_mm = 37.0
         self.primary_ngeo_ref_energy_MeV = 304.0
         self.primary_ngeo_ref_r_mm = 1000.0
 
@@ -1375,7 +1375,7 @@ class Emitter:
         # ------------------------------------------------------------------
         self.delta_e_use_finite_disk_solid_angle = True
         self.delta_e_distance_ref_r_mm = 1000.0
-        self.delta_e_distance_pmt_radius_mm = 60 #37.0
+        self.delta_e_distance_pmt_radius_mm = 37.0
 
         # Kept only for backward-compatible fallback when
         self.delta_e_distance_power = 2
@@ -1389,53 +1389,12 @@ class Emitter:
         # After fixing the electron-energy dT integration and the forward-u
         # endpoint handling, the best low+high joint value was about 3.4.
         self.analytic_delta_scale = 1 #2.5
-        
-        # Try a small physical floor for PMTs
-        self.charge_floor_pe = 1e-4
-        
-        # Diagnostic only:
-        # Artificially shift secondary-electron emission points downstream
-        # along the muon direction. This tests whether collapsing electron
-        # range back to the muon point is causing the central-light deficit.
-        self.delta_e_test_forward_shift_mm = 0
-        
-        # ------------------------------------------------------------------
-        # DEBUG / DIAGNOSTIC ONLY:
-        # Reweight the refined secondary-electron angular table toward high u,
-        # while optionally preserving each K-row's total integrated yield.
-        #
-        # u_power = 0 -> original table
-        # u_power = 1 -> multiply by u
-        # u_power = 2 -> multiply by u^2
-        # u_power = 4 -> strongly forward-weighted
-        # ------------------------------------------------------------------
-        self.delta_e_debug_u_power = 0
-        self.delta_e_debug_u_min = 0.0
-        self.delta_e_debug_preserve_yield = True
-        
-        # ------------------------------------------------------------------
-        # Primary-muon cone softening.
-        #
-        # The collapse solver compares the PMT direction alpha(s) to the
-        # shrinking Cherenkov angle theta_c(s).  If there is no exact crossing,
-        # this width gives a soft nonzero contribution based on the closest
-        # angular mismatch:
-        #
-        #   exp[-0.5 * (min|alpha - theta_c| / sigma)^2]
-        #
-        # Units: radians.  Set to 0.0 to recover hard zero behavior for
-        # no-crossing PMTs.
-        # ------------------------------------------------------------------
-        self.primary_soft_cone_sigma_rad = 0.02
-        
-        
 
         # Match the original behavior: initialise beta from the length-dependent
         # lookup table rather than trusting the constructor beta argument.
         self.refresh_kinematics_from_length(self.length)
 
-        
-        
+
 
 
     def __repr__(self):
@@ -2246,71 +2205,11 @@ class Emitter:
         s_centers = np.ascontiguousarray(s_centers[valid_src], dtype=np.float64)
         ds_cm = np.ascontiguousarray(ds_cm[valid_src], dtype=np.float64)
         K_mu = np.ascontiguousarray(K_mu[valid_src], dtype=np.float64)
-        
-        # ------------------------------------------------------------
-        # DIAGNOSTIC ONLY:
-        # Keep the secondary-electron yield and muon-energy assignment
-        # fixed, but project the light as if it were emitted downstream
-        # from the parent muon point.
-        #
-        # This tests whether spatially collapsing electron range back to
-        # the muon point is responsible for underfilling the ring center.
-        # ------------------------------------------------------------
-#         delta_shift_mm = float(getattr(self, "delta_e_test_forward_shift_mm", 0.0))
-#         s_centers_for_projection = np.ascontiguousarray(
-#             s_centers + delta_shift_mm,
-#             dtype=np.float64,
-#         )
-        
-        ###
-        
 
         K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n)
-       
         K_grid = np.ascontiguousarray(K_grid, dtype=np.float64)
         u_grid = np.ascontiguousarray(u_grid, dtype=np.float64)
         table = np.ascontiguousarray(table, dtype=np.float64)
-        
-        
-        # ------------------------------------------------------------------
-        # DEBUG / DIAGNOSTIC ONLY:
-        # Modify the refined secondary-electron angular table shape.
-        # This tests whether the electron light is too broad in u.
-        #
-        # Important:
-        #   If delta_e_debug_preserve_yield=True, each K row is renormalized so
-        #   the total secondary-electron yield S_delta(K) stays approximately fixed.
-        #   Therefore this tests angular broadness, not total electron intensity.
-        # ------------------------------------------------------------------
-        u_power = float(getattr(self, "delta_e_debug_u_power", 0.0))
-        u_min = float(getattr(self, "delta_e_debug_u_min", 0.0))
-        preserve_yield = bool(getattr(self, "delta_e_debug_preserve_yield", True))
-
-        if (u_power != 0.0) or (u_min > 0.0):
-            table_mod = np.array(table, dtype=np.float64, copy=True)
-
-            du = float(u_grid[1] - u_grid[0])
-            row_yield_before = np.sum(table_mod, axis=1) * du
-
-            if u_min > 0.0:
-                table_mod[:, u_grid < u_min] = 0.0
-
-            if u_power != 0.0:
-                weights = np.clip(u_grid, 0.0, 1.0) ** u_power
-                table_mod *= weights[None, :]
-
-            if preserve_yield:
-                row_yield_after = np.sum(table_mod, axis=1) * du
-                renorm = np.divide(
-                    row_yield_before,
-                    row_yield_after,
-                    out=np.ones_like(row_yield_before),
-                    where=(row_yield_after > 0.0) & np.isfinite(row_yield_after),
-                )
-                table_mod *= renorm[:, None]
-
-            table = table_mod
-        ###
 
         if mpmt_types is None:
             mpmt_codes = np.full(n_pmts, -1, dtype=np.int8)
@@ -2415,7 +2314,7 @@ class Emitter:
                 s_max_mm=self.length,
                 theta_c_func=theta_c_func,
                 n_scan=150,
-                near_cross_tol=float(getattr(self, "primary_soft_cone_sigma_rad", 0.03)),#0.02,
+                near_cross_tol=0.02,
             )
 
             scale[idx] = scale_sub
@@ -2510,9 +2409,7 @@ class Emitter:
         raw_mean = float(np.mean(mean_pes_raw))
         norm = obs_mean / raw_mean if raw_mean > 0.0 else 1.0
         mean_pes = mean_pes_raw * norm
-        #mean_pes[mean_pes < 1e-3] = 0.0
-        # Test a small physical floor 
-        mean_pes = np.maximum(mean_pes, self.charge_floor_pe)
+        mean_pes[mean_pes < 1e-3] = 0.0
 
         # Expected time model.
         #

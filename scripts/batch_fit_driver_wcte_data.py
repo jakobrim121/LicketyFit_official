@@ -17,11 +17,10 @@ from iminuit import Minuit
 
 geometry_path = "/eos/user/j/jrimmer/Geometry"
 
-sys.path.insert(0, "/eos/user/j/jrimmer/SWAN_projects/beam/LicketFit2/LicketyFit")
-sys.path.insert(0, "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1")
-sys.path.insert(0, "../../LicketyFit")
+sys.path.insert(0, "../LicketyFit")
+sys.path.insert(0, "../scripts")
+sys.path.insert(0, "../tab;es")
 sys.path.insert(0, geometry_path)
-sys.path.insert(0, "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/")
 sys.path.insert(0, "../")
 sys.path.insert(0, "../../")
 
@@ -161,28 +160,28 @@ INIT_PARAM_SETS = [
     {
         "x0": 0.0,
         "y0": 0.0,
-        "z0": -1500,
+        "z0": -1300,
         "cx": 0.0,
         "cy": 0.0,
-        "length": 1000.0,
+        "length": 500.0,
         "t0": 0,
     },
     {
         "x0": 0.0,
         "y0": 0.0,
-        "z0": 0.0,
+        "z0": -1500,
         "cx": 0.0,
         "cy": 0.0,
-        "length": 500.0,
+        "length": 700.0,
         "t0": 0,
     },
     {
         "x0": 0.0,
         "y0": 0,
-        "z0": 1000,
+        "z0": -1000,
         "cx": 0.0,
         "cy": 0.0,
-        "length": 500.0,
+        "length": 1000.0,
         "t0": 0,
     },
 ]
@@ -217,11 +216,11 @@ OBS_PES_ALL = None
 OBS_TS_ALL = None
 
 # Get the mPMT-by-mPMT dictionary info
-with open('/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/other_mpmt_info_v2.dict', 'rb') as f:
+with open('../tables/other_mpmt_info_v2.dict', 'rb') as f:
     mpmt_info = pickle.load(f)
     
 # Get mPMT slot by slot efficiency correction
-rel_mpmt_eff_path = "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/rel_mpmt_eff.dict"
+rel_mpmt_eff_path = "../tables/rel_mpmt_eff.dict"
 with open(rel_mpmt_eff_path, 'rb') as f:
         
     rel_mpmt_eff = pickle.load(f)
@@ -911,12 +910,12 @@ def main():
         18.0,
     )
     
-    DELTA_E_ANGULAR_PDF_PATH = (
-        "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/"
-        "delta_e_angular_pdf_table.npz"
-    )
+#     DELTA_E_ANGULAR_PDF_PATH = (
+#         "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/"
+#         "delta_e_angular_pdf_table.npz"
+#     )
 
-    emitter_model.load_delta_e_angular_pdf_table(DELTA_E_ANGULAR_PDF_PATH)
+#     emitter_model.load_delta_e_angular_pdf_table(DELTA_E_ANGULAR_PDF_PATH)
     
     #self.load_delta_e_angular_pdf_table("delta_e_angular_pdf_table.npz")
     PMT_MODEL = PMT(1.0, 0.3, 1.0, 40.0, 0.2, 0.0)

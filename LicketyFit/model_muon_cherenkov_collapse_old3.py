@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-import math
+
 import numpy as np
 from numba import njit
 import pickle
@@ -321,68 +321,27 @@ def _find_scale_kernel(
                 if af < min_abs_f:
                     min_abs_f = af
                     min_idx = j
-                    
-                    
+
         if found_crossing:
             sb = s_grid[cross_idx]
             eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
             Eb = energy_row[eidx]
-
             s_b[i] = sb
             E_b[i] = Eb
-
-            # Normal primary crossing: use Frank--Tamm scale at the
-            # collapse/crossing energy.
             scale[i] = _scale_from_energy_scalar(Eb)
-
         else:
-            # No exact crossing.  The old code gave either:
-            #   - scale = 1.0 for a very early near crossing, or
-            #   - scale = 0.0 otherwise.
-            #
-            # For low-energy tracks this is too hard-edged.  Instead, assign
-            # a soft cone-mismatch weight based on the closest approach to the
-            # Cherenkov cone:
-            #
-            #   soft = exp[-0.5 * (min |alpha - theta_c| / sigma)^2]
-            #
-            # Here near_cross_tol is reinterpreted as sigma_theta [rad].
-            # This keeps the same public function signature.
             sb = s_grid[min_idx]
-            eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-            Eb = energy_row[eidx]
+            frac_along = (sb - s_a_mm) / denom
 
-            s_b[i] = sb
-            E_b[i] = Eb
-
-            sigma_theta = near_cross_tol
-            if sigma_theta <= 0.0:
-                scale[i] = 0.0
+            if (min_abs_f < near_cross_tol) and (frac_along < 0.3):
+                eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
+                Eb = energy_row[eidx]
+                s_b[i] = sb
+                E_b[i] = Eb
+                scale[i] = 1.0
             else:
-                ft_scale = _scale_from_energy_scalar(Eb)
-                soft = math.exp(-0.5 * (min_abs_f / sigma_theta) * (min_abs_f / sigma_theta))
-                scale[i] = ft_scale * soft
-
-#         if found_crossing:
-#             sb = s_grid[cross_idx]
-#             eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-#             Eb = energy_row[eidx]
-#             s_b[i] = sb
-#             E_b[i] = Eb
-#             scale[i] = _scale_from_energy_scalar(Eb)
-#         else:
-#             sb = s_grid[min_idx]
-#             frac_along = (sb - s_a_mm) / denom
-
-#             if (min_abs_f < near_cross_tol) and (frac_along < 0.3):
-#                 eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-#                 Eb = energy_row[eidx]
-#                 s_b[i] = sb
-#                 E_b[i] = Eb
-#                 scale[i] = 1.0
-#             else:
-#                 E_b[i] = energy_row[0]
-#                 scale[i] = 0.0
+                E_b[i] = energy_row[0]
+                scale[i] = 0.0
 
     return scale, s_b, E_b
 
@@ -395,7 +354,7 @@ def find_scale_for_pmts(
     theta_c_func,
     mpmt_bool=False,
     n_scan=150,
-    near_cross_tol=0.03,
+    near_cross_tol=0.02,
 ):
     """
     Fast Cherenkov-cone-collapse solver for many PMTs.
@@ -457,25 +416,9 @@ def find_scale_for_pmts(
 
     # Preserve the original table lookup rule used for theta_c_grid:
     # searchsorted + clipping, without later nearest-neighbour refinement.
-#     ds_mm = s_grid - float(s_a_mm)
-#     idx = np.searchsorted(dist_row, ds_mm)
-#     idx = np.clip(idx, 1, dist_row.size - 1)
-#     E_grid = energy_row[idx]
-#     E_grid = np.maximum(E_grid, 52.5)
-
-    # Nearest-neighbour lookup for theta_c_grid energy.
-    # searchsorted returns the right-neighbour index; we check both neighbours
-    # and take whichever dist_row entry is closer, matching the logic in
-    # _nearest_index_1d. The previous clip-to-right-neighbour systematically
-    # assigned every scan point the energy of the next step along the track
-    # (i.e. slightly too low), which biased theta_c downward and pushed the
-    # fitted length in the positive direction.
     ds_mm = s_grid - float(s_a_mm)
     idx = np.searchsorted(dist_row, ds_mm)
-    idx_right = np.clip(idx, 0, dist_row.size - 1)
-    idx_left  = np.clip(idx - 1, 0, dist_row.size - 1)
-    use_left  = (ds_mm - dist_row[idx_left]) <= (dist_row[idx_right] - ds_mm)
-    idx       = np.where(use_left, idx_left, idx_right)
+    idx = np.clip(idx, 1, dist_row.size - 1)
     E_grid = energy_row[idx]
     E_grid = np.maximum(E_grid, 52.5)
 
