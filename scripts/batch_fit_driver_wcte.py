@@ -2088,7 +2088,9 @@ def main():
     OBS_PES_ALL = obs_pes_all
     OBS_TS_ALL = obs_ts_all
     MPMT_SLOTS_ALL = mpmt_slots_all
+    
     MPMT_TYPE_CODES_ALL = [get_mpmt_slot_type_codes(slots) for slots in MPMT_SLOTS_ALL]
+    print(MPMT_TYPE_CODES_ALL)
     tot_events = len(OBS_PES_ALL)
 
     print("Computing truth FCNs...")
