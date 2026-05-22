@@ -1286,19 +1286,19 @@ class Emitter:
         self._last_geometry_cache_key = None
         self._last_mpmt_type_codes = None
 
-        self.muon_subthreshold_range_mm = 120 # How far muon travels after it drops below cherenkov threshold (in mm)
+        self.muon_subthreshold_range_mm = 150 # How far muon travels after it drops below cherenkov threshold (in mm)
         self.enable_delta_e = True
-        self.delta_e_scale = 1
+        self.delta_e_scale = 3
 
 
 
         # Number of source bins along the above-threshold, Cherenkov-visible muon path.
-        self.n_delta_steps = 5
+        self.n_delta_steps = 20
 
         # Force the below-threshold tail to be sampled separately.
         # This prevents the 110 mm tail from disappearing when n_delta_steps is small.
         self.delta_e_tail_step_mm = 20.0
-        self.delta_e_tail_min_steps = 3
+        self.delta_e_tail_min_steps = 10
 
         # ------------------------------------------------------------------
         # Secondary-electron timing model.
@@ -1391,7 +1391,7 @@ class Emitter:
         self.analytic_delta_scale = 1 #2.5
         
         # Try a small physical floor for PMTs
-        self.charge_floor_pe = 1e-4
+        self.charge_floor_pe = 0
         
         # Diagnostic only:
         # Artificially shift secondary-electron emission points downstream
@@ -1409,7 +1409,7 @@ class Emitter:
         # u_power = 2 -> multiply by u^2
         # u_power = 4 -> strongly forward-weighted
         # ------------------------------------------------------------------
-        self.delta_e_debug_u_power = 0
+        self.delta_e_debug_u_power = 0.5
         self.delta_e_debug_u_min = 0.0
         self.delta_e_debug_preserve_yield = True
         
@@ -2374,7 +2374,7 @@ class Emitter:
         The heavy cone-collapse work is delegated to the optimized solver in
         model_muon_cherenkov_collapse.py.
         """
-        pmt_radius = _get_pmt_radius_cached(wcd)
+        pmt_radius = _get_pmt_radius_cached(wcd) + 20 # Add additional 20mm for reflector area
 
         p_locations = np.asarray(p_locations, dtype=np.float64)
         direction_zs = np.asarray(direction_zs, dtype=np.float64)
