@@ -1,16 +1,114 @@
-import os
-from functools import lru_cache
+"""
+model_muon_cherenkov_collapse.py
+
+Particle-aware Cherenkov-cone collapse helpers.
+
+This file keeps the historical module name so existing imports continue to work,
+but it no longer assumes the primary track is a muon.  Use set_active_particle()
+or pass particle=... into find_scale_for_pmts() to choose between:
+
+    muon, pion, kaon, proton
+
+Range tables are expected to use the same format as your original muon tables.
+For non-muon particles the default filenames are:
+
+    E_vs_dist_cm_pion.npy       overall_distances_cm_pion.npy
+    E_vs_dist_cm_kaon.npy       overall_distances_cm_kaon.npy
+    E_vs_dist_cm_proton.npy     overall_distances_cm_proton.npy
+
+The old muon filenames E_vs_dist_cm.npy and overall_distances_cm.npy are still
+accepted as fallbacks.
+"""
+
+from __future__ import annotations
+
 import math
+import os
+import pickle
+from functools import lru_cache
+from pathlib import Path
+
 import numpy as np
 from numba import njit
-import pickle
+
+
+# -----------------------------------------------------------------------------
+# Particle definitions
+# -----------------------------------------------------------------------------
+PARTICLE_ALIASES = {
+    "mu": "muon",
+    "mu-": "muon",
+    "mu+": "muon",
+    "muon": "muon",
+    "pi": "pion",
+    "pi-": "pion",
+    "pi+": "pion",
+    "pion": "pion",
+    "k": "kaon",
+    "k-": "kaon",
+    "k+": "kaon",
+    "kaon": "kaon",
+    "p": "proton",
+    "p+": "proton",
+    "proton": "proton",
+}
+
+PARTICLE_MASS_MEV = {
+    "muon": 105.6583755,
+    "pion": 139.57039,
+    "kaon": 493.677,
+    "proton": 938.27208816,
+}
+
+_ACTIVE_PARTICLE = "muon"
+_TABLES_BY_PARTICLE = {}
+_REL_MPMT_EFF_CACHE = None
+
+
+def canonical_particle_name(particle: str | None = None) -> str:
+    if particle is None:
+        return _ACTIVE_PARTICLE
+    key = str(particle).strip().lower()
+    if key not in PARTICLE_ALIASES:
+        raise ValueError(
+            f"Unknown particle {particle!r}. Use one of: "
+            f"{', '.join(sorted(PARTICLE_ALIASES))}"
+        )
+    return PARTICLE_ALIASES[key]
+
+
+def set_active_particle(particle: str) -> str:
+    """
+    Set the process-wide default particle used by legacy calls.
+
+    The batch driver calls this once before constructing the Emitter template.
+    New code should prefer passing particle=... explicitly where available.
+    """
+    global _ACTIVE_PARTICLE
+    _ACTIVE_PARTICLE = canonical_particle_name(particle)
+    return _ACTIVE_PARTICLE
+
+
+def get_active_particle() -> str:
+    return _ACTIVE_PARTICLE
+
+
+def particle_mass_mev(particle: str | None = None) -> float:
+    return float(PARTICLE_MASS_MEV[canonical_particle_name(particle)])
+
+
+def cherenkov_threshold_kinetic_mev(particle_or_mass, n: float = 1.344) -> float:
+    if isinstance(particle_or_mass, str) or particle_or_mass is None:
+        mass = particle_mass_mev(particle_or_mass)
+    else:
+        mass = float(particle_or_mass)
+    beta_thr = 1.0 / float(n)
+    gamma_thr = 1.0 / math.sqrt(1.0 - beta_thr * beta_thr)
+    return float(mass * (gamma_thr - 1.0))
 
 
 # -----------------------------------------------------------------------------
 # Table loading
-# -----------------------------------------------------------------------------
-# These files live in the user's normal CERN environment. The helper below also
-# allows local fallbacks so this module can still be imported outside that setup.
 # -----------------------------------------------------------------------------
 def _load_first_existing(paths, *, allow_pickle=False):
     for path in paths:
@@ -22,114 +120,216 @@ def _load_first_existing(paths, *, allow_pickle=False):
     )
 
 
-_TABLES = None
+def _table_dirs():
+    """Return table search directories, preferring this self-contained checkout.
+
+    Expected layout:
+        LF_multiParticles/
+          LicketyFit/
+          scripts/
+          tables/
+
+    You can override or prepend table directories with LF_TABLE_DIR, using
+    os.pathsep-separated entries if needed.
+    """
+    module_dir = Path(__file__).resolve().parent
+    project_root = module_dir.parent
+
+    dirs = []
+    for env_name in ("LF_TABLE_DIR", "LF_MULTIPARTICLES_TABLE_DIR"):
+        env = os.environ.get(env_name)
+        if env:
+            dirs.extend([d for d in env.split(os.pathsep) if d])
+
+    dirs.extend([
+        str(project_root / "tables"),
+        str(module_dir / "tables"),
+        str(Path.cwd() / "tables"),
+        str(module_dir),
+        str(Path.cwd()),
+    ])
+
+    # Preserve old CERN locations as last-resort fallbacks only.
+    dirs.extend([
+        "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables",
+        "/eos/experiment/wcte/wcte_tests/mPMT_led_events/LicketyFit_stuff",
+    ])
+
+    unique = []
+    seen = set()
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
 
 
-def _ensure_tables_loaded():
-    global _TABLES
-    if _TABLES is not None:
-        return _TABLES
+def _candidate_paths(filename):
+    return [os.path.join(d, filename) for d in _table_dirs()]
 
-    base_dir = os.path.dirname(__file__)
 
-    cang_paths = [
-        "../tables/mu_cAng_vs_E_n1344.npy",
-       # os.path.join(base_dir, "mu_cAng_vs_E_n1344.npy"),
-    ]
-    evsd_paths = [
-        "/eos/experiment/wcte/wcte_tests/mPMT_led_events/LicketyFit_stuff/E_vs_dist_cm.npy",
-    ]
-    odist_paths = [
-        "../tables/overall_distances_cm.npy",
-    ]
-    rdep_paths = [
-        "../tables/n_vs_E_vs_r_v1.npy",
-    ]
-    sec_e_ang = [
-        "../tables/delta_e_angular_pdf_table.npz",
-    ]
-    rel_mpmt_eff_path = "../tables/rel_mpmt_eff.dict"
-    
-   
+def _load_rel_mpmt_eff_tables():
+    global _REL_MPMT_EFF_CACHE
+    if _REL_MPMT_EFF_CACHE is not None:
+        return _REL_MPMT_EFF_CACHE
 
-    c_ang_vs_E = _load_first_existing(cang_paths, allow_pickle=False)
+    candidates = _candidate_paths("rel_mpmt_eff.dict")
+    path = None
+    for p in candidates:
+        if os.path.exists(p):
+            path = p
+            break
+    if path is None:
+        # Self-contained WCSim/design fits do not need real-data relative mPMT
+        # efficiency corrections.  Use unity curves so imports and particle
+        # table loading work even when calibration dictionaries are absent.
+        unity = np.ones(200, dtype=np.float64)
+        _REL_MPMT_EFF_CACHE = (unity, unity, unity, unity)
+        return _REL_MPMT_EFF_CACHE
+
+    with open(path, "rb") as f:
+        rel_mpmt_eff = pickle.load(f)
+
+    _REL_MPMT_EFF_CACHE = (
+        np.asarray(rel_mpmt_eff["tri_exsitu"], dtype=np.float64),
+        np.asarray(rel_mpmt_eff["tri_insitu"], dtype=np.float64),
+        np.asarray(rel_mpmt_eff["wut_insitu"], dtype=np.float64),
+        np.asarray(rel_mpmt_eff["wut_exsitu"], dtype=np.float64),
+    )
+    return _REL_MPMT_EFF_CACHE
+
+
+def _load_energy_distance_arrays(particle: str):
+    pname = canonical_particle_name(particle)
+
+    evsd_paths = _candidate_paths(f"E_vs_dist_cm_{pname}.npy")
+    overall_paths = _candidate_paths(f"overall_distances_cm_{pname}.npy")
+
+    # Backward-compatible fallback for the old muon table names.
+    if pname == "muon":
+        evsd_paths += _candidate_paths("E_vs_dist_cm.npy")
+        overall_paths += _candidate_paths("overall_distances_cm.npy")
+
     E_vs_dist = _load_first_existing(evsd_paths, allow_pickle=True)
-    overall_distances = _load_first_existing(odist_paths, allow_pickle=False) * 10.0
-    #rdep = _load_first_existing(rdep_paths, allow_pickle=False)
+    overall_distances = _load_first_existing(overall_paths, allow_pickle=False) * 10.0
 
-    # Store the jagged lookup rows exactly once. The fit repeatedly picks a
-    # single row from these tables, so loading them repeatedly is wasted work.
     energy_rows = [np.asarray(row[:, 1], dtype=np.float64) for row in E_vs_dist]
     distance_rows = [np.asarray(row[:, 0], dtype=np.float64) * 10.0 for row in E_vs_dist]
-    
-    with open(rel_mpmt_eff_path, 'rb') as f:
-        
-        rel_mpmt_eff = pickle.load(f)
-        
-    tri_exsitu = rel_mpmt_eff['tri_exsitu']
-    tri_insitu = rel_mpmt_eff['tri_insitu']
-    
-    wut_insitu = rel_mpmt_eff['wut_insitu']
-    wut_exsitu = rel_mpmt_eff['wut_exsitu']
 
-    _TABLES = {
-        "c_ang": np.asarray(c_ang_vs_E[:, 0], dtype=np.float64),
-        "energy_for_angle": np.asarray(c_ang_vs_E[:, 1], dtype=np.float64),
+    return np.asarray(overall_distances, dtype=np.float64), energy_rows, distance_rows
+
+
+def _analytic_cerenkov_angle_table(particle: str, n: float = 1.344):
+    mass = particle_mass_mev(particle)
+    eth = cherenkov_threshold_kinetic_mev(mass, n=n)
+
+    # Start slightly below threshold so interpolation safely returns 0 there.
+    e_min = max(0.0, eth - 5.0)
+    e_max = 5000.0
+    energy = np.linspace(e_min, e_max, 20000, dtype=np.float64)
+
+    gamma = 1.0 + energy / mass
+    beta2 = 1.0 - 1.0 / np.maximum(gamma, 1.0) ** 2
+    beta2 = np.clip(beta2, 0.0, None)
+    beta = np.sqrt(beta2)
+
+    angles = np.zeros_like(energy)
+    above = n * beta > 1.0
+    angles[above] = np.arccos(np.clip(1.0 / (n * beta[above]), -1.0, 1.0))
+    return angles, energy
+
+
+def _load_cerenkov_angle_table(particle: str):
+    pname = canonical_particle_name(particle)
+
+    # Preserve the original muon angle table if it exists; otherwise all
+    # particles can use the analytic mass-based table.
+    if pname == "muon":
+        cang_paths = [
+            "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/mu_cAng_vs_E_n1344.npy",
+            *(_candidate_paths("mu_cAng_vs_E_n1344.npy")),
+        ]
+        for path in cang_paths:
+            if path and os.path.exists(path):
+                c_ang_vs_E = np.load(path, allow_pickle=False)
+                angles = np.asarray(c_ang_vs_E[:, 0], dtype=np.float64)
+                energy = np.asarray(c_ang_vs_E[:, 1], dtype=np.float64)
+                # Original table has nan below threshold. Replace with zero.
+                angles = np.where(np.isfinite(angles), angles, 0.0)
+                return angles, energy
+
+    return _analytic_cerenkov_angle_table(pname)
+
+
+def _ensure_tables_loaded(particle: str | None = None):
+    pname = canonical_particle_name(particle)
+    cached = _TABLES_BY_PARTICLE.get(pname)
+    if cached is not None:
+        return cached
+
+    c_ang, energy_for_angle = _load_cerenkov_angle_table(pname)
+    overall_distances, energy_rows, distance_rows = _load_energy_distance_arrays(pname)
+    tri_exsitu, tri_insitu, wut_insitu, wut_exsitu = _load_rel_mpmt_eff_tables()
+
+    cached = {
+        "particle": pname,
+        "mass_mev": particle_mass_mev(pname),
+        "threshold_mev": cherenkov_threshold_kinetic_mev(pname),
+        "c_ang": np.asarray(c_ang, dtype=np.float64),
+        "energy_for_angle": np.asarray(energy_for_angle, dtype=np.float64),
         "overall_distances": np.asarray(overall_distances, dtype=np.float64),
         "energy_rows": energy_rows,
         "distance_rows": distance_rows,
         "tri_exsitu": tri_exsitu,
         "tri_insitu": tri_insitu,
         "wut_insitu": wut_insitu,
-        "wut_exsitu": wut_exsitu
-#         "r_rdep": np.asarray(rdep[:, 0], dtype=np.float64),
-#         "E_rdep": np.asarray(rdep[:, 1], dtype=np.float64),
-#         "n_rdep": np.asarray(rdep[:, 2], dtype=np.float64),
+        "wut_exsitu": wut_exsitu,
     }
-    return _TABLES
+    _TABLES_BY_PARTICLE[pname] = cached
+    return cached
 
 
-def get_cerenkov_angle_table():
-    t = _ensure_tables_loaded()
+def get_cerenkov_angle_table(particle: str | None = None):
+    t = _ensure_tables_loaded(particle)
     return t["c_ang"], t["energy_for_angle"]
 
 
-def get_energy_distance_tables():
-    t = _ensure_tables_loaded()
+def get_energy_distance_tables(particle: str | None = None):
+    t = _ensure_tables_loaded(particle)
     return t["overall_distances"], t["energy_rows"], t["distance_rows"]
 
 
 def get_rel_mpmt_eff_tables():
-    t = _ensure_tables_loaded()
-    return t["tri_exsitu"], t["tri_insitu"], t["wut_insitu"], t["wut_exsitu"]
-
-# def get_rdep_tables():
-#     t = _ensure_tables_loaded()
-#     return t["r_rdep"], t["E_rdep"], t["n_rdep"]
+    return _load_rel_mpmt_eff_tables()
 
 
 # -----------------------------------------------------------------------------
 # Physics helpers
 # -----------------------------------------------------------------------------
-def cherenkov_scale_muon_water(T_MeV, n=1.344, hard_saturate_above_MeV=None):
+def cherenkov_scale_particle_water(
+    T_MeV,
+    particle: str | None = None,
+    *,
+    mass_mev: float | None = None,
+    n: float = 1.344,
+    hard_saturate_above_MeV=None,
+):
     """
-    Dimensionless Cherenkov light-yield scale factor for a muon in water.
-
-    This matches the original Frank-Tamm-based logic, but keeps the code compact
-    and vectorized.
+    Dimensionless Frank-Tamm light-yield scale for a singly charged particle.
     """
-    m_mu = 105.6583755  # MeV/c^2
+    if mass_mev is None:
+        mass_mev = particle_mass_mev(particle)
 
     T = np.asarray(T_MeV, dtype=np.float64)
-    gamma = (T + m_mu) / m_mu
-    beta2 = 1.0 - 1.0 / gamma**2
+    gamma = 1.0 + T / float(mass_mev)
+    beta2 = 1.0 - 1.0 / np.maximum(gamma, 1.0) ** 2
     beta2 = np.clip(beta2, 0.0, None)
 
-    ft = 1.0 - 1.0 / (beta2 * n**2)
-    ft_inf = 1.0 - 1.0 / (n**2)
+    ft = 1.0 - 1.0 / (np.maximum(beta2, 1e-30) * n * n)
+    ft_inf = 1.0 - 1.0 / (n * n)
 
     scale = np.zeros_like(T, dtype=np.float64)
-    mask = beta2 * n**2 > 1.0
+    mask = beta2 * n * n > 1.0
     scale[mask] = ft[mask] / ft_inf
     scale = np.clip(scale, 0.0, 1.0)
 
@@ -137,6 +337,16 @@ def cherenkov_scale_muon_water(T_MeV, n=1.344, hard_saturate_above_MeV=None):
         scale[T >= hard_saturate_above_MeV] = 1.0
 
     return scale
+
+
+def cherenkov_scale_muon_water(T_MeV, n=1.344, hard_saturate_above_MeV=None):
+    """Backward-compatible wrapper."""
+    return cherenkov_scale_particle_water(
+        T_MeV,
+        "muon",
+        n=n,
+        hard_saturate_above_MeV=hard_saturate_above_MeV,
+    )
 
 
 @njit(cache=True)
@@ -167,9 +377,6 @@ def _theta_interp_numba(energy_grid, angle_grid, x):
 def theta_c_func(angles, E, E_k):
     """
     Vectorized Cherenkov-angle interpolation with no debug printing.
-
-    Returning clipped endpoint values is substantially cheaper than raising
-    exceptions inside a fit loop.
     """
     angles = np.asarray(angles, dtype=np.float64)
     E = np.asarray(E, dtype=np.float64)
@@ -196,9 +403,8 @@ def _nearest_index_1d(arr, x):
 
 
 @njit(cache=True)
-def _scale_from_energy_scalar(T_MeV, n=1.344):
-    m_mu = 105.6583755
-    gamma = (T_MeV + m_mu) / m_mu
+def _scale_from_energy_scalar(T_MeV, mass_mev, n):
+    gamma = 1.0 + T_MeV / mass_mev
     beta2 = 1.0 - 1.0 / (gamma * gamma)
     if beta2 < 0.0:
         beta2 = 0.0
@@ -229,12 +435,14 @@ def _find_scale_kernel(
     s_a_mm,
     s_max_mm,
     near_cross_tol,
+    particle_mass_mev,
+    n_water,
 ):
     """
-    Hybrid binary-search version.
+    Hybrid binary-search collapse solver.
 
-    It is exactly equivalent to the original linear scan in the no-cross case,
-    and only uses binary search when a genuine crossing exists.
+    It preserves your optimized crossing logic but uses a supplied particle mass
+    for the Frank-Tamm scale rather than a hard-coded muon mass.
     """
     n_pmts = pmt_pos.shape[0]
     n_scan = s_grid.size
@@ -247,10 +455,6 @@ def _find_scale_kernel(
     ty = track_dir[1]
     tz = track_dir[2]
 
-    denom = s_max_mm - s_a_mm
-    if denom <= 0.0:
-        denom = 1.0
-
     for i in range(n_pmts):
         wx = pmt_pos[i, 0] - start_pos[0]
         wy = pmt_pos[i, 1] - start_pos[1]
@@ -259,13 +463,11 @@ def _find_scale_kernel(
         w2 = wx * wx + wy * wy + wz * wz
         u0 = wx * tx + wy * ty + wz * tz
 
-        # Same geometry reduction as your original optimized kernel
         perp2 = w2 - u0 * u0
         if perp2 < 0.0:
             perp2 = 0.0
         perp = np.sqrt(perp2)
 
-        # Endpoints
         parallel_lo = u0 - s_grid[0]
         f_lo = np.arctan2(perp, parallel_lo) - theta_c_grid[0]
 
@@ -285,9 +487,6 @@ def _find_scale_kernel(
         found_crossing = False
         cross_idx = 0
 
-        # Match the original linear logic exactly:
-        # a crossing only exists if some later point goes from prev_f < 0 to f >= 0.
-        # Therefore f_lo >= 0 is NOT a valid crossing.
         if (n_scan >= 2) and (f_lo < 0.0) and (f_hi >= 0.0):
             lo = 0
             hi = n_scan - 1
@@ -307,13 +506,11 @@ def _find_scale_kernel(
                 else:
                     lo = mid
 
-            # hi is the first index with f >= 0, so preserve the original j-1 rule
             cross_idx = hi - 1
             if cross_idx < 0:
                 cross_idx = 0
             found_crossing = True
         else:
-            # No crossing case: preserve original behavior exactly by scanning all points
             for j in range(1, n_scan - 1):
                 parallel = u0 - s_grid[j]
                 f = np.arctan2(perp, parallel) - theta_c_grid[j]
@@ -321,8 +518,7 @@ def _find_scale_kernel(
                 if af < min_abs_f:
                     min_abs_f = af
                     min_idx = j
-                    
-                    
+
         if found_crossing:
             sb = s_grid[cross_idx]
             eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
@@ -330,24 +526,9 @@ def _find_scale_kernel(
 
             s_b[i] = sb
             E_b[i] = Eb
-
-            # Normal primary crossing: use Frank--Tamm scale at the
-            # collapse/crossing energy.
-            scale[i] = _scale_from_energy_scalar(Eb)
+            scale[i] = _scale_from_energy_scalar(Eb, particle_mass_mev, n_water)
 
         else:
-            # No exact crossing.  The old code gave either:
-            #   - scale = 1.0 for a very early near crossing, or
-            #   - scale = 0.0 otherwise.
-            #
-            # For low-energy tracks this is too hard-edged.  Instead, assign
-            # a soft cone-mismatch weight based on the closest approach to the
-            # Cherenkov cone:
-            #
-            #   soft = exp[-0.5 * (min |alpha - theta_c| / sigma)^2]
-            #
-            # Here near_cross_tol is reinterpreted as sigma_theta [rad].
-            # This keeps the same public function signature.
             sb = s_grid[min_idx]
             eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
             Eb = energy_row[eidx]
@@ -359,32 +540,12 @@ def _find_scale_kernel(
             if sigma_theta <= 0.0:
                 scale[i] = 0.0
             else:
-                ft_scale = _scale_from_energy_scalar(Eb)
+                ft_scale = _scale_from_energy_scalar(Eb, particle_mass_mev, n_water)
                 soft = math.exp(-0.5 * (min_abs_f / sigma_theta) * (min_abs_f / sigma_theta))
                 scale[i] = ft_scale * soft
 
-#         if found_crossing:
-#             sb = s_grid[cross_idx]
-#             eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-#             Eb = energy_row[eidx]
-#             s_b[i] = sb
-#             E_b[i] = Eb
-#             scale[i] = _scale_from_energy_scalar(Eb)
-#         else:
-#             sb = s_grid[min_idx]
-#             frac_along = (sb - s_a_mm) / denom
-
-#             if (min_abs_f < near_cross_tol) and (frac_along < 0.3):
-#                 eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-#                 Eb = energy_row[eidx]
-#                 s_b[i] = sb
-#                 E_b[i] = Eb
-#                 scale[i] = 1.0
-#             else:
-#                 E_b[i] = energy_row[0]
-#                 scale[i] = 0.0
-
     return scale, s_b, E_b
+
 
 def find_scale_for_pmts(
     pmt_pos,
@@ -395,89 +556,63 @@ def find_scale_for_pmts(
     theta_c_func,
     mpmt_bool=False,
     n_scan=150,
-    near_cross_tol=0.03,
+    near_cross_tol=0.02,
+    particle: str | None = None,
+    particle_mass: float | None = None,
+    n_water: float = 1.344,
+    range_stop_mm: float | None = None,
 ):
     """
     Fast Cherenkov-cone-collapse solver for many PMTs.
 
-    This is a drop-in replacement for the original function. The public argument
-    order and names are preserved exactly, while the internal crossing search is
-    accelerated.
-
-    Parameters
-    ----------
-    pmt_pos : array-like, shape (N, 3)
-        PMT positions.
-    start_pos : array-like, shape (3,)
-        Start position of the currently visible track segment.
-    track_dir : array-like, shape (3,)
-        Unit direction vector of the track.
-    s_a_mm : float
-        Start of the scan interval along the track.
-    s_max_mm : float
-        End of the scan interval along the track.
-    theta_c_func : callable
-        Retained for API compatibility. The compiled helper below performs the
-        interpolation directly.
-    mpmt_bool : bool, optional
-        Retained for API compatibility/debug compatibility.
-    n_scan : int, optional
-        Number of scan points.
-    near_cross_tol : float, optional
-        Tolerance for the no-crossing near-match fallback.
-
-    Returns
-    -------
-    scale : ndarray, shape (N,)
-        Cherenkov light-yield scale factors.
-    s_b : ndarray, shape (N,)
-        Collapse-adjusted emission points.
-    E_b : ndarray, shape (N,)
-        Corresponding muon kinetic energies.
+    The original argument order is preserved.  New optional arguments:
+      particle      : "muon", "pion", "kaon", or "proton"
+      particle_mass : override mass in MeV/c^2
+      n_water       : refractive index
+      range_stop_mm : dE/dx range-to-threshold used for K(s).  If omitted,
+                      the old behavior uses s_max_mm for both visible length
+                      and range-to-threshold.
     """
     del theta_c_func  # kept only for drop-in API compatibility
 
-    tables = _ensure_tables_loaded()
+    pname = canonical_particle_name(particle)
+    tables = _ensure_tables_loaded(pname)
     overall_distances = tables["overall_distances"]
     energy_rows = tables["energy_rows"]
     distance_rows = tables["distance_rows"]
     c_ang = tables["c_ang"]
     energy_for_angle = tables["energy_for_angle"]
+    if particle_mass is None:
+        particle_mass = tables["mass_mev"]
 
     pmt_pos = np.asarray(pmt_pos, dtype=np.float64)
     start_pos = np.asarray(start_pos, dtype=np.float64)
     track_dir = np.asarray(track_dir, dtype=np.float64)
     track_dir = track_dir / np.linalg.norm(track_dir)
 
-    main_idx = _nearest_index_1d(overall_distances, float(s_max_mm))
+    if range_stop_mm is None:
+        range_stop_for_energy = float(s_max_mm)
+    else:
+        range_stop_for_energy = float(range_stop_mm)
+
+    main_idx = _nearest_index_1d(overall_distances, range_stop_for_energy)
     dist_row = distance_rows[main_idx]
     energy_row = energy_rows[main_idx]
 
-    s_grid = np.linspace(float(s_a_mm), float(s_max_mm), int(n_scan), dtype=np.float64)
+    visible_s_max = min(float(s_max_mm), range_stop_for_energy)
+    visible_s_max = max(visible_s_max, float(s_a_mm))
+    s_grid = np.linspace(float(s_a_mm), visible_s_max, int(n_scan), dtype=np.float64)
 
-    # Preserve the original table lookup rule used for theta_c_grid:
-    # searchsorted + clipping, without later nearest-neighbour refinement.
-#     ds_mm = s_grid - float(s_a_mm)
-#     idx = np.searchsorted(dist_row, ds_mm)
-#     idx = np.clip(idx, 1, dist_row.size - 1)
-#     E_grid = energy_row[idx]
-#     E_grid = np.maximum(E_grid, 52.5)
-
-    # Nearest-neighbour lookup for theta_c_grid energy.
-    # searchsorted returns the right-neighbour index; we check both neighbours
-    # and take whichever dist_row entry is closer, matching the logic in
-    # _nearest_index_1d. The previous clip-to-right-neighbour systematically
-    # assigned every scan point the energy of the next step along the track
-    # (i.e. slightly too low), which biased theta_c downward and pushed the
-    # fitted length in the positive direction.
     ds_mm = s_grid - float(s_a_mm)
     idx = np.searchsorted(dist_row, ds_mm)
     idx_right = np.clip(idx, 0, dist_row.size - 1)
-    idx_left  = np.clip(idx - 1, 0, dist_row.size - 1)
-    use_left  = (ds_mm - dist_row[idx_left]) <= (dist_row[idx_right] - ds_mm)
-    idx       = np.where(use_left, idx_left, idx_right)
+    idx_left = np.clip(idx - 1, 0, dist_row.size - 1)
+    use_left = (ds_mm - dist_row[idx_left]) <= (dist_row[idx_right] - ds_mm)
+    idx = np.where(use_left, idx_left, idx_right)
     E_grid = energy_row[idx]
-    E_grid = np.maximum(E_grid, 52.5)
+
+    threshold = cherenkov_threshold_kinetic_mev(float(particle_mass), n=float(n_water))
+    E_grid = np.maximum(E_grid, threshold)
 
     theta_c_grid = _theta_interp_numba(
         np.asarray(energy_for_angle, dtype=np.float64),
@@ -494,19 +629,17 @@ def find_scale_for_pmts(
         np.asarray(dist_row, dtype=np.float64),
         np.asarray(energy_row, dtype=np.float64),
         float(s_a_mm),
-        float(s_max_mm),
+        float(visible_s_max),
         float(near_cross_tol),
+        float(particle_mass),
+        float(n_water),
     )
 
-    # The original function exposed mpmt_bool only for debug printing.
-    # The fast path intentionally stays silent.
     _ = mpmt_bool
-
     return scale, s_b, E_b
 
 
-# Backward-compatible aliases. Older exploratory notebooks sometimes imported
-# these names even though the current fitter only uses find_scale_for_pmts.
+# Backward-compatible aliases.
 def find_scale_for_pmts_old2(*args, **kwargs):
     return find_scale_for_pmts(*args, **kwargs)
 

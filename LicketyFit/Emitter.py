@@ -4,31 +4,52 @@ import numpy as np
 from typing import List, Tuple
 from numba import njit
 
-from model_muon_cherenkov_collapse import (
-    find_scale_for_pmts,
-    get_cerenkov_angle_table,
-    get_energy_distance_tables,
-    theta_c_func,
-    get_rel_mpmt_eff_tables
-)
+try:
+    from .particle_cherenkov_model import (
+        find_scale_for_pmts,
+        get_cerenkov_angle_table,
+        get_energy_distance_tables,
+        theta_c_func,
+        get_rel_mpmt_eff_tables,
+        set_active_particle,
+        canonical_particle_name,
+        particle_mass_mev,
+        cherenkov_threshold_kinetic_mev,
+    )
+    from .n_model_wrapper import *
+except ImportError:
+    # Support the historical usage pattern where LicketyFit/ itself is placed
+    # directly on sys.path and modules are imported as top-level files.
+    from particle_cherenkov_model import (
+        find_scale_for_pmts,
+        get_cerenkov_angle_table,
+        get_energy_distance_tables,
+        theta_c_func,
+        get_rel_mpmt_eff_tables,
+        set_active_particle,
+        canonical_particle_name,
+        particle_mass_mev,
+        cherenkov_threshold_kinetic_mev,
+    )
+    from n_model_wrapper import *
 
-from n_model_wrapper import *
 
+_TABLE_CACHE = {}
 
-_TABLE_CACHE = None
-
-def _get_tables():
-    """Load and cache lookup tables once per Python process."""
-    global _TABLE_CACHE
-    if _TABLE_CACHE is None:
-        c_ang, energy_for_angle = get_cerenkov_angle_table()
-        overall_distances, energy_rows, distance_rows = get_energy_distance_tables()
+def _get_tables(particle=None):
+    """Load and cache lookup tables once per Python process and particle."""
+    pname = canonical_particle_name(particle)
+    cached = _TABLE_CACHE.get(pname)
+    if cached is None:
+        c_ang, energy_for_angle = get_cerenkov_angle_table(pname)
+        overall_distances, energy_rows, distance_rows = get_energy_distance_tables(pname)
         tri_exsitu, tri_insitu, wut_insitu, wut_exsitu = get_rel_mpmt_eff_tables()
-        _TABLE_CACHE = (
+        cached = (
             c_ang, energy_for_angle, overall_distances, energy_rows, distance_rows,
             tri_exsitu, tri_insitu, wut_insitu, wut_exsitu,
         )
-    return _TABLE_CACHE
+        _TABLE_CACHE[pname] = cached
+    return cached
 
 
 # -----------------------------------------------------------------------------
@@ -48,7 +69,7 @@ _MPMT_TYPE_TO_CODE = {
 
 _REL_EFF_STACK_CACHE = None
 _PRIMARY_NGEO_NORM_CACHE = {}
-_MUON_STOPPING_POWER_CACHE = None
+_PARTICLE_STOPPING_POWER_CACHE = {}
 _PMT_RADIUS_CACHE = {}
 
 
@@ -738,34 +759,34 @@ def _electron_cherenkov_cos_alpha(T_MeV, n=1.344, m_e=0.51099895):
 
     return cos_alpha
 
-def _get_muon_stopping_power_table():
+def _get_particle_stopping_power_table(particle="muon"):
     """
-    Build and cache a smooth stopping-power table for muons in water.
+    Build and cache a smooth positive stopping-power table for a primary particle.
 
     Returns
     -------
     E_grid : ndarray
-        Muon kinetic energies [MeV].
+        Kinetic energies [MeV].
     dEdx_grid : ndarray
         Positive stopping power, -dE/ds [MeV/mm].
 
     Notes
     -----
-    The range table stores total stopping range versus initial kinetic energy.
-    Differentiating range with respect to kinetic energy gives dR/dE, so
+    The range table stores total above-threshold range versus initial kinetic
+    energy. Differentiating range with respect to kinetic energy gives dR/dE, so
 
         -dE/ds = 1 / (dR/dE).
 
     This is the same range-table information used by the collapse solver, just
     rearranged into the derivative needed by the analytic N_geo formula.
     """
-    global _MUON_STOPPING_POWER_CACHE
+    pname = canonical_particle_name(particle)
+    cached = _PARTICLE_STOPPING_POWER_CACHE.get(pname)
+    if cached is not None:
+        return cached
 
-    if _MUON_STOPPING_POWER_CACHE is not None:
-        return _MUON_STOPPING_POWER_CACHE
-
-    overall_distances = np.asarray(_get_tables()[2], dtype=np.float64)  # mm
-    energy_rows = _get_tables()[3]
+    overall_distances = np.asarray(_get_tables(pname)[2], dtype=np.float64)  # mm
+    energy_rows = _get_tables(pname)[3]
 
     # Initial kinetic energy for each stopping range.
     E0 = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
@@ -774,7 +795,6 @@ def _get_muon_stopping_power_table():
     E0 = E0[order]
     ranges = overall_distances[order]
 
-    # Guard against duplicate/non-monotonic table entries.
     keep = np.isfinite(E0) & np.isfinite(ranges)
     E0 = E0[keep]
     ranges = ranges[keep]
@@ -787,20 +807,30 @@ def _get_muon_stopping_power_table():
     dEdx = 1.0 / np.maximum(dR_dE, 1e-30)  # MeV / mm
 
     good = np.isfinite(E0) & np.isfinite(dEdx) & (dEdx > 0.0)
-    _MUON_STOPPING_POWER_CACHE = (E0[good], dEdx[good])
-    return _MUON_STOPPING_POWER_CACHE
+    cached = (E0[good], dEdx[good])
+    _PARTICLE_STOPPING_POWER_CACHE[pname] = cached
+    return cached
 
 
-def _interp_muon_dedx_positive(E_MeV):
+def _interp_particle_dedx_positive(E_MeV, particle="muon"):
     """
-    Interpolate positive muon stopping power -dE/ds [MeV/mm].
+    Interpolate positive primary-particle stopping power -dE/ds [MeV/mm].
     """
-    E_grid, dEdx_grid = _get_muon_stopping_power_table()
+    E_grid, dEdx_grid = _get_particle_stopping_power_table(particle)
     E = np.asarray(E_MeV, dtype=np.float64)
     return np.interp(E, E_grid, dEdx_grid, left=dEdx_grid[0], right=dEdx_grid[-1])
 
 
-_REFINED_ANALYTIC_DELTA_CACHE = None
+# Backward-compatible names.
+def _get_muon_stopping_power_table():
+    return _get_particle_stopping_power_table("muon")
+
+
+def _interp_muon_dedx_positive(E_MeV):
+    return _interp_particle_dedx_positive(E_MeV, "muon")
+
+
+_REFINED_ANALYTIC_DELTA_CACHE = {}
 
 @njit(cache=True)
 def _electron_cherenkov_threshold_numba(n, m_e):
@@ -1020,6 +1050,7 @@ def _fill_refined_analytic_delta_table_numba(
     n,
     n_T0,
     n_T_slow,
+    projectile_mass,
 ):
     """
     Compiled version of the slowing-down secondary-electron table builder.
@@ -1034,7 +1065,7 @@ def _fill_refined_analytic_delta_table_numba(
     but without Python loops or repeated kernel-array allocations.
     """
     m_e = 0.51099895
-    m_mu = 105.658
+    m_mu = projectile_mass
 
     r_e_cm = 2.8179403262e-13
     N_A = 6.02214076e23
@@ -1169,6 +1200,7 @@ def _build_refined_analytic_delta_table(
     n_T0=120,
     n_T_slow=60,
     n_T=None,
+    projectile_mass=105.6583755,
 ):
     """
     Fast compiled builder for dS_delta/du(K_mu, u).
@@ -1206,6 +1238,7 @@ def _build_refined_analytic_delta_table(
         float(n),
         int(n_T0),
         int(n_T_slow),
+        float(projectile_mass),
     )
 
     return K_grid, u_centers, table
@@ -1213,19 +1246,26 @@ def _build_refined_analytic_delta_table(
 
 
 
-def get_refined_analytic_delta_cache(n=1.344):
+def get_refined_analytic_delta_cache(n=1.344, projectile_mass=105.6583755, particle="muon"):
     """
     Return cached refined analytic secondary-electron table.
 
-    This is intentionally separate from the old scalar S_delta cache and the
-    external WCSim-derived angular PDF table.
+    The table depends on projectile mass through the delta-ray kinematics, so it
+    is cached per (particle, n, mass) rather than globally as a muon-only table.
     """
     global _REFINED_ANALYTIC_DELTA_CACHE
 
-    if _REFINED_ANALYTIC_DELTA_CACHE is None:
-        _REFINED_ANALYTIC_DELTA_CACHE = _build_refined_analytic_delta_table(n=n)
+    pname = canonical_particle_name(particle)
+    key = (pname, float(n), float(projectile_mass))
+    cached = _REFINED_ANALYTIC_DELTA_CACHE.get(key)
+    if cached is None:
+        cached = _build_refined_analytic_delta_table(
+            n=n,
+            projectile_mass=float(projectile_mass),
+        )
+        _REFINED_ANALYTIC_DELTA_CACHE[key] = cached
 
-    return _REFINED_ANALYTIC_DELTA_CACHE
+    return cached
 
 
 _DELTA_E_CACHE = None
@@ -1240,7 +1280,18 @@ class Emitter:
       - repeated temporary allocations when not needed
     """
 
-    def __init__(self, starting_time, start_coord, direction, beta, length, intensity):
+    def __init__(
+        self,
+        starting_time,
+        start_coord,
+        direction,
+        beta,
+        length,
+        intensity,
+        particle="muon",
+        track_end_mode="threshold",
+        fixed_initial_KE=None,
+    ):
         if not isinstance(starting_time, (int, float)):
             raise TypeError("starting_time must be a number")
         if not (
@@ -1268,7 +1319,32 @@ class Emitter:
         self.length = float(length)
         self.intensity = float(intensity)
 
-        self.mu_mass = 105.658  # MeV/c^2
+        self.particle_name = canonical_particle_name(particle)
+        set_active_particle(self.particle_name)
+        self.particle_mass = particle_mass_mev(self.particle_name)
+        self.mu_mass = self.particle_mass  # Backward-compatible alias used by older helper names.
+
+        # ------------------------------------------------------------------
+        # Primary-track endpoint model.
+        #
+        # threshold:
+        #     Old behavior.  The fitted parameter ``length`` is interpreted as
+        #     the dE/dx-only range to Cherenkov threshold, so it determines the
+        #     initial kinetic energy through the range table.
+        #
+        # abrupt:
+        #     The fitted parameter ``length`` is interpreted as the visible
+        #     primary-Cherenkov length before an abrupt cutoff/interaction.
+        #     The initial kinetic energy is fixed independently by
+        #     ``fixed_initial_KE``.  Internally, ``range_to_threshold_mm`` still
+        #     comes from the dE/dx table and is used to evaluate K(s), theta_c(s),
+        #     beta, and dE/dx along the visible part of the track.
+        # ------------------------------------------------------------------
+        self.track_end_mode = "threshold"
+        self.fixed_initial_KE = None
+        self.range_to_threshold_mm = float(length)
+        self.last_visible_length_exceeds_range = False
+
         self.n = 1.344
         self.c = 299.792458  # mm/ns
 
@@ -1286,19 +1362,23 @@ class Emitter:
         self._last_geometry_cache_key = None
         self._last_mpmt_type_codes = None
 
-        self.muon_subthreshold_range_mm = 150 # How far muon travels after it drops below cherenkov threshold (in mm)
+        # Production fits do not need to copy large diagnostic arrays on every
+        # FCN call.  Set this True only for residual/component debugging.
+        self.store_expected_component_diagnostics = False
+
+        self.muon_subthreshold_range_mm = 120 # Backward-compatible name: subthreshold tail distance after primary Cherenkov threshold (mm)
         self.enable_delta_e = True
-        self.delta_e_scale = 3
+        self.delta_e_scale = 1
 
 
 
         # Number of source bins along the above-threshold, Cherenkov-visible muon path.
-        self.n_delta_steps = 20
+        self.n_delta_steps = 5
 
         # Force the below-threshold tail to be sampled separately.
         # This prevents the 110 mm tail from disappearing when n_delta_steps is small.
         self.delta_e_tail_step_mm = 20.0
-        self.delta_e_tail_min_steps = 10
+        self.delta_e_tail_min_steps = 3
 
         # ------------------------------------------------------------------
         # Secondary-electron timing model.
@@ -1335,9 +1415,20 @@ class Emitter:
         # efficiency remain separate, as in the old model.
         # ------------------------------------------------------------------
         self.use_analytic_primary_ngeo = True
-        self.primary_ngeo_pmt_radius_mm = 60 #37.0
+        self.primary_ngeo_pmt_radius_mm = 60.0
         self.primary_ngeo_ref_energy_MeV = 304.0
         self.primary_ngeo_ref_r_mm = 1000.0
+
+        # The original reference energy (304 MeV) is safely above the muon
+        # Cherenkov threshold, but it is below the proton threshold in water.
+        # If the normalization reference is below threshold,
+        # primary_ngeo_falloff_raw() is zero and the old code silently used
+        # norm = 1.0, suppressing primary proton light by orders of magnitude.
+        # Keep the old muon/pion behavior, but automatically move the reference
+        # energy above threshold for heavy particles such as protons.
+        self.primary_ngeo_auto_ref_above_threshold = True
+        self.primary_ngeo_ref_threshold_factor = 2.0
+        self.primary_ngeo_ref_threshold_margin_MeV = 25.0
 
         # Apply relative mPMT efficiency using each secondary source point's
         # actual incidence angle, not the primary-muon emission angle.
@@ -1375,7 +1466,7 @@ class Emitter:
         # ------------------------------------------------------------------
         self.delta_e_use_finite_disk_solid_angle = True
         self.delta_e_distance_ref_r_mm = 1000.0
-        self.delta_e_distance_pmt_radius_mm = 60 #37.0
+        self.delta_e_distance_pmt_radius_mm = 60
 
         # Kept only for backward-compatible fallback when
         self.delta_e_distance_power = 2
@@ -1391,7 +1482,7 @@ class Emitter:
         self.analytic_delta_scale = 1 #2.5
         
         # Try a small physical floor for PMTs
-        self.charge_floor_pe = 0
+        self.charge_floor_pe = 0 #1e-4
         
         # Diagnostic only:
         # Artificially shift secondary-electron emission points downstream
@@ -1409,7 +1500,7 @@ class Emitter:
         # u_power = 2 -> multiply by u^2
         # u_power = 4 -> strongly forward-weighted
         # ------------------------------------------------------------------
-        self.delta_e_debug_u_power = 0.5
+        self.delta_e_debug_u_power = 0
         self.delta_e_debug_u_min = 0.0
         self.delta_e_debug_preserve_yield = True
         
@@ -1426,9 +1517,12 @@ class Emitter:
         # Units: radians.  Set to 0.0 to recover hard zero behavior for
         # no-crossing PMTs.
         # ------------------------------------------------------------------
-        self.primary_soft_cone_sigma_rad = 0.02
-        
-        
+        self.primary_soft_cone_sigma_rad = 0.015
+
+        # Configure the endpoint mode after all attributes used by the kinematic
+        # refresh helpers exist.  For the default threshold mode this is exactly
+        # the old behavior.
+        self.configure_track_end(track_end_mode, fixed_initial_KE=fixed_initial_KE, refresh=False)
 
         # Match the original behavior: initialise beta from the length-dependent
         # lookup table rather than trusting the constructor beta argument.
@@ -1456,6 +1550,21 @@ class Emitter:
         new.__dict__ = self.__dict__.copy()
         return new
 
+    def set_particle(self, particle):
+        """Set the primary particle species for this emitter."""
+        self.particle_name = canonical_particle_name(particle)
+        set_active_particle(self.particle_name)
+        self.particle_mass = particle_mass_mev(self.particle_name)
+        self.mu_mass = self.particle_mass  # compatibility alias
+        self.interp_E_init = None
+        self._energy_main_idx = None
+        self._energy_dist_row = None
+        self._energy_energy_row = None
+        self.range_to_threshold_mm = float(self.length)
+        self.last_visible_length_exceeds_range = False
+        self.refresh_kinematics_from_length(self.length)
+        return self
+
     def calc_constants(self, n):
         self.n = float(n)
         self.cos_tq = 1.0 / (self.beta * self.n)
@@ -1466,14 +1575,115 @@ class Emitter:
         self.v = self.beta * self.c
 
     @staticmethod
-    def nearest_main_idx(length_mm):
-        idx = np.searchsorted(_get_tables()[2], float(length_mm))
-        idx = np.clip(idx, 1, len(_get_tables()[2]) - 1)
-        left = _get_tables()[2][idx - 1]
-        right = _get_tables()[2][idx]
+    def nearest_main_idx(length_mm, particle=None):
+        tables = _get_tables(particle)
+        overall = tables[2]
+        idx = np.searchsorted(overall, float(length_mm))
+        idx = np.clip(idx, 1, len(overall) - 1)
+        left = overall[idx - 1]
+        right = overall[idx]
         if (float(length_mm) - left) <= (right - float(length_mm)):
             idx -= 1
         return int(idx)
+
+    def configure_track_end(self, mode="threshold", fixed_initial_KE=None, refresh=True):
+        """Configure how the primary Cherenkov track terminates.
+
+        Parameters
+        ----------
+        mode : {"threshold", "abrupt"}
+            ``threshold`` keeps the original behavior: fitted ``length`` is the
+            dE/dx range to Cherenkov threshold and therefore determines the
+            initial kinetic energy.
+
+            ``abrupt`` makes fitted ``length`` the visible primary-Cherenkov
+            length only.  The initial kinetic energy must be supplied separately
+            through ``fixed_initial_KE``.  This is intended for protons/hadrons
+            whose clean Cherenkov ring can end suddenly before the particle has
+            slowed to threshold.
+        fixed_initial_KE : float or None
+            Fixed initial kinetic energy in MeV for abrupt mode.
+        refresh : bool
+            If True, immediately refresh beta and the cached K(s) lookup row.
+        """
+        mode = str(mode).strip().lower()
+        aliases = {
+            "threshold": "threshold",
+            "range": "threshold",
+            "csda": "threshold",
+            "old": "threshold",
+            "abrupt": "abrupt",
+            "truncated": "abrupt",
+            "interaction": "abrupt",
+            "absorbed": "abrupt",
+            "absorption": "abrupt",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                "track_end_mode must be 'threshold' or 'abrupt' "
+                f"(got {mode!r})"
+            )
+
+        self.track_end_mode = aliases[mode]
+        if fixed_initial_KE is None:
+            self.fixed_initial_KE = None
+        else:
+            self.fixed_initial_KE = float(fixed_initial_KE)
+
+        if self.track_end_mode == "abrupt" and self.fixed_initial_KE is None:
+            raise ValueError(
+                "abrupt track-end mode requires fixed_initial_KE in MeV. "
+                "Use threshold mode if fitted length should determine energy."
+            )
+
+        self.interp_E_init = None
+        self._energy_main_idx = None
+        self._energy_dist_row = None
+        self._energy_energy_row = None
+
+        if refresh:
+            self.refresh_kinematics_from_length(self.length)
+        return self
+
+    # More explicit aliases for fit-driver code.
+    set_track_end_mode = configure_track_end
+    set_primary_truncation_mode = configure_track_end
+
+    def _range_to_threshold_from_energy(self, initial_KE):
+        """Interpolate dE/dx-only Cherenkov-visible range [mm] from K0 [MeV]."""
+        tables = _get_tables(self.particle_name)
+        overall_distances = np.asarray(tables[2], dtype=np.float64)
+        energy_rows = tables[3]
+        initial_energies = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
+
+        order = np.argsort(initial_energies)
+        initial_energies = initial_energies[order]
+        overall_distances = overall_distances[order]
+
+        return float(
+            np.interp(
+                float(initial_KE),
+                initial_energies,
+                overall_distances,
+                left=overall_distances[0],
+                right=overall_distances[-1],
+            )
+        )
+
+    def _cache_energy_row_for_range(self, range_mm):
+        """Cache the K(s) table row corresponding to a dE/dx range."""
+        main_idx = self.nearest_main_idx(float(range_mm), particle=self.particle_name)
+        tables = _get_tables(self.particle_name)
+        self._energy_main_idx = main_idx
+        self._energy_dist_row = tables[4][main_idx]
+        self._energy_energy_row = tables[3][main_idx]
+        return main_idx
+
+    def visible_length_is_physical(self, tol_mm=1e-9):
+        """Return False when an abrupt visible length exceeds the dE/dx range."""
+        if self.track_end_mode != "abrupt":
+            return True
+        return float(self.length) <= float(self.range_to_threshold_mm) + float(tol_mm)
 
     def _get_energy_rows_for_length(self, L_stop_mm):
         """
@@ -1483,14 +1693,15 @@ class Emitter:
         refresh_kinematics_from_length(), avoiding repeated table searches for
         every secondary-electron source calculation.
         """
+        cached_range = float(getattr(self, "range_to_threshold_mm", self.length))
         if (
             self._energy_dist_row is not None
             and self._energy_energy_row is not None
-            and np.isclose(float(L_stop_mm), float(self.length), rtol=0.0, atol=1e-12)
+            and np.isclose(float(L_stop_mm), cached_range, rtol=0.0, atol=1e-12)
         ):
             return self._energy_dist_row, self._energy_energy_row
 
-        overall_distances, energy_rows, distance_rows = _get_tables()[2:5]
+        overall_distances, energy_rows, distance_rows = _get_tables(self.particle_name)[2:5]
         main_idx = np.searchsorted(overall_distances, float(L_stop_mm))
         main_idx = np.clip(main_idx, 1, len(overall_distances) - 1)
 
@@ -1503,7 +1714,7 @@ class Emitter:
 
     def muon_energy_at_s(self, s_mm, L_stop_mm):
         """
-        Approximate muon kinetic energy at distance s along the physical muon path.
+        Approximate primary-particle kinetic energy at distance s along the physical muon path.
 
         Uses the same range-table philosophy as the collapse solver.
         """
@@ -1531,15 +1742,32 @@ class Emitter:
         return self.interp_E_init
 
     def refresh_kinematics_from_length(self, length_mm):
+        """Refresh beta and K(s) tables from the current fit length.
+
+        In threshold mode this is the historical behavior: ``length_mm`` selects
+        the range-table row and therefore the initial kinetic energy.
+
+        In abrupt mode, ``length_mm`` is only the visible/truncated Cherenkov
+        length.  The dE/dx range row and beta are instead selected from the fixed
+        initial kinetic energy.
+        """
         self.length = float(length_mm)
-        main_idx = self.nearest_main_idx(self.length)
 
-        # Cache the table row used by muon_energy_at_s_array().
-        tables = _get_tables()
-        self._energy_main_idx = main_idx
-        self._energy_dist_row = tables[4][main_idx]
-        self._energy_energy_row = tables[3][main_idx]
+        if getattr(self, "track_end_mode", "threshold") == "abrupt":
+            if self.fixed_initial_KE is None:
+                raise ValueError(
+                    "Emitter is in abrupt track-end mode but fixed_initial_KE is not set."
+                )
+            self.range_to_threshold_mm = self._range_to_threshold_from_energy(self.fixed_initial_KE)
+            self._cache_energy_row_for_range(self.range_to_threshold_mm)
+            self.last_visible_length_exceeds_range = not self.visible_length_is_physical()
+            return self.refresh_kinematics_from_energy(self.fixed_initial_KE)
 
+        # Default/old behavior: fitted length is the range to Cherenkov threshold.
+        self.range_to_threshold_mm = float(self.length)
+        self.last_visible_length_exceeds_range = False
+        main_idx = self._cache_energy_row_for_range(self.length)
+        tables = _get_tables(self.particle_name)
         return self.refresh_kinematics_from_energy(tables[3][main_idx][0])
 
     def set_nominal_track_parameters(self, starting_time, start_coord, direction, length):
@@ -1895,16 +2123,20 @@ class Emitter:
         return out
 
 
-    def muon_dedx_positive(self, E_MeV):
+    def particle_dedx_positive(self, E_MeV):
         """
-        Positive muon stopping power, -dE/ds, in MeV/mm.
+        Positive primary-particle stopping power, -dE/ds, in MeV/mm.
 
-        This is derived from the same muon range table used by the collapse
-        solver.  It is needed for the analytic cone-density falloff:
+        This is derived from the same particle range table used by the collapse
+        solver. It is needed for the analytic cone-density falloff:
 
             d cos(theta_c)/ds = (-dE/ds) / (n m beta^3 gamma^3).
         """
-        return _interp_muon_dedx_positive(E_MeV)
+        return _interp_particle_dedx_positive(E_MeV, self.particle_name)
+
+    def muon_dedx_positive(self, E_MeV):
+        """Backward-compatible alias for particle_dedx_positive()."""
+        return self.particle_dedx_positive(E_MeV)
 
 
     def primary_ngeo_falloff_raw(self, E_MeV, r_mm):
@@ -1968,6 +2200,27 @@ class Emitter:
         return out
 
 
+    def primary_ngeo_reference_energy(self):
+        """Return a particle-safe reference energy for N_geo normalization.
+
+        The historical value primary_ngeo_ref_energy_MeV=304 MeV was tuned for
+        muons.  For protons in water, 304 MeV is below Cherenkov threshold, so
+        primary_ngeo_falloff_raw(304 MeV, r_ref) is exactly zero.  That made the
+        normalization fall back to 1.0 and effectively removed the primary
+        proton ring.
+        """
+        E_ref = float(self.primary_ngeo_ref_energy_MeV)
+        if getattr(self, "primary_ngeo_auto_ref_above_threshold", True):
+            threshold = float(self.get_cherenkov_threshold_kinetic_energy())
+            min_ref = max(
+                threshold + float(getattr(self, "primary_ngeo_ref_threshold_margin_MeV", 25.0)),
+                threshold * float(getattr(self, "primary_ngeo_ref_threshold_factor", 2.0)),
+            )
+            if E_ref <= min_ref:
+                E_ref = min_ref
+        return float(E_ref)
+
+
     def primary_ngeo_normalization(self):
         """
         Fixed convention factor for N_geo.
@@ -1976,11 +2229,12 @@ class Emitter:
         recomputed for every Minuit FCN call even though it only depends on the
         optical constants and chosen reference point.
         """
-        E_ref = float(self.primary_ngeo_ref_energy_MeV)
+        E_ref = self.primary_ngeo_reference_energy()
         r_ref = float(self.primary_ngeo_ref_r_mm)
         key = (
+            self.particle_name,
             float(self.n),
-            float(self.mu_mass),
+            float(self.particle_mass),
             float(self.primary_ngeo_pmt_radius_mm),
             E_ref,
             r_ref,
@@ -1990,18 +2244,22 @@ class Emitter:
         if cached is not None:
             return cached
 
-        raw_ref = _primary_ngeo_raw_static(
+        raw_ref = self.primary_ngeo_falloff_raw(
             np.asarray([E_ref], dtype=np.float64),
             np.asarray([r_ref], dtype=np.float64),
-            n=float(self.n),
-            mu_mass=float(self.mu_mass),
-            pmt_radius_mm=float(self.primary_ngeo_pmt_radius_mm),
         )[0]
 
         if not np.isfinite(raw_ref) or raw_ref <= 0.0:
+            # This should no longer happen for protons because the reference
+            # energy is moved above threshold, but keep a clear diagnostic state
+            # instead of silently producing a tiny primary component.
             norm = 1.0
         else:
             norm = float(n_from_E_r(E_ref, r_ref) / raw_ref)
+
+        self._last_primary_ngeo_norm = float(norm)
+        self._last_primary_ngeo_ref_energy_MeV = float(E_ref)
+        self._last_primary_ngeo_raw_ref = float(raw_ref)
 
         _PRIMARY_NGEO_NORM_CACHE[key] = norm
         return norm
@@ -2017,7 +2275,12 @@ class Emitter:
 
 
     def get_physical_stop_length_from_cherenkov_length(self):
+        if getattr(self, "track_end_mode", "threshold") == "abrupt":
+            return float(self.length)
         return self.length + self.muon_subthreshold_range_mm
+
+    def get_cherenkov_threshold_kinetic_energy(self):
+        return cherenkov_threshold_kinetic_mev(float(self.particle_mass), n=float(self.n))
 
     def beta2_from_K(self, K, mass):
         K = np.asarray(K, dtype=np.float64)
@@ -2112,7 +2375,7 @@ class Emitter:
         K_mu = np.asarray(K_mu, dtype=np.float64)
         u = np.asarray(cos_forward, dtype=np.float64)
 
-        K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n)
+        K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n, projectile_mass=float(self.particle_mass), particle=self.particle_name)
 
         valid_K = np.isfinite(K_mu)
         # Treat the table as representing bins over the physical range 0 < u <= 1.
@@ -2194,7 +2457,14 @@ class Emitter:
         # Build the same two-part source grid as the slow implementation:
         # visible above-threshold track plus forced below-threshold tail.
         L_ch = max(float(self.length), 0.0)
-        L_tail = max(float(self.muon_subthreshold_range_mm), 0.0)
+        if getattr(self, "track_end_mode", "threshold") == "abrupt":
+            # Abrupt endpoint means the primary track has ended/interacted, not
+            # merely fallen below Cherenkov threshold.  Do not append the old
+            # below-threshold secondary-electron tail beyond the visible cutoff.
+            L_tail = 0.0
+        else:
+            L_tail = max(float(self.muon_subthreshold_range_mm), 0.0)
+        L_stop_for_energy = float(getattr(self, "range_to_threshold_mm", L_ch))
         n_ch = max(1, int(self.n_delta_steps))
 
         tail_step_mm = max(float(getattr(self, "delta_e_tail_step_mm", 20.0)), 1e-12)
@@ -2220,10 +2490,10 @@ class Emitter:
         below_threshold = ~above_threshold
 
         if np.any(above_threshold):
-            K_mu[above_threshold] = self.muon_energy_at_s_array(s_centers[above_threshold], L_ch)
+            K_mu[above_threshold] = self.muon_energy_at_s_array(s_centers[above_threshold], L_stop_for_energy)
 
         if np.any(below_threshold):
-            K_thr = self.muon_energy_at_s_array(np.array([L_ch], dtype=np.float64), L_ch)[0]
+            K_thr = self.muon_energy_at_s_array(np.array([L_ch], dtype=np.float64), L_stop_for_energy)[0]
             d_post = s_centers[below_threshold] - L_ch
             frac = np.clip(d_post / max(L_tail, 1e-12), 0.0, 1.0)
             K_mu[below_threshold] = K_thr * (1.0 - frac)
@@ -2265,7 +2535,7 @@ class Emitter:
         ###
         
 
-        K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n)
+        K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n, projectile_mass=float(self.particle_mass), particle=self.particle_name)
        
         K_grid = np.ascontiguousarray(K_grid, dtype=np.float64)
         u_grid = np.ascontiguousarray(u_grid, dtype=np.float64)
@@ -2366,15 +2636,16 @@ class Emitter:
         direction_zs,
         mpmt_types,
         obs_pes,
+        need_times=True,
     ):
 
         """
         Expected PE and first-hit-time model used by the fit.
 
         The heavy cone-collapse work is delegated to the optimized solver in
-        model_muon_cherenkov_collapse.py.
+        particle_cherenkov_model.py.
         """
-        pmt_radius = _get_pmt_radius_cached(wcd) + 20 # Add additional 20mm for reflector area
+        pmt_radius = _get_pmt_radius_cached(wcd) + 20 # Add 20 mm for additional reflector surface area
 
         p_locations = np.asarray(p_locations, dtype=np.float64)
         direction_zs = np.asarray(direction_zs, dtype=np.float64)
@@ -2414,8 +2685,12 @@ class Emitter:
                 s_a_mm=0.001,
                 s_max_mm=self.length,
                 theta_c_func=theta_c_func,
+                range_stop_mm=float(getattr(self, "range_to_threshold_mm", self.length)),
                 n_scan=150,
                 near_cross_tol=float(getattr(self, "primary_soft_cone_sigma_rad", 0.03)),#0.02,
+                particle=self.particle_name,
+                particle_mass=float(self.particle_mass),
+                n_water=float(self.n),
             )
 
             scale[idx] = scale_sub
@@ -2471,16 +2746,20 @@ class Emitter:
         # add secondary light on top. That guarantees an overprediction whenever
         # delta_e_scale > 0.
         # Primary-muon expected hit time from the same effective emission point
-        # used by the primary charge model.
-        t_light_primary = r * self.n / self.c
-        t_emitter_primary = s_eff / self.v
-        t_primary = self.starting_time + t_emitter_primary + t_light_primary
+        # used by the primary charge model.  In charge-only fits these times are
+        # ignored, so skip them entirely.
+        if bool(need_times):
+            t_light_primary = r * self.n / self.c
+            t_emitter_primary = s_eff / self.v
+            t_primary = self.starting_time + t_emitter_primary + t_light_primary
+        else:
+            t_primary = None
 
         mu_delta = None
         t_delta = None
 
         if self.enable_delta_e and self.delta_e_scale != 0.0:
-            if getattr(self, "use_delta_e_timing", True):
+            if bool(need_times) and getattr(self, "use_delta_e_timing", True):
                 mu_delta, t_delta = self.get_delta_e_expected_pes(
                     p_locations=p_locations,
                     direction_zs=direction_zs,
@@ -2511,8 +2790,31 @@ class Emitter:
         norm = obs_mean / raw_mean if raw_mean > 0.0 else 1.0
         mean_pes = mean_pes_raw * norm
         #mean_pes[mean_pes < 1e-3] = 0.0
-        # Test a small physical floor 
+        # Test a small physical floor
         mean_pes = np.maximum(mean_pes, self.charge_floor_pe)
+
+        # Store component diagnostics only when explicitly requested.
+        # The old unconditional path copied several nPMT-length arrays every FCN
+        # call, which is useful for debugging but pure overhead in production.
+        if getattr(self, "store_expected_component_diagnostics", False):
+            sum_primary = float(np.sum(mu_primary))
+            sum_delta = float(np.sum(mu_delta_scaled))
+            sum_total = float(np.sum(mean_pes_raw))
+            self._last_expected_components = {
+                "mu_primary_raw": mu_primary.copy(),
+                "mu_delta_raw": mu_delta_scaled.copy(),
+                "mean_pes_raw": mean_pes_raw.copy(),
+                "mean_pes": mean_pes.copy(),
+                "norm": float(norm),
+                "obs_mean": float(obs_mean),
+                "raw_mean": float(raw_mean),
+                "sum_primary_raw": sum_primary,
+                "sum_delta_raw": sum_delta,
+                "primary_fraction_raw": (sum_primary / sum_total) if sum_total > 0.0 else np.nan,
+                "primary_ngeo_ref_energy_MeV": float(getattr(self, "_last_primary_ngeo_ref_energy_MeV", np.nan)),
+                "primary_ngeo_norm": float(getattr(self, "_last_primary_ngeo_norm", np.nan)),
+                "primary_ngeo_raw_ref": float(getattr(self, "_last_primary_ngeo_raw_ref", np.nan)),
+            }
 
         # Expected time model.
         #
@@ -2524,7 +2826,10 @@ class Emitter:
         # This is the model that corresponds to using charge-weighted mean hit
         # times in the data.  The event-level normalization cancels in the time
         # weights, so the raw component PEs are used here.
-        if (
+        if not bool(need_times):
+            # Charge-only caller: keep the API shape, but avoid any time algebra.
+            t_hits = np.empty_like(mean_pes)
+        elif (
             self.enable_delta_e
             and self.delta_e_scale != 0.0
             and getattr(self, "use_delta_e_timing", True)
@@ -2702,42 +3007,58 @@ class Emitter:
 
 
 
-
-
-
-
-
 # import math
 
 # import numpy as np
 # from typing import List, Tuple
 # from numba import njit
 
-# from model_muon_cherenkov_collapse import (
-#     find_scale_for_pmts,
-#     get_cerenkov_angle_table,
-#     get_energy_distance_tables,
-#     theta_c_func,
-#     get_rel_mpmt_eff_tables
-# )
+# try:
+#     from .particle_cherenkov_model import (
+#         find_scale_for_pmts,
+#         get_cerenkov_angle_table,
+#         get_energy_distance_tables,
+#         theta_c_func,
+#         get_rel_mpmt_eff_tables,
+#         set_active_particle,
+#         canonical_particle_name,
+#         particle_mass_mev,
+#         cherenkov_threshold_kinetic_mev,
+#     )
+#     from .n_model_wrapper import *
+# except ImportError:
+#     # Support the historical usage pattern where LicketyFit/ itself is placed
+#     # directly on sys.path and modules are imported as top-level files.
+#     from particle_cherenkov_model import (
+#         find_scale_for_pmts,
+#         get_cerenkov_angle_table,
+#         get_energy_distance_tables,
+#         theta_c_func,
+#         get_rel_mpmt_eff_tables,
+#         set_active_particle,
+#         canonical_particle_name,
+#         particle_mass_mev,
+#         cherenkov_threshold_kinetic_mev,
+#     )
+#     from n_model_wrapper import *
 
-# from n_model_wrapper import *
 
+# _TABLE_CACHE = {}
 
-# _TABLE_CACHE = None
-
-# def _get_tables():
-#     """Load and cache lookup tables once per Python process."""
-#     global _TABLE_CACHE
-#     if _TABLE_CACHE is None:
-#         c_ang, energy_for_angle = get_cerenkov_angle_table()
-#         overall_distances, energy_rows, distance_rows = get_energy_distance_tables()
+# def _get_tables(particle=None):
+#     """Load and cache lookup tables once per Python process and particle."""
+#     pname = canonical_particle_name(particle)
+#     cached = _TABLE_CACHE.get(pname)
+#     if cached is None:
+#         c_ang, energy_for_angle = get_cerenkov_angle_table(pname)
+#         overall_distances, energy_rows, distance_rows = get_energy_distance_tables(pname)
 #         tri_exsitu, tri_insitu, wut_insitu, wut_exsitu = get_rel_mpmt_eff_tables()
-#         _TABLE_CACHE = (
+#         cached = (
 #             c_ang, energy_for_angle, overall_distances, energy_rows, distance_rows,
 #             tri_exsitu, tri_insitu, wut_insitu, wut_exsitu,
 #         )
-#     return _TABLE_CACHE
+#         _TABLE_CACHE[pname] = cached
+#     return cached
 
 
 # # -----------------------------------------------------------------------------
@@ -2757,7 +3078,7 @@ class Emitter:
 
 # _REL_EFF_STACK_CACHE = None
 # _PRIMARY_NGEO_NORM_CACHE = {}
-# _MUON_STOPPING_POWER_CACHE = None
+# _PARTICLE_STOPPING_POWER_CACHE = {}
 # _PMT_RADIUS_CACHE = {}
 
 
@@ -2804,7 +3125,7 @@ class Emitter:
 #     return codes
 
 
-# def _interp_rel_mpmt_eff_from_codes(cost, mpmt_type_codes=None, fill_empty=1.0):
+# def _interp_rel_mpmt_eff_from_codes(cost, mpmt_type_codes, fill_empty=1.0):
 #     """
 #     Fast relative mPMT efficiency interpolation on the fixed uniform cost grid.
 
@@ -2814,43 +3135,35 @@ class Emitter:
 #     source grid.
 #     """
 #     cost = np.asarray(cost, dtype=np.float64)
-    
-#     if type(mpmt_type_codes) != type(None):
-#         codes = np.asarray(mpmt_type_codes)
+#     codes = np.asarray(mpmt_type_codes)
 
-#         # Broadcast PMT codes over a source x PMT cost grid without allocating a
-#         # tiled string array.  For 1D cost this is a no-op.
-#         if cost.ndim == 2 and codes.ndim == 1:
-#             codes = np.broadcast_to(codes[None, :], cost.shape)
-#         else:
-#             codes = np.broadcast_to(codes, cost.shape)
-
-#         out = np.full(cost.shape, fill_empty, dtype=np.float64)
-#         valid = np.isfinite(cost) & (codes >= 0) & (codes < 4)
-#         if not np.any(valid):
-#             return out
-
-#         table = _get_rel_eff_stack()
-#         n_grid = table.shape[1]
-
-#         # np.interp with x-grid linspace(0,1,N) is just linear interpolation in
-#         # fractional index space.  Clipping reproduces left/right edge behavior.
-#         x = np.clip(cost[valid], 0.0, 1.0) * (n_grid - 1)
-#         i0 = np.floor(x).astype(np.int64)
-#         i0 = np.clip(i0, 0, n_grid - 2)
-#         t = x - i0
-
-#         c = codes[valid].astype(np.int64, copy=False)
-#         y0 = table[c, i0]
-#         y1 = table[c, i0 + 1]
-#         out[valid] = y0 + t * (y1 - y0)
-        
-#         return out
-        
+#     # Broadcast PMT codes over a source x PMT cost grid without allocating a
+#     # tiled string array.  For 1D cost this is a no-op.
+#     if cost.ndim == 2 and codes.ndim == 1:
+#         codes = np.broadcast_to(codes[None, :], cost.shape)
 #     else:
-#         return np.ones(shape=np.shape(cost))
-    
-    
+#         codes = np.broadcast_to(codes, cost.shape)
+
+#     out = np.full(cost.shape, fill_empty, dtype=np.float64)
+#     valid = np.isfinite(cost) & (codes >= 0) & (codes < 4)
+#     if not np.any(valid):
+#         return out
+
+#     table = _get_rel_eff_stack()
+#     n_grid = table.shape[1]
+
+#     # np.interp with x-grid linspace(0,1,N) is just linear interpolation in
+#     # fractional index space.  Clipping reproduces left/right edge behavior.
+#     x = np.clip(cost[valid], 0.0, 1.0) * (n_grid - 1)
+#     i0 = np.floor(x).astype(np.int64)
+#     i0 = np.clip(i0, 0, n_grid - 2)
+#     t = x - i0
+
+#     c = codes[valid].astype(np.int64, copy=False)
+#     y0 = table[c, i0]
+#     y1 = table[c, i0 + 1]
+#     out[valid] = y0 + t * (y1 - y0)
+#     return out
 
 
 # # -----------------------------------------------------------------------------
@@ -3008,46 +3321,218 @@ class Emitter:
 #     delta_e_time_offset_ns,
 #     return_times,
 # ):
+#     """
+#     Fast PMT-parallel secondary-electron accumulator.
+
+#     This keeps the same physics as the original source x PMT loop, but removes
+#     repeated source-only work from the hot PMT loop:
+
+#       * source positions, source times, source weights are precomputed once;
+#       * K-grid interpolation indices/fractions are precomputed once per source;
+#       * each Numba thread accumulates one PMT, avoiding write conflicts;
+#       * impossible contributions are rejected before expensive optical factors.
+
+#     The table is still interpreted as dS_delta/du(K_mu, u), where u is the
+#     photon direction cosine relative to the primary muon direction.
+#     """
 #     n_src = s_centers.size
 #     n_pmts = p_locations.shape[0]
+
 #     mu = np.zeros(n_pmts, dtype=np.float64)
 #     tnum = np.zeros(n_pmts, dtype=np.float64)
 
+#     if n_src == 0 or n_pmts == 0:
+#         if return_times:
+#             t_empty = np.empty(n_pmts, dtype=np.float64)
+#             for i in range(n_pmts):
+#                 t_empty[i] = np.nan
+#             return mu, t_empty
+#         return mu, tnum
+
+#     # ------------------------------------------------------------------
+#     # Precompute source-only quantities.
+#     # ------------------------------------------------------------------
+#     src_x = np.empty(n_src, dtype=np.float64)
+#     src_y = np.empty(n_src, dtype=np.float64)
+#     src_z = np.empty(n_src, dtype=np.float64)
+#     src_t = np.empty(n_src, dtype=np.float64)
+#     src_w = np.empty(n_src, dtype=np.float64)
+#     src_iK = np.empty(n_src, dtype=np.int64)
+#     src_tK = np.empty(n_src, dtype=np.float64)
+#     src_valid = np.zeros(n_src, dtype=np.uint8)
+
+#     K_min = K_grid[0]
+#     K_max = K_grid[K_grid.size - 1]
+#     dK = K_grid[1] - K_grid[0]
+#     inv_dK = 1.0 / dK
+#     nK = K_grid.size
+
 #     for j in range(n_src):
 #         K = K_mu[j]
+#         ds = ds_cm[j]
+
 #         if (not math.isfinite(K)) or K <= 0.0:
 #             continue
-#         ds = ds_cm[j]
 #         if (not math.isfinite(ds)) or ds <= 0.0:
 #             continue
 
-#         K_for_weight = K
-#         if K_for_weight < source_k_floor:
-#             K_for_weight = source_k_floor
-#         source_weight = (K_for_weight / source_k_ref) ** source_k_power
+#         if source_k_power == 0.0:
+#             source_weight = 1.0
+#         else:
+#             K_for_weight = K
+#             if K_for_weight < source_k_floor:
+#                 K_for_weight = source_k_floor
+
+#             if source_k_ref <= 0.0:
+#                 source_weight = 1.0
+#             else:
+#                 source_weight = (K_for_weight / source_k_ref) ** source_k_power
+
 #         w_src = analytic_delta_scale * source_weight * ds
 #         if (not math.isfinite(w_src)) or w_src <= 0.0:
 #             continue
 
-#         sx = start_pos[0] + s_centers[j] * track_dir[0]
-#         sy = start_pos[1] + s_centers[j] * track_dir[1]
-#         sz = start_pos[2] + s_centers[j] * track_dir[2]
-#         t_source = starting_time + s_centers[j] / v + delta_e_time_offset_ns
+#         s = s_centers[j]
+#         src_x[j] = start_pos[0] + s * track_dir[0]
+#         src_y[j] = start_pos[1] + s * track_dir[1]
+#         src_z[j] = start_pos[2] + s * track_dir[2]
+#         src_w[j] = w_src
 
-#         for i in range(n_pmts):
-#             dx = p_locations[i, 0] - sx
-#             dy = p_locations[i, 1] - sy
-#             dz = p_locations[i, 2] - sz
+#         if return_times:
+#             src_t[j] = starting_time + s / v + delta_e_time_offset_ns
+#         else:
+#             src_t[j] = 0.0
+
+#         # The original scalar interpolation returned zero for K below the
+#         # table minimum.  In this model K_grid[0] is 0, and nonpositive K has
+#         # already been filtered, so the lower clip only protects roundoff.
+#         Kc = K
+#         if Kc < K_min:
+#             Kc = K_min
+#         elif Kc > K_max:
+#             Kc = K_max
+
+#         iK = int(math.floor((Kc - K_min) * inv_dK))
+#         if iK < 0:
+#             iK = 0
+#         elif iK > nK - 2:
+#             iK = nK - 2
+
+#         K0 = K_grid[iK]
+#         K1 = K_grid[iK + 1]
+#         tK = (Kc - K0) / (K1 - K0 + 1e-300)
+#         if tK < 0.0:
+#             tK = 0.0
+#         elif tK > 1.0:
+#             tK = 1.0
+
+#         src_iK[j] = iK
+#         src_tK[j] = tK
+#         src_valid[j] = 1
+
+#     # ------------------------------------------------------------------
+#     # Constants for u-grid interpolation.
+#     # ------------------------------------------------------------------
+#     u_min = u_grid[0]
+#     u_max = u_grid[u_grid.size - 1]
+#     du = u_grid[1] - u_grid[0]
+#     inv_du = 1.0 / du
+#     nU = u_grid.size
+
+#     # ------------------------------------------------------------------
+#     # PMT accumulation.
+#     # IMPORTANT: this is intentionally not parallelized with prange/OpenMP.
+#     # Some batch drivers fork worker processes after importing/compiling this
+#     # module, and GNU OpenMP aborts on fork-after-OpenMP.  Keeping this loop
+#     # serial preserves multiprocessing compatibility while retaining the
+#     # source precomputation and fast interpolation optimizations.
+#     # ------------------------------------------------------------------
+#     for i in range(n_pmts):
+#         px = p_locations[i, 0]
+#         py = p_locations[i, 1]
+#         pz = p_locations[i, 2]
+
+#         nx = direction_zs[i, 0]
+#         ny = direction_zs[i, 1]
+#         nz = direction_zs[i, 2]
+
+#         mpmt_code = mpmt_codes[i]
+
+#         mu_i = 0.0
+#         tnum_i = 0.0
+
+#         for j in range(n_src):
+#             if src_valid[j] == 0:
+#                 continue
+
+#             dx = px - src_x[j]
+#             dy = py - src_y[j]
+#             dz = pz - src_z[j]
+
 #             r2 = dx * dx + dy * dy + dz * dz
 #             if r2 <= 0.0:
 #                 continue
-#             r = math.sqrt(r2) + 0.01
 
-#             cost = -(dx * direction_zs[i, 0] + dy * direction_zs[i, 1] + dz * direction_zs[i, 2]) / r
+#             r = math.sqrt(r2) + 0.01
+#             inv_r = 1.0 / r
+
+#             # Direction cosine of photon direction relative to the muon.
+#             # dS_delta/du is zero for u <= 0.  Values slightly above 1 can
+#             # happen from roundoff and should be treated as u = 1, matching
+#             # the old clamp-before-interpolation behavior.
+#             u = (dx * track_dir[0] + dy * track_dir[1] + dz * track_dir[2]) * inv_r
+#             if (not math.isfinite(u)) or u <= 0.0:
+#                 continue
+#             if u > 1.0:
+#                 u = 1.0
+
+#             # PMT-facing factor.  This is checked before the optical response;
+#             # negative values cannot contribute.
+#             cost = -(dx * nx + dy * ny + dz * nz) * inv_r
 #             if (not math.isfinite(cost)) or cost <= 0.0:
 #                 continue
 
+#             # ----------------------------------------------------------
+#             # Fast bilinear interpolation of dS_delta/du(K, u).
+#             # K interpolation terms are source-only and were precomputed.
+#             # ----------------------------------------------------------
+#             uc = u
+#             if uc < u_min:
+#                 uc = u_min
+#             elif uc > u_max:
+#                 uc = u_max
+
+#             iu = int(math.floor((uc - u_min) * inv_du))
+#             if iu < 0:
+#                 iu = 0
+#             elif iu > nU - 2:
+#                 iu = nU - 2
+
+#             u0 = u_grid[iu]
+#             u1 = u_grid[iu + 1]
+#             tu = (uc - u0) / (u1 - u0 + 1e-300)
+#             if tu < 0.0:
+#                 tu = 0.0
+#             elif tu > 1.0:
+#                 tu = 1.0
+
+#             iK = src_iK[j]
+#             tK = src_tK[j]
+
+#             p00 = table[iK, iu]
+#             p01 = table[iK, iu + 1]
+#             p10 = table[iK + 1, iu]
+#             p11 = table[iK + 1, iu + 1]
+
+#             p0 = p00 + tu * (p01 - p00)
+#             p1 = p10 + tu * (p11 - p10)
+#             kernel = p0 + tK * (p1 - p0)
+
+#             if (not math.isfinite(kernel)) or kernel <= 0.0:
+#                 continue
+
 #             pwr = _power_law_scalar_numba(cost)
+
 #             if use_finite_disk:
 #                 optical = _finite_disk_rel_scalar_numba(r, pmt_radius_mm, ref_r_mm) * pwr
 #             else:
@@ -3055,30 +3540,22 @@ class Emitter:
 #                 optical = (R0 / r) ** distance_power * pwr
 
 #             if apply_mpmt_eff:
-#                 optical *= _rel_mpmt_eff_scalar_numba(cost, mpmt_codes[i], rel_eff_table)
+#                 optical *= _rel_mpmt_eff_scalar_numba(cost, mpmt_code, rel_eff_table)
 
 #             if (not math.isfinite(optical)) or optical <= 0.0:
 #                 continue
 
-#             u = (dx * track_dir[0] + dy * track_dir[1] + dz * track_dir[2]) / r
-#             if u < -1.0:
-#                 u = -1.0
-#             elif u > 1.0:
-#                 u = 1.0
+#             contrib = src_w[j] * optical * kernel
+#             mu_i += contrib
 
-#             kernel = _refined_delta_dSdu_scalar_numba(K, u, K_grid, u_grid, table)
-#             if kernel <= 0.0:
-#                 continue
-
-#             contrib = w_src * optical * kernel
-#             mu[i] += contrib
 #             if return_times:
-#                 t_delta = t_source + r * n_water / c_light
-#                 tnum[i] += contrib * t_delta
+#                 t_delta = src_t[j] + r * n_water / c_light
+#                 tnum_i += contrib * t_delta
 
-#     for i in range(n_pmts):
-#         mu[i] *= intensity
-#         tnum[i] *= intensity
+#         mu_i *= intensity
+#         tnum_i *= intensity
+#         mu[i] = mu_i
+#         tnum[i] = tnum_i
 
 #     if return_times:
 #         t = np.empty(n_pmts, dtype=np.float64)
@@ -3090,7 +3567,6 @@ class Emitter:
 #         return mu, t
 
 #     return mu, tnum
-
 
 
 # def _get_pmt_radius_cached(wcd):
@@ -3292,34 +3768,34 @@ class Emitter:
 
 #     return cos_alpha
 
-# def _get_muon_stopping_power_table():
+# def _get_particle_stopping_power_table(particle="muon"):
 #     """
-#     Build and cache a smooth stopping-power table for muons in water.
+#     Build and cache a smooth positive stopping-power table for a primary particle.
 
 #     Returns
 #     -------
 #     E_grid : ndarray
-#         Muon kinetic energies [MeV].
+#         Kinetic energies [MeV].
 #     dEdx_grid : ndarray
 #         Positive stopping power, -dE/ds [MeV/mm].
 
 #     Notes
 #     -----
-#     The range table stores total stopping range versus initial kinetic energy.
-#     Differentiating range with respect to kinetic energy gives dR/dE, so
+#     The range table stores total above-threshold range versus initial kinetic
+#     energy. Differentiating range with respect to kinetic energy gives dR/dE, so
 
 #         -dE/ds = 1 / (dR/dE).
 
 #     This is the same range-table information used by the collapse solver, just
 #     rearranged into the derivative needed by the analytic N_geo formula.
 #     """
-#     global _MUON_STOPPING_POWER_CACHE
+#     pname = canonical_particle_name(particle)
+#     cached = _PARTICLE_STOPPING_POWER_CACHE.get(pname)
+#     if cached is not None:
+#         return cached
 
-#     if _MUON_STOPPING_POWER_CACHE is not None:
-#         return _MUON_STOPPING_POWER_CACHE
-
-#     overall_distances = np.asarray(_get_tables()[2], dtype=np.float64)  # mm
-#     energy_rows = _get_tables()[3]
+#     overall_distances = np.asarray(_get_tables(pname)[2], dtype=np.float64)  # mm
+#     energy_rows = _get_tables(pname)[3]
 
 #     # Initial kinetic energy for each stopping range.
 #     E0 = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
@@ -3328,7 +3804,6 @@ class Emitter:
 #     E0 = E0[order]
 #     ranges = overall_distances[order]
 
-#     # Guard against duplicate/non-monotonic table entries.
 #     keep = np.isfinite(E0) & np.isfinite(ranges)
 #     E0 = E0[keep]
 #     ranges = ranges[keep]
@@ -3341,20 +3816,30 @@ class Emitter:
 #     dEdx = 1.0 / np.maximum(dR_dE, 1e-30)  # MeV / mm
 
 #     good = np.isfinite(E0) & np.isfinite(dEdx) & (dEdx > 0.0)
-#     _MUON_STOPPING_POWER_CACHE = (E0[good], dEdx[good])
-#     return _MUON_STOPPING_POWER_CACHE
+#     cached = (E0[good], dEdx[good])
+#     _PARTICLE_STOPPING_POWER_CACHE[pname] = cached
+#     return cached
 
 
-# def _interp_muon_dedx_positive(E_MeV):
+# def _interp_particle_dedx_positive(E_MeV, particle="muon"):
 #     """
-#     Interpolate positive muon stopping power -dE/ds [MeV/mm].
+#     Interpolate positive primary-particle stopping power -dE/ds [MeV/mm].
 #     """
-#     E_grid, dEdx_grid = _get_muon_stopping_power_table()
+#     E_grid, dEdx_grid = _get_particle_stopping_power_table(particle)
 #     E = np.asarray(E_MeV, dtype=np.float64)
 #     return np.interp(E, E_grid, dEdx_grid, left=dEdx_grid[0], right=dEdx_grid[-1])
 
 
-# _REFINED_ANALYTIC_DELTA_CACHE = None
+# # Backward-compatible names.
+# def _get_muon_stopping_power_table():
+#     return _get_particle_stopping_power_table("muon")
+
+
+# def _interp_muon_dedx_positive(E_MeV):
+#     return _interp_particle_dedx_positive(E_MeV, "muon")
+
+
+# _REFINED_ANALYTIC_DELTA_CACHE = {}
 
 # @njit(cache=True)
 # def _electron_cherenkov_threshold_numba(n, m_e):
@@ -3574,6 +4059,7 @@ class Emitter:
 #     n,
 #     n_T0,
 #     n_T_slow,
+#     projectile_mass,
 # ):
 #     """
 #     Compiled version of the slowing-down secondary-electron table builder.
@@ -3588,7 +4074,7 @@ class Emitter:
 #     but without Python loops or repeated kernel-array allocations.
 #     """
 #     m_e = 0.51099895
-#     m_mu = 105.658
+#     m_mu = projectile_mass
 
 #     r_e_cm = 2.8179403262e-13
 #     N_A = 6.02214076e23
@@ -3723,6 +4209,7 @@ class Emitter:
 #     n_T0=120,
 #     n_T_slow=60,
 #     n_T=None,
+#     projectile_mass=105.6583755,
 # ):
 #     """
 #     Fast compiled builder for dS_delta/du(K_mu, u).
@@ -3760,6 +4247,7 @@ class Emitter:
 #         float(n),
 #         int(n_T0),
 #         int(n_T_slow),
+#         float(projectile_mass),
 #     )
 
 #     return K_grid, u_centers, table
@@ -3767,19 +4255,26 @@ class Emitter:
 
 
 
-# def get_refined_analytic_delta_cache(n=1.344):
+# def get_refined_analytic_delta_cache(n=1.344, projectile_mass=105.6583755, particle="muon"):
 #     """
 #     Return cached refined analytic secondary-electron table.
 
-#     This is intentionally separate from the old scalar S_delta cache and the
-#     external WCSim-derived angular PDF table.
+#     The table depends on projectile mass through the delta-ray kinematics, so it
+#     is cached per (particle, n, mass) rather than globally as a muon-only table.
 #     """
 #     global _REFINED_ANALYTIC_DELTA_CACHE
 
-#     if _REFINED_ANALYTIC_DELTA_CACHE is None:
-#         _REFINED_ANALYTIC_DELTA_CACHE = _build_refined_analytic_delta_table(n=n)
+#     pname = canonical_particle_name(particle)
+#     key = (pname, float(n), float(projectile_mass))
+#     cached = _REFINED_ANALYTIC_DELTA_CACHE.get(key)
+#     if cached is None:
+#         cached = _build_refined_analytic_delta_table(
+#             n=n,
+#             projectile_mass=float(projectile_mass),
+#         )
+#         _REFINED_ANALYTIC_DELTA_CACHE[key] = cached
 
-#     return _REFINED_ANALYTIC_DELTA_CACHE
+#     return cached
 
 
 # _DELTA_E_CACHE = None
@@ -3794,7 +4289,18 @@ class Emitter:
 #       - repeated temporary allocations when not needed
 #     """
 
-#     def __init__(self, starting_time, start_coord, direction, beta, length, intensity):
+#     def __init__(
+#         self,
+#         starting_time,
+#         start_coord,
+#         direction,
+#         beta,
+#         length,
+#         intensity,
+#         particle="muon",
+#         track_end_mode="threshold",
+#         fixed_initial_KE=None,
+#     ):
 #         if not isinstance(starting_time, (int, float)):
 #             raise TypeError("starting_time must be a number")
 #         if not (
@@ -3822,7 +4328,32 @@ class Emitter:
 #         self.length = float(length)
 #         self.intensity = float(intensity)
 
-#         self.mu_mass = 105.658  # MeV/c^2
+#         self.particle_name = canonical_particle_name(particle)
+#         set_active_particle(self.particle_name)
+#         self.particle_mass = particle_mass_mev(self.particle_name)
+#         self.mu_mass = self.particle_mass  # Backward-compatible alias used by older helper names.
+
+#         # ------------------------------------------------------------------
+#         # Primary-track endpoint model.
+#         #
+#         # threshold:
+#         #     Old behavior.  The fitted parameter ``length`` is interpreted as
+#         #     the dE/dx-only range to Cherenkov threshold, so it determines the
+#         #     initial kinetic energy through the range table.
+#         #
+#         # abrupt:
+#         #     The fitted parameter ``length`` is interpreted as the visible
+#         #     primary-Cherenkov length before an abrupt cutoff/interaction.
+#         #     The initial kinetic energy is fixed independently by
+#         #     ``fixed_initial_KE``.  Internally, ``range_to_threshold_mm`` still
+#         #     comes from the dE/dx table and is used to evaluate K(s), theta_c(s),
+#         #     beta, and dE/dx along the visible part of the track.
+#         # ------------------------------------------------------------------
+#         self.track_end_mode = "threshold"
+#         self.fixed_initial_KE = None
+#         self.range_to_threshold_mm = float(length)
+#         self.last_visible_length_exceeds_range = False
+
 #         self.n = 1.344
 #         self.c = 299.792458  # mm/ns
 
@@ -3840,7 +4371,7 @@ class Emitter:
 #         self._last_geometry_cache_key = None
 #         self._last_mpmt_type_codes = None
 
-#         self.muon_subthreshold_range_mm = 120 # How far muon travels after it drops below cherenkov threshold (in mm)
+#         self.muon_subthreshold_range_mm = 120 # Backward-compatible name: subthreshold tail distance after primary Cherenkov threshold (mm)
 #         self.enable_delta_e = True
 #         self.delta_e_scale = 1
 
@@ -3865,7 +4396,7 @@ class Emitter:
 #         # time of flight from that source point to the PMT.  Any explicit
 #         # electron-propagation delay can be added with delta_e_time_offset_ns.
 #         # ------------------------------------------------------------------
-#         self.use_delta_e_timing = True
+#         self.use_delta_e_timing = False
 #         self.delta_e_time_offset_ns = 0
 
 #         # Secondary electrons are treated as localized light sources.
@@ -3889,9 +4420,20 @@ class Emitter:
 #         # efficiency remain separate, as in the old model.
 #         # ------------------------------------------------------------------
 #         self.use_analytic_primary_ngeo = True
-#         self.primary_ngeo_pmt_radius_mm = 37.0
+#         self.primary_ngeo_pmt_radius_mm = 60.0
 #         self.primary_ngeo_ref_energy_MeV = 304.0
 #         self.primary_ngeo_ref_r_mm = 1000.0
+
+#         # The original reference energy (304 MeV) is safely above the muon
+#         # Cherenkov threshold, but it is below the proton threshold in water.
+#         # If the normalization reference is below threshold,
+#         # primary_ngeo_falloff_raw() is zero and the old code silently used
+#         # norm = 1.0, suppressing primary proton light by orders of magnitude.
+#         # Keep the old muon/pion behavior, but automatically move the reference
+#         # energy above threshold for heavy particles such as protons.
+#         self.primary_ngeo_auto_ref_above_threshold = True
+#         self.primary_ngeo_ref_threshold_factor = 2.0
+#         self.primary_ngeo_ref_threshold_margin_MeV = 25.0
 
 #         # Apply relative mPMT efficiency using each secondary source point's
 #         # actual incidence angle, not the primary-muon emission angle.
@@ -3929,7 +4471,7 @@ class Emitter:
 #         # ------------------------------------------------------------------
 #         self.delta_e_use_finite_disk_solid_angle = True
 #         self.delta_e_distance_ref_r_mm = 1000.0
-#         self.delta_e_distance_pmt_radius_mm = 37.0
+#         self.delta_e_distance_pmt_radius_mm = 60
 
 #         # Kept only for backward-compatible fallback when
 #         self.delta_e_distance_power = 2
@@ -3943,12 +4485,56 @@ class Emitter:
 #         # After fixing the electron-energy dT integration and the forward-u
 #         # endpoint handling, the best low+high joint value was about 3.4.
 #         self.analytic_delta_scale = 1 #2.5
+        
+#         # Try a small physical floor for PMTs
+#         self.charge_floor_pe = 0 #1e-4
+        
+#         # Diagnostic only:
+#         # Artificially shift secondary-electron emission points downstream
+#         # along the muon direction. This tests whether collapsing electron
+#         # range back to the muon point is causing the central-light deficit.
+#         self.delta_e_test_forward_shift_mm = 0
+        
+#         # ------------------------------------------------------------------
+#         # DEBUG / DIAGNOSTIC ONLY:
+#         # Reweight the refined secondary-electron angular table toward high u,
+#         # while optionally preserving each K-row's total integrated yield.
+#         #
+#         # u_power = 0 -> original table
+#         # u_power = 1 -> multiply by u
+#         # u_power = 2 -> multiply by u^2
+#         # u_power = 4 -> strongly forward-weighted
+#         # ------------------------------------------------------------------
+#         self.delta_e_debug_u_power = 0
+#         self.delta_e_debug_u_min = 0.0
+#         self.delta_e_debug_preserve_yield = True
+        
+#         # ------------------------------------------------------------------
+#         # Primary-muon cone softening.
+#         #
+#         # The collapse solver compares the PMT direction alpha(s) to the
+#         # shrinking Cherenkov angle theta_c(s).  If there is no exact crossing,
+#         # this width gives a soft nonzero contribution based on the closest
+#         # angular mismatch:
+#         #
+#         #   exp[-0.5 * (min|alpha - theta_c| / sigma)^2]
+#         #
+#         # Units: radians.  Set to 0.0 to recover hard zero behavior for
+#         # no-crossing PMTs.
+#         # ------------------------------------------------------------------
+#         self.primary_soft_cone_sigma_rad = 0.015
+
+#         # Configure the endpoint mode after all attributes used by the kinematic
+#         # refresh helpers exist.  For the default threshold mode this is exactly
+#         # the old behavior.
+#         self.configure_track_end(track_end_mode, fixed_initial_KE=fixed_initial_KE, refresh=False)
 
 #         # Match the original behavior: initialise beta from the length-dependent
 #         # lookup table rather than trusting the constructor beta argument.
 #         self.refresh_kinematics_from_length(self.length)
 
-
+        
+        
 
 
 #     def __repr__(self):
@@ -3969,6 +4555,21 @@ class Emitter:
 #         new.__dict__ = self.__dict__.copy()
 #         return new
 
+#     def set_particle(self, particle):
+#         """Set the primary particle species for this emitter."""
+#         self.particle_name = canonical_particle_name(particle)
+#         set_active_particle(self.particle_name)
+#         self.particle_mass = particle_mass_mev(self.particle_name)
+#         self.mu_mass = self.particle_mass  # compatibility alias
+#         self.interp_E_init = None
+#         self._energy_main_idx = None
+#         self._energy_dist_row = None
+#         self._energy_energy_row = None
+#         self.range_to_threshold_mm = float(self.length)
+#         self.last_visible_length_exceeds_range = False
+#         self.refresh_kinematics_from_length(self.length)
+#         return self
+
 #     def calc_constants(self, n):
 #         self.n = float(n)
 #         self.cos_tq = 1.0 / (self.beta * self.n)
@@ -3979,14 +4580,115 @@ class Emitter:
 #         self.v = self.beta * self.c
 
 #     @staticmethod
-#     def nearest_main_idx(length_mm):
-#         idx = np.searchsorted(_get_tables()[2], float(length_mm))
-#         idx = np.clip(idx, 1, len(_get_tables()[2]) - 1)
-#         left = _get_tables()[2][idx - 1]
-#         right = _get_tables()[2][idx]
+#     def nearest_main_idx(length_mm, particle=None):
+#         tables = _get_tables(particle)
+#         overall = tables[2]
+#         idx = np.searchsorted(overall, float(length_mm))
+#         idx = np.clip(idx, 1, len(overall) - 1)
+#         left = overall[idx - 1]
+#         right = overall[idx]
 #         if (float(length_mm) - left) <= (right - float(length_mm)):
 #             idx -= 1
 #         return int(idx)
+
+#     def configure_track_end(self, mode="threshold", fixed_initial_KE=None, refresh=True):
+#         """Configure how the primary Cherenkov track terminates.
+
+#         Parameters
+#         ----------
+#         mode : {"threshold", "abrupt"}
+#             ``threshold`` keeps the original behavior: fitted ``length`` is the
+#             dE/dx range to Cherenkov threshold and therefore determines the
+#             initial kinetic energy.
+
+#             ``abrupt`` makes fitted ``length`` the visible primary-Cherenkov
+#             length only.  The initial kinetic energy must be supplied separately
+#             through ``fixed_initial_KE``.  This is intended for protons/hadrons
+#             whose clean Cherenkov ring can end suddenly before the particle has
+#             slowed to threshold.
+#         fixed_initial_KE : float or None
+#             Fixed initial kinetic energy in MeV for abrupt mode.
+#         refresh : bool
+#             If True, immediately refresh beta and the cached K(s) lookup row.
+#         """
+#         mode = str(mode).strip().lower()
+#         aliases = {
+#             "threshold": "threshold",
+#             "range": "threshold",
+#             "csda": "threshold",
+#             "old": "threshold",
+#             "abrupt": "abrupt",
+#             "truncated": "abrupt",
+#             "interaction": "abrupt",
+#             "absorbed": "abrupt",
+#             "absorption": "abrupt",
+#         }
+#         if mode not in aliases:
+#             raise ValueError(
+#                 "track_end_mode must be 'threshold' or 'abrupt' "
+#                 f"(got {mode!r})"
+#             )
+
+#         self.track_end_mode = aliases[mode]
+#         if fixed_initial_KE is None:
+#             self.fixed_initial_KE = None
+#         else:
+#             self.fixed_initial_KE = float(fixed_initial_KE)
+
+#         if self.track_end_mode == "abrupt" and self.fixed_initial_KE is None:
+#             raise ValueError(
+#                 "abrupt track-end mode requires fixed_initial_KE in MeV. "
+#                 "Use threshold mode if fitted length should determine energy."
+#             )
+
+#         self.interp_E_init = None
+#         self._energy_main_idx = None
+#         self._energy_dist_row = None
+#         self._energy_energy_row = None
+
+#         if refresh:
+#             self.refresh_kinematics_from_length(self.length)
+#         return self
+
+#     # More explicit aliases for fit-driver code.
+#     set_track_end_mode = configure_track_end
+#     set_primary_truncation_mode = configure_track_end
+
+#     def _range_to_threshold_from_energy(self, initial_KE):
+#         """Interpolate dE/dx-only Cherenkov-visible range [mm] from K0 [MeV]."""
+#         tables = _get_tables(self.particle_name)
+#         overall_distances = np.asarray(tables[2], dtype=np.float64)
+#         energy_rows = tables[3]
+#         initial_energies = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
+
+#         order = np.argsort(initial_energies)
+#         initial_energies = initial_energies[order]
+#         overall_distances = overall_distances[order]
+
+#         return float(
+#             np.interp(
+#                 float(initial_KE),
+#                 initial_energies,
+#                 overall_distances,
+#                 left=overall_distances[0],
+#                 right=overall_distances[-1],
+#             )
+#         )
+
+#     def _cache_energy_row_for_range(self, range_mm):
+#         """Cache the K(s) table row corresponding to a dE/dx range."""
+#         main_idx = self.nearest_main_idx(float(range_mm), particle=self.particle_name)
+#         tables = _get_tables(self.particle_name)
+#         self._energy_main_idx = main_idx
+#         self._energy_dist_row = tables[4][main_idx]
+#         self._energy_energy_row = tables[3][main_idx]
+#         return main_idx
+
+#     def visible_length_is_physical(self, tol_mm=1e-9):
+#         """Return False when an abrupt visible length exceeds the dE/dx range."""
+#         if self.track_end_mode != "abrupt":
+#             return True
+#         return float(self.length) <= float(self.range_to_threshold_mm) + float(tol_mm)
 
 #     def _get_energy_rows_for_length(self, L_stop_mm):
 #         """
@@ -3996,14 +4698,15 @@ class Emitter:
 #         refresh_kinematics_from_length(), avoiding repeated table searches for
 #         every secondary-electron source calculation.
 #         """
+#         cached_range = float(getattr(self, "range_to_threshold_mm", self.length))
 #         if (
 #             self._energy_dist_row is not None
 #             and self._energy_energy_row is not None
-#             and np.isclose(float(L_stop_mm), float(self.length), rtol=0.0, atol=1e-12)
+#             and np.isclose(float(L_stop_mm), cached_range, rtol=0.0, atol=1e-12)
 #         ):
 #             return self._energy_dist_row, self._energy_energy_row
 
-#         overall_distances, energy_rows, distance_rows = _get_tables()[2:5]
+#         overall_distances, energy_rows, distance_rows = _get_tables(self.particle_name)[2:5]
 #         main_idx = np.searchsorted(overall_distances, float(L_stop_mm))
 #         main_idx = np.clip(main_idx, 1, len(overall_distances) - 1)
 
@@ -4016,7 +4719,7 @@ class Emitter:
 
 #     def muon_energy_at_s(self, s_mm, L_stop_mm):
 #         """
-#         Approximate muon kinetic energy at distance s along the physical muon path.
+#         Approximate primary-particle kinetic energy at distance s along the physical muon path.
 
 #         Uses the same range-table philosophy as the collapse solver.
 #         """
@@ -4044,15 +4747,32 @@ class Emitter:
 #         return self.interp_E_init
 
 #     def refresh_kinematics_from_length(self, length_mm):
+#         """Refresh beta and K(s) tables from the current fit length.
+
+#         In threshold mode this is the historical behavior: ``length_mm`` selects
+#         the range-table row and therefore the initial kinetic energy.
+
+#         In abrupt mode, ``length_mm`` is only the visible/truncated Cherenkov
+#         length.  The dE/dx range row and beta are instead selected from the fixed
+#         initial kinetic energy.
+#         """
 #         self.length = float(length_mm)
-#         main_idx = self.nearest_main_idx(self.length)
 
-#         # Cache the table row used by muon_energy_at_s_array().
-#         tables = _get_tables()
-#         self._energy_main_idx = main_idx
-#         self._energy_dist_row = tables[4][main_idx]
-#         self._energy_energy_row = tables[3][main_idx]
+#         if getattr(self, "track_end_mode", "threshold") == "abrupt":
+#             if self.fixed_initial_KE is None:
+#                 raise ValueError(
+#                     "Emitter is in abrupt track-end mode but fixed_initial_KE is not set."
+#                 )
+#             self.range_to_threshold_mm = self._range_to_threshold_from_energy(self.fixed_initial_KE)
+#             self._cache_energy_row_for_range(self.range_to_threshold_mm)
+#             self.last_visible_length_exceeds_range = not self.visible_length_is_physical()
+#             return self.refresh_kinematics_from_energy(self.fixed_initial_KE)
 
+#         # Default/old behavior: fitted length is the range to Cherenkov threshold.
+#         self.range_to_threshold_mm = float(self.length)
+#         self.last_visible_length_exceeds_range = False
+#         main_idx = self._cache_energy_row_for_range(self.length)
+#         tables = _get_tables(self.particle_name)
 #         return self.refresh_kinematics_from_energy(tables[3][main_idx][0])
 
 #     def set_nominal_track_parameters(self, starting_time, start_coord, direction, length):
@@ -4408,16 +5128,20 @@ class Emitter:
 #         return out
 
 
-#     def muon_dedx_positive(self, E_MeV):
+#     def particle_dedx_positive(self, E_MeV):
 #         """
-#         Positive muon stopping power, -dE/ds, in MeV/mm.
+#         Positive primary-particle stopping power, -dE/ds, in MeV/mm.
 
-#         This is derived from the same muon range table used by the collapse
-#         solver.  It is needed for the analytic cone-density falloff:
+#         This is derived from the same particle range table used by the collapse
+#         solver. It is needed for the analytic cone-density falloff:
 
 #             d cos(theta_c)/ds = (-dE/ds) / (n m beta^3 gamma^3).
 #         """
-#         return _interp_muon_dedx_positive(E_MeV)
+#         return _interp_particle_dedx_positive(E_MeV, self.particle_name)
+
+#     def muon_dedx_positive(self, E_MeV):
+#         """Backward-compatible alias for particle_dedx_positive()."""
+#         return self.particle_dedx_positive(E_MeV)
 
 
 #     def primary_ngeo_falloff_raw(self, E_MeV, r_mm):
@@ -4481,6 +5205,27 @@ class Emitter:
 #         return out
 
 
+#     def primary_ngeo_reference_energy(self):
+#         """Return a particle-safe reference energy for N_geo normalization.
+
+#         The historical value primary_ngeo_ref_energy_MeV=304 MeV was tuned for
+#         muons.  For protons in water, 304 MeV is below Cherenkov threshold, so
+#         primary_ngeo_falloff_raw(304 MeV, r_ref) is exactly zero.  That made the
+#         normalization fall back to 1.0 and effectively removed the primary
+#         proton ring.
+#         """
+#         E_ref = float(self.primary_ngeo_ref_energy_MeV)
+#         if getattr(self, "primary_ngeo_auto_ref_above_threshold", True):
+#             threshold = float(self.get_cherenkov_threshold_kinetic_energy())
+#             min_ref = max(
+#                 threshold + float(getattr(self, "primary_ngeo_ref_threshold_margin_MeV", 25.0)),
+#                 threshold * float(getattr(self, "primary_ngeo_ref_threshold_factor", 2.0)),
+#             )
+#             if E_ref <= min_ref:
+#                 E_ref = min_ref
+#         return float(E_ref)
+
+
 #     def primary_ngeo_normalization(self):
 #         """
 #         Fixed convention factor for N_geo.
@@ -4489,11 +5234,12 @@ class Emitter:
 #         recomputed for every Minuit FCN call even though it only depends on the
 #         optical constants and chosen reference point.
 #         """
-#         E_ref = float(self.primary_ngeo_ref_energy_MeV)
+#         E_ref = self.primary_ngeo_reference_energy()
 #         r_ref = float(self.primary_ngeo_ref_r_mm)
 #         key = (
+#             self.particle_name,
 #             float(self.n),
-#             float(self.mu_mass),
+#             float(self.particle_mass),
 #             float(self.primary_ngeo_pmt_radius_mm),
 #             E_ref,
 #             r_ref,
@@ -4503,18 +5249,22 @@ class Emitter:
 #         if cached is not None:
 #             return cached
 
-#         raw_ref = _primary_ngeo_raw_static(
+#         raw_ref = self.primary_ngeo_falloff_raw(
 #             np.asarray([E_ref], dtype=np.float64),
 #             np.asarray([r_ref], dtype=np.float64),
-#             n=float(self.n),
-#             mu_mass=float(self.mu_mass),
-#             pmt_radius_mm=float(self.primary_ngeo_pmt_radius_mm),
 #         )[0]
 
 #         if not np.isfinite(raw_ref) or raw_ref <= 0.0:
+#             # This should no longer happen for protons because the reference
+#             # energy is moved above threshold, but keep a clear diagnostic state
+#             # instead of silently producing a tiny primary component.
 #             norm = 1.0
 #         else:
 #             norm = float(n_from_E_r(E_ref, r_ref) / raw_ref)
+
+#         self._last_primary_ngeo_norm = float(norm)
+#         self._last_primary_ngeo_ref_energy_MeV = float(E_ref)
+#         self._last_primary_ngeo_raw_ref = float(raw_ref)
 
 #         _PRIMARY_NGEO_NORM_CACHE[key] = norm
 #         return norm
@@ -4530,7 +5280,12 @@ class Emitter:
 
 
 #     def get_physical_stop_length_from_cherenkov_length(self):
+#         if getattr(self, "track_end_mode", "threshold") == "abrupt":
+#             return float(self.length)
 #         return self.length + self.muon_subthreshold_range_mm
+
+#     def get_cherenkov_threshold_kinetic_energy(self):
+#         return cherenkov_threshold_kinetic_mev(float(self.particle_mass), n=float(self.n))
 
 #     def beta2_from_K(self, K, mass):
 #         K = np.asarray(K, dtype=np.float64)
@@ -4625,7 +5380,7 @@ class Emitter:
 #         K_mu = np.asarray(K_mu, dtype=np.float64)
 #         u = np.asarray(cos_forward, dtype=np.float64)
 
-#         K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n)
+#         K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n, projectile_mass=float(self.particle_mass), particle=self.particle_name)
 
 #         valid_K = np.isfinite(K_mu)
 #         # Treat the table as representing bins over the physical range 0 < u <= 1.
@@ -4707,7 +5462,14 @@ class Emitter:
 #         # Build the same two-part source grid as the slow implementation:
 #         # visible above-threshold track plus forced below-threshold tail.
 #         L_ch = max(float(self.length), 0.0)
-#         L_tail = max(float(self.muon_subthreshold_range_mm), 0.0)
+#         if getattr(self, "track_end_mode", "threshold") == "abrupt":
+#             # Abrupt endpoint means the primary track has ended/interacted, not
+#             # merely fallen below Cherenkov threshold.  Do not append the old
+#             # below-threshold secondary-electron tail beyond the visible cutoff.
+#             L_tail = 0.0
+#         else:
+#             L_tail = max(float(self.muon_subthreshold_range_mm), 0.0)
+#         L_stop_for_energy = float(getattr(self, "range_to_threshold_mm", L_ch))
 #         n_ch = max(1, int(self.n_delta_steps))
 
 #         tail_step_mm = max(float(getattr(self, "delta_e_tail_step_mm", 20.0)), 1e-12)
@@ -4733,10 +5495,10 @@ class Emitter:
 #         below_threshold = ~above_threshold
 
 #         if np.any(above_threshold):
-#             K_mu[above_threshold] = self.muon_energy_at_s_array(s_centers[above_threshold], L_ch)
+#             K_mu[above_threshold] = self.muon_energy_at_s_array(s_centers[above_threshold], L_stop_for_energy)
 
 #         if np.any(below_threshold):
-#             K_thr = self.muon_energy_at_s_array(np.array([L_ch], dtype=np.float64), L_ch)[0]
+#             K_thr = self.muon_energy_at_s_array(np.array([L_ch], dtype=np.float64), L_stop_for_energy)[0]
 #             d_post = s_centers[below_threshold] - L_ch
 #             frac = np.clip(d_post / max(L_tail, 1e-12), 0.0, 1.0)
 #             K_mu[below_threshold] = K_thr * (1.0 - frac)
@@ -4759,11 +5521,71 @@ class Emitter:
 #         s_centers = np.ascontiguousarray(s_centers[valid_src], dtype=np.float64)
 #         ds_cm = np.ascontiguousarray(ds_cm[valid_src], dtype=np.float64)
 #         K_mu = np.ascontiguousarray(K_mu[valid_src], dtype=np.float64)
+        
+#         # ------------------------------------------------------------
+#         # DIAGNOSTIC ONLY:
+#         # Keep the secondary-electron yield and muon-energy assignment
+#         # fixed, but project the light as if it were emitted downstream
+#         # from the parent muon point.
+#         #
+#         # This tests whether spatially collapsing electron range back to
+#         # the muon point is responsible for underfilling the ring center.
+#         # ------------------------------------------------------------
+# #         delta_shift_mm = float(getattr(self, "delta_e_test_forward_shift_mm", 0.0))
+# #         s_centers_for_projection = np.ascontiguousarray(
+# #             s_centers + delta_shift_mm,
+# #             dtype=np.float64,
+# #         )
+        
+#         ###
+        
 
-#         K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n)
+#         K_grid, u_grid, table = get_refined_analytic_delta_cache(self.n, projectile_mass=float(self.particle_mass), particle=self.particle_name)
+       
 #         K_grid = np.ascontiguousarray(K_grid, dtype=np.float64)
 #         u_grid = np.ascontiguousarray(u_grid, dtype=np.float64)
 #         table = np.ascontiguousarray(table, dtype=np.float64)
+        
+        
+#         # ------------------------------------------------------------------
+#         # DEBUG / DIAGNOSTIC ONLY:
+#         # Modify the refined secondary-electron angular table shape.
+#         # This tests whether the electron light is too broad in u.
+#         #
+#         # Important:
+#         #   If delta_e_debug_preserve_yield=True, each K row is renormalized so
+#         #   the total secondary-electron yield S_delta(K) stays approximately fixed.
+#         #   Therefore this tests angular broadness, not total electron intensity.
+#         # ------------------------------------------------------------------
+#         u_power = float(getattr(self, "delta_e_debug_u_power", 0.0))
+#         u_min = float(getattr(self, "delta_e_debug_u_min", 0.0))
+#         preserve_yield = bool(getattr(self, "delta_e_debug_preserve_yield", True))
+
+#         if (u_power != 0.0) or (u_min > 0.0):
+#             table_mod = np.array(table, dtype=np.float64, copy=True)
+
+#             du = float(u_grid[1] - u_grid[0])
+#             row_yield_before = np.sum(table_mod, axis=1) * du
+
+#             if u_min > 0.0:
+#                 table_mod[:, u_grid < u_min] = 0.0
+
+#             if u_power != 0.0:
+#                 weights = np.clip(u_grid, 0.0, 1.0) ** u_power
+#                 table_mod *= weights[None, :]
+
+#             if preserve_yield:
+#                 row_yield_after = np.sum(table_mod, axis=1) * du
+#                 renorm = np.divide(
+#                     row_yield_before,
+#                     row_yield_after,
+#                     out=np.ones_like(row_yield_before),
+#                     where=(row_yield_after > 0.0) & np.isfinite(row_yield_after),
+#                 )
+#                 table_mod *= renorm[:, None]
+
+#             table = table_mod
+#         ###
 
 #         if mpmt_types is None:
 #             mpmt_codes = np.full(n_pmts, -1, dtype=np.int8)
@@ -4825,9 +5647,9 @@ class Emitter:
 #         Expected PE and first-hit-time model used by the fit.
 
 #         The heavy cone-collapse work is delegated to the optimized solver in
-#         model_muon_cherenkov_collapse.py.
+#         particle_cherenkov_model.py.
 #         """
-#         pmt_radius = _get_pmt_radius_cached(wcd)
+#         pmt_radius = _get_pmt_radius_cached(wcd) + 20 # Add 20 mm for additional reflector surface area
 
 #         p_locations = np.asarray(p_locations, dtype=np.float64)
 #         direction_zs = np.asarray(direction_zs, dtype=np.float64)
@@ -4838,17 +5660,13 @@ class Emitter:
 #         # If your fit creates a fresh Emitter each FCN call this still saves the
 #         # source x PMT tiling inside the secondary model; if the Emitter is
 #         # reused, this also saves the string comparisons.
-#         if type(mpmt_types) != type(None):
-#             geom_key = (id(mpmt_types), np.shape(mpmt_types))
-#             if geom_key == self._last_geometry_cache_key and self._last_mpmt_type_codes is not None:
-#                 mpmt_codes = self._last_mpmt_type_codes
-#             else:
-#                 mpmt_codes = _encode_mpmt_types(mpmt_types)
-#                 self._last_geometry_cache_key = geom_key
-#                 self._last_mpmt_type_codes = mpmt_codes
+#         geom_key = (id(mpmt_types), np.shape(mpmt_types))
+#         if geom_key == self._last_geometry_cache_key and self._last_mpmt_type_codes is not None:
+#             mpmt_codes = self._last_mpmt_type_codes
 #         else:
-#             mpmt_codes = None
-            
+#             mpmt_codes = _encode_mpmt_types(mpmt_types)
+#             self._last_geometry_cache_key = geom_key
+#             self._last_mpmt_type_codes = mpmt_codes
 
 #         n_pmts = s.size
 
@@ -4871,8 +5689,12 @@ class Emitter:
 #                 s_a_mm=0.001,
 #                 s_max_mm=self.length,
 #                 theta_c_func=theta_c_func,
+#                 range_stop_mm=float(getattr(self, "range_to_threshold_mm", self.length)),
 #                 n_scan=150,
-#                 near_cross_tol=0.02,
+#                 near_cross_tol=float(getattr(self, "primary_soft_cone_sigma_rad", 0.03)),#0.02,
+#                 particle=self.particle_name,
+#                 particle_mass=float(self.particle_mass),
+#                 n_water=float(self.n),
 #             )
 
 #             scale[idx] = scale_sub
@@ -4967,7 +5789,31 @@ class Emitter:
 #         raw_mean = float(np.mean(mean_pes_raw))
 #         norm = obs_mean / raw_mean if raw_mean > 0.0 else 1.0
 #         mean_pes = mean_pes_raw * norm
-#         mean_pes[mean_pes < 1e-3] = 0.0
+#         #mean_pes[mean_pes < 1e-3] = 0.0
+#         # Test a small physical floor
+#         mean_pes = np.maximum(mean_pes, self.charge_floor_pe)
+
+#         # Store component diagnostics from the most recent prediction.  This is
+#         # useful for checking that the primary ring is not accidentally being
+#         # suppressed by a normalization or threshold issue.
+#         sum_primary = float(np.sum(mu_primary))
+#         sum_delta = float(np.sum(mu_delta_scaled))
+#         sum_total = float(np.sum(mean_pes_raw))
+#         self._last_expected_components = {
+#             "mu_primary_raw": mu_primary.copy(),
+#             "mu_delta_raw": mu_delta_scaled.copy(),
+#             "mean_pes_raw": mean_pes_raw.copy(),
+#             "mean_pes": mean_pes.copy(),
+#             "norm": float(norm),
+#             "obs_mean": float(obs_mean),
+#             "raw_mean": float(raw_mean),
+#             "sum_primary_raw": sum_primary,
+#             "sum_delta_raw": sum_delta,
+#             "primary_fraction_raw": (sum_primary / sum_total) if sum_total > 0.0 else np.nan,
+#             "primary_ngeo_ref_energy_MeV": float(getattr(self, "_last_primary_ngeo_ref_energy_MeV", np.nan)),
+#             "primary_ngeo_norm": float(getattr(self, "_last_primary_ngeo_norm", np.nan)),
+#             "primary_ngeo_raw_ref": float(getattr(self, "_last_primary_ngeo_raw_ref", np.nan)),
+#         }
 
 #         # Expected time model.
 #         #

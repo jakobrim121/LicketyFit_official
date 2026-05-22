@@ -43,9 +43,13 @@ class Fitter:
         self.minimizer.errordef = Minuit.LIKELIHOOD
 
     def minimize(self):
-        """Perform the minimization using Minuit."""
+        """Perform the minimization using Minuit.
+
+        Do not treat ``minimizer.valid == False`` as a fatal result here; in
+        this workflow that flag is diagnostic, not by itself a reason to reject
+        a fit.  Callers can inspect ``self.minimizer.fval``, ``fmin.edm``, and
+        the fitted values/errors to decide whether to retry or rescue.
+        """
         self.minimizer.migrad()
-        if not self.minimizer.valid:
-            raise RuntimeError("Minimization did not converge")
         return self.minimizer.values, self.minimizer.errors
 

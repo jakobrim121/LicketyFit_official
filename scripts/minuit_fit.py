@@ -82,6 +82,10 @@ def fit_track_with_minuit(
     strategy=2,
     ncall=None,
     staged=True,
+    particle="muon",
+    track_end_mode="threshold",
+    fixed_initial_KE=None,
+    length_upper_limit=3000.0,
 ):
     """
     Minuit-based track fit.
@@ -116,9 +120,12 @@ def fit_track_with_minuit(
         beta=beta,
         length=400.0,
         intensity=intensity,
+        particle=particle,
+        track_end_mode=track_end_mode,
+        fixed_initial_KE=fixed_initial_KE,
     )
 
-    p_locations, direction_zs = emitter.get_pmt_placements(ev, wcte, "design")
+    p_locations, direction_zs, _mpmt_slots = emitter.get_pmt_placements(ev, wcte, "design")
     p_locations = np.asarray(p_locations, dtype=np.float64)
     direction_zs = np.asarray(direction_zs, dtype=np.float64)
 
@@ -134,6 +141,8 @@ def fit_track_with_minuit(
     cx_init = 0.0
     cy_init = 0.0
     length_init = float(np.max(p_locations[:, 2]) - np.min(p_locations[:, 2]))
+    if getattr(emitter, "track_end_mode", "threshold") == "abrupt":
+        length_init = min(length_init, float(getattr(emitter, "range_to_threshold_mm", length_init)))
 
     if verbose:
         print("Initial guesses:")
@@ -154,13 +163,15 @@ def fit_track_with_minuit(
         emitter.starting_time = t0
 
         init_ke = emitter.refresh_kinematics_from_length(length)
+        if not emitter.visible_length_is_physical():
+            return 1e30
         s = emitter.get_emission_points(p_locations, init_ke)
         exp_pes, exp_ts = emitter.get_expected_pes_ts(
             wcte,
             s,
             p_locations,
             direction_zs,
-            corr_pos=None,
+            mpmt_types=None,
             obs_pes=obs_pes,
         )
 
@@ -185,7 +196,10 @@ def fit_track_with_minuit(
     m.limits["z0"] = (-2000, 2000)
     m.limits["cx"] = (-0.5, 0.5)
     m.limits["cy"] = (-0.5, 0.5)
-    m.limits["length"] = (100, 3000)
+    length_hi = float(length_upper_limit)
+    if getattr(emitter, "track_end_mode", "threshold") == "abrupt":
+        length_hi = min(length_hi, float(getattr(emitter, "range_to_threshold_mm", length_hi)))
+    m.limits["length"] = (100, length_hi)
     m.limits["t0"] = (-30, 60)
 
     m.errors["x0"] = 20.0

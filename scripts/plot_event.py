@@ -5,6 +5,7 @@ sys.path.insert(0, "../event_display")
 from EventDisplay import EventDisplay
 
 sys.path.insert(0, "../LicketyFit")
+sys.path.insert(0, "../tables")
 
 #sys.path.insert(0, "../../")
 #matplotlib.use('Agg')
@@ -157,3 +158,89 @@ def plot_event(file_path_or_data, evt_num, vmax=5,vmin=0.1, log_scale=False, LF_
         x = eventDisplay.plotEventDisplay(data_to_plot,vmax=vmax,vmin=vmin,log_scale=False,color_norm=colors.Normalize(), style= "dark_background")
 
 
+
+
+
+
+
+# """
+# Optional WCSim/LF event plotting helper.
+
+# This module intentionally has no import-time side effects.  The original version
+# constructed an EventDisplay object at import time, which could fail in a clean
+# self-contained checkout when optional plotting assets were not present.
+# """
+
+# from __future__ import annotations
+
+# from pathlib import Path
+
+# import numpy as np
+
+
+# def load_wcsim_to_wcte_mapping(mapping_path=None):
+#     if mapping_path is None:
+#         mapping_path = Path(__file__).resolve().parent.parent / "tables" / "wcsim_wcte_mapping.txt"
+#     mapping_path = Path(mapping_path)
+#     arr = np.loadtxt(mapping_path)
+#     mapping = {}
+#     for row in np.atleast_2d(arr):
+#         # WCSim file convention in your previous plotting scripts used raw tube
+#         # numbers offset by -1; the value returned is WCTE slot*100+pmt_0based.
+#         mapping[int(row[0]) - 1] = int(row[1] * 100 + row[2] - 1)
+#     return mapping
+
+
+# def plot_event(file_path_or_data, evt_num, *, use_mapping=True, mapping_path=None):
+#     """
+#     Return an LF-style event array with columns [pmt_id, charge, time].
+
+#     Parameters
+#     ----------
+#     file_path_or_data : str, Path, or dict-like
+#         Either a WCSim npz path or a loaded dict/npz object with digi_hit_pmt,
+#         digi_hit_charge, and digi_hit_time.
+#     evt_num : int
+#         Event index inside the WCSim arrays.
+#     use_mapping : bool
+#         If True, convert raw WCSim PMT IDs to WCTE PMT IDs using the mapping file.
+#     """
+#     if isinstance(file_path_or_data, (str, Path)):
+#         data = np.load(file_path_or_data, allow_pickle=True)
+#     else:
+#         data = file_path_or_data
+
+#     pmts = np.asarray(data["digi_hit_pmt"][evt_num], dtype=int)
+#     charges = np.asarray(data["digi_hit_charge"][evt_num], dtype=float)
+#     times = np.asarray(data["digi_hit_time"][evt_num], dtype=float)
+
+#     if use_mapping:
+#         mapping = load_wcsim_to_wcte_mapping(mapping_path)
+#         mapped = []
+#         keep = []
+#         for i, p in enumerate(pmts):
+#             if int(p) in mapping:
+#                 mapped.append(mapping[int(p)])
+#                 keep.append(i)
+#         pmts = np.asarray(mapped, dtype=int)
+#         charges = charges[keep]
+#         times = times[keep]
+
+#     return np.column_stack([pmts, charges, times])
+
+
+# # def plot_event(*args, **kwargs):
+# #     """
+# #     Optional legacy display wrapper.
+
+# #     The full 2D unwrapped event-display stack is not required for fitting and is
+# #     not bundled here.  Use lf_array_from_wcsim_npz(...) to get the data array for
+# #     fitting or copy your external event_display assets into the checkout if you
+# #     need the old display.
+# #     """
+# #     raise RuntimeError(
+# #         "The legacy 2D EventDisplay assets are optional and are not included in "
+# #         "this self-contained fitter package. Use lf_array_from_wcsim_npz(...) "
+# #         "to build fit arrays, or add your event_display package/assets and "
+# #         "restore your plotting wrapper."
+# #     )

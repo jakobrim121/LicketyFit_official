@@ -1,9 +1,18 @@
-from LicketyFit.event_displays_chatgpt import (
-    plot_unified_surface,
-    plot_photon_sky,
-    plot_hough_circle_endcap,
-    plot_hough_barrel_sinusoid
-)
+try:
+    from LicketyFit.event_displays_chatgpt import (
+        plot_unified_surface,
+        plot_photon_sky,
+        plot_hough_circle_endcap,
+        plot_hough_barrel_sinusoid,
+    )
+except Exception:
+    # Optional plotting helpers are not required for fitting.  EventDisplay will
+    # still import in a self-contained fitter checkout; plotting methods that
+    # need these helpers will fail only if called without adding the helpers.
+    plot_unified_surface = None
+    plot_photon_sky = None
+    plot_hough_circle_endcap = None
+    plot_hough_barrel_sinusoid = None
 
 import numpy as np
 
