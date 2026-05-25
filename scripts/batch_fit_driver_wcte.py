@@ -90,8 +90,8 @@ def _parse_float_list_env(name, default):
 # -----------------------------------------------------------------------------
 # 1) Run, event input, and output
 # -----------------------------------------------------------------------------
-RUN = _env_int("RUN", 2079)
-BEAM_P = _env_float("BEAM_P", 430)
+RUN = _env_int("RUN", 1589)
+BEAM_P = _env_float("BEAM_P", 1500)
 N_EVENTS = _env_int("N_EVENTS", 10000)
 
 # Number of fitted events per multiprocessing batch.
@@ -118,14 +118,14 @@ OUTPUT_FILE_OVERRIDE = os.environ.get("LF_OUTPUT_FILE", "").strip()
 # Particle hypothesis used by the likelihood and range table.
 # Common choices depend on your particle_cherenkov_model.py support, e.g.:
 #   "muon", "pion", "kaon", "proton"
-FIT_PARTICLE = os.environ.get("FIT_PARTICLE", "muon").strip()
+FIT_PARTICLE = os.environ.get("FIT_PARTICLE", "proton").strip()
 
 # Track-end / parameterization mode:
 #   "full_length" : original 7-parameter fit; length determines initial KE
 #   "absorption"  : 8-parameter fit; visible_length and full_range float separately
 FIT_MODE_REQUEST = os.environ.get(
     "FIT_MODE",
-    os.environ.get("TRACK_END_MODE", "full_length"),
+    os.environ.get("TRACK_END_MODE", "absorption"),
 ).strip().lower()
 
 # Likelihood mode:
@@ -365,7 +365,7 @@ for _path in (str(LICKETYFIT_DIR), str(PROJECT_ROOT), str(SCRIPT_DIR), str(TABLE
 
 # Force local tables before importing lookup/collapse helpers.
 os.environ["LF_TABLE_DIR"] = str(TABLE_DIR)
-os.environ["LF_MULTIPARTICLES_TABLE_DIR"] = str(TABLE_DIR)
+os.environ["LF_OFFICIAL_TABLE_DIR"] = str(TABLE_DIR)
 
 from Geometry.Device import Device
 from LicketyFit.Event import Event
@@ -378,10 +378,10 @@ from particle_cherenkov_model import (
     particle_mass_mev,
     cherenkov_threshold_kinetic_mev,
 )
-try:
-    from event_loader import get_selected_events
-except Exception:
-    get_selected_events = None
+#try:
+from event_loader import get_selected_events
+# except Exception:
+#     get_selected_events = None
 from particle_range_lookup import ParticleRangeLookup
 
 

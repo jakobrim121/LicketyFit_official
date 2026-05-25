@@ -95,22 +95,41 @@ def _make_beam_event_mask(
     *,
     tof_window=DEFAULT_TOF_WINDOW,
     t5_particle_nr=1,
+    particle = "muon",
 ):
     """Return the standard beam/quality/TOF event mask."""
-    return (
-        (arr["vme_act_eveto"] < eveto_cut)
-        & (arr["vme_act_tagger"] > tagger_cut)
-        & (arr["T5_HasMultipleScintillatorsHit"] == False)
-        & (arr["T5_HasOutOfTimeWindow"] == False)
-        & (arr["vme_evt_quality_bitmask"] == 0)
-        & (arr["T5_HasValidHit"] == True)
-        & (arr["T5_particle_nr"] == int(t5_particle_nr))
-        & (arr["window_data_quality_mask"] == 0)
-        & (arr["vme_digi_issues_bitmask"] == 0)
-        & (arr["T5_HasInTimeWindow"] == True)
-        & (arr["vme_tof_corr"] > float(tof_primary) - float(tof_window))
-        & (arr["vme_tof_corr"] < float(tof_primary) + float(tof_window))
-    )
+    if particle == "muon":
+        return (
+            (arr["vme_act_eveto"] < eveto_cut)
+            & (arr["vme_act_tagger"] > tagger_cut)
+            & (arr["T5_HasMultipleScintillatorsHit"] == False)
+            & (arr["T5_HasOutOfTimeWindow"] == False)
+            & (arr["vme_evt_quality_bitmask"] == 0)
+            & (arr["T5_HasValidHit"] == True)
+            & (arr["T5_particle_nr"] == int(t5_particle_nr))
+            & (arr["window_data_quality_mask"] == 0)
+            & (arr["vme_digi_issues_bitmask"] == 0)
+            & (arr["T5_HasInTimeWindow"] == True)
+            & (arr["vme_tof_corr"] > float(tof_primary) - float(tof_window))
+            & (arr["vme_tof_corr"] < float(tof_primary) + float(tof_window))
+        )
+    #elif particle=="proton":
+    else:
+        
+        return (
+            (arr["vme_act_eveto"] < eveto_cut)
+            & (arr["vme_act_tagger"] < tagger_cut)
+            & (arr["T5_HasMultipleScintillatorsHit"] == False)
+            & (arr["T5_HasOutOfTimeWindow"] == False)
+            & (arr["vme_evt_quality_bitmask"] == 0)
+            & (arr["T5_HasValidHit"] == True)
+            & (arr["T5_particle_nr"] == int(t5_particle_nr))
+            & (arr["window_data_quality_mask"] == 0)
+            & (arr["vme_digi_issues_bitmask"] == 0)
+            & (arr["T5_HasInTimeWindow"] == True)
+            & (arr["vme_tof_corr"] > float(tof_primary) - float(tof_window))
+            & (arr["vme_tof_corr"] < float(tof_primary) + float(tof_window))
+        )
 
 
 # ============================================================
@@ -362,6 +381,7 @@ def _estimate_t5_delta_peak_time(
     tof_window=DEFAULT_TOF_WINDOW,
     t5_particle_nr=1,
     verbose=True,
+    particle = "muon",
 ):
     """
     Estimate the global reference peak of:
@@ -392,6 +412,7 @@ def _estimate_t5_delta_peak_time(
             tof_primary,
             tof_window=tof_window,
             t5_particle_nr=t5_particle_nr,
+            particle=particle,
         )
         arr_sample = arr[sample_mask]
 
@@ -748,6 +769,7 @@ def get_selected_events(
             tof_window=tof_window,
             t5_particle_nr=t5_particle_nr,
             verbose=verbose,
+            particle=particle,
         )
 
     if n_entries_to_process == 0 or max_selected_events == 0:
@@ -777,6 +799,7 @@ def get_selected_events(
                 tof_primary_value,
                 tof_window=tof_window,
                 t5_particle_nr=t5_particle_nr,
+                particle=particle,
             )
             event_mask_np = _mask_to_numpy(event_mask)
             n_before_timing_cuts += int(np.sum(event_mask_np))

@@ -128,13 +128,13 @@ WCSIM_DATA_PATH = os.environ.get(
     "/eos/user/j/jrimmer/sim_work_dir/WCSim/sim_data/",
 ).strip()
 
-# Default input file.  This preserves the current selected 76-event proton sample.
+# Default input file.  
 # To use the generated path instead, set DEFAULT_WCSIM_INPUT_FILE to something like:
 #   str(Path(WCSIM_DATA_PATH) / WCSIM_PARTICLE_DIR / f"1k{WCSIM_PARTICLE_LABEL}_{int(ENERGY_TRUE)}MeV_x0y0zn1350.npz")
 DEFAULT_WCSIM_INPUT_FILE = os.environ.get(
     "DEFAULT_WCSIM_INPUT_FILE",
     "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit_official/work_dir/"
-    "sample_data/1kp+_1000MeV_x0y0zn1350_absorption_like_selected_76events.npz",
+    "sample_data/1kp+_1000MeV_x0y0zn1350_fixed_single_ring_218events.npz",
 ).strip()
 
 # Leave blank to use DEFAULT_WCSIM_INPUT_FILE.
