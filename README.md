@@ -111,7 +111,7 @@ The generated files are:
 Use:
 
 ```bash
-python scripts/batch_fit_driver_wcte.py
+python3 scripts/batch_fit_driver_wcte.py
 ```
 
 or override settings through environment variables:
