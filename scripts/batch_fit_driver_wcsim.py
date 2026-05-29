@@ -106,10 +106,10 @@ def _parse_int_list_env(name, default):
 # -----------------------------------------------------------------------------
 # Nominal kinetic energy of the WCSim sample.  This is used for default filenames,
 # truth diagnostics, and the default fixed KE0 in absorption mode.
-ENERGY_TRUE = _env_float("ENERGY_TRUE", 1000.0)
+ENERGY_TRUE = _env_float("ENERGY_TRUE", 800.0)
 
 # Maximum number of WCSim events to fit from the input file.
-TOT_EVENTS = _env_int("TOT_EVENTS", 1000)
+TOT_EVENTS = _env_int("TOT_EVENTS", 222)
 
 # Number of fitted events per multiprocessing batch.
 N_EVENTS_PER_BATCH = _env_int("N_EVENTS_PER_BATCH", 100)
@@ -134,7 +134,7 @@ WCSIM_DATA_PATH = os.environ.get(
 DEFAULT_WCSIM_INPUT_FILE = os.environ.get(
     "DEFAULT_WCSIM_INPUT_FILE",
     "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit_official/work_dir/"
-    "sample_data/1kp+_1000MeV_x0y0zn1350_fixed_single_ring_218events.npz",
+    "sample_data/wcsim/p+_800MeV_absorptionLike_x0y0zn1348.npz",
 ).strip()
 
 # Leave blank to use DEFAULT_WCSIM_INPUT_FILE.
@@ -211,7 +211,7 @@ _DEFAULT_FIXED_KE0_MEV = (
 FIXED_FIT_PARAMS = {
     "x0": _env_optional_float("FIX_X0", None),
     "y0": _env_optional_float("FIX_Y0", None),
-    "z0": _env_optional_float("FIX_Z0", -1350.0),
+    "z0": _env_optional_float("FIX_Z0", -1348.0),
     "cx": _env_optional_float("FIX_CX", None),
     "cy": _env_optional_float("FIX_CY", None),
 
