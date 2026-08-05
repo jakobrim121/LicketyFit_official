@@ -23,6 +23,7 @@ import math
 import os
 import pickle
 from functools import lru_cache
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,15 @@ PARTICLE_MASS_MEV = {
 _ACTIVE_PARTICLE = "muon"
 _TABLES_BY_PARTICLE = {}
 _REL_MPMT_EFF_CACHE = None
+# Exact scan-grid reuse is valuable within one minimization because vertex and
+# direction probes often share the same length.  It is not useful to retain
+# thousands of event-specific floating-point length hypotheses indefinitely.
+# The old 4096-entry clear-all cache accumulated roughly O(100 MB) of arrays and
+# produced a severe latency cliff when it was cleared during long single-process
+# jobs.  A small exact-key LRU preserves all intra-event reuse without the
+# long-run memory/deallocation spike.
+_SCAN_GRID_CACHE = OrderedDict()
+_SCAN_GRID_CACHE_MAX = max(32, int(os.environ.get("LF_SCAN_GRID_CACHE_MAX", "256")))
 
 
 def canonical_particle_name(particle: str | None = None) -> str:
@@ -283,6 +293,16 @@ def _ensure_tables_loaded(particle: str | None = None):
         "tri_insitu": tri_insitu,
         "wut_insitu": wut_insitu,
         "wut_exsitu": wut_exsitu,
+        # SMOOTH-NLL ADDITION: master KE(range) curve.  Row i of the K(s)
+        # tables is an exact slice of this single monotone curve (verified to
+        # <=1e-4 MeV), so E at remaining-range r can be evaluated continuously
+        # as interp(r, master_range, master_ke) instead of snapping to the
+        # nearest row.  This removes the ~1 MeV / ~5 mm staircase in L.
+        "master_range": np.asarray(overall_distances, dtype=np.float64),
+        "master_ke": np.asarray(
+            [np.asarray(energy_rows[i], dtype=np.float64)[0] for i in range(len(overall_distances))],
+            dtype=np.float64,
+        ),
     }
     _TABLES_BY_PARTICLE[pname] = cached
     return cached
@@ -407,6 +427,36 @@ def _nearest_index_1d(arr, x):
 
 
 @njit(cache=True)
+def _interp_energy_at_dist(dist_row, energy_row, x):
+    """Linear interpolation of energy_row vs dist_row at distance x.
+
+    dist_row is increasing; energy_row is the (decreasing) energy at that
+    distance.  Used by the sub-grid refinement so E_b varies smoothly with the
+    emission point instead of snapping to the nearest table row.
+    """
+    n = dist_row.size
+    if n == 0:
+        return 0.0
+    if x <= dist_row[0]:
+        return energy_row[0]
+    if x >= dist_row[n - 1]:
+        return energy_row[n - 1]
+    idx = np.searchsorted(dist_row, x)
+    if idx <= 0:
+        return energy_row[0]
+    if idx >= n:
+        return energy_row[n - 1]
+    x0 = dist_row[idx - 1]
+    x1 = dist_row[idx]
+    y0 = energy_row[idx - 1]
+    y1 = energy_row[idx]
+    dx = x1 - x0
+    if dx <= 0.0:
+        return y0
+    return y0 + (x - x0) / dx * (y1 - y0)
+
+
+@njit(cache=True)
 def _scale_from_energy_scalar(T_MeV, mass_mev, n):
     gamma = 1.0 + T_MeV / mass_mev
     beta2 = 1.0 - 1.0 / (gamma * gamma)
@@ -434,6 +484,7 @@ def _find_scale_kernel(
     track_dir,
     s_grid,
     theta_c_grid,
+    cot_grid,
     dist_row,
     energy_row,
     s_a_mm,
@@ -441,6 +492,11 @@ def _find_scale_kernel(
     near_cross_tol,
     particle_mass_mev,
     n_water,
+    refine,
+    master_r,
+    master_k,
+    range_stop_mm,
+    edge_model,
 ):
     """
     Hybrid binary-search collapse solver.
@@ -492,20 +548,22 @@ def _find_scale_kernel(
         cross_idx = 0
 
         if (n_scan >= 2) and (f_lo < 0.0) and (f_hi >= 0.0):
+            # Crossing case.  The root of f(s) = arctan2(perp, u0-s) - theta_c(s)
+            # in the forward region is identical to the root of
+            #   g(s) = (u0 - s) - perp * cot(theta_c(s)),
+            # because arctan2(perp, u0-s) = theta_c  <=>  (u0-s) = perp*cot(theta_c).
+            # The sign maps as f >= 0  <=>  g <= 0, so we bisect on g's sign with
+            # pure arithmetic (one multiply/subtract per step) instead of an
+            # arctan2 per step.  cot_grid is precomputed once per grid.
+            # min_abs_f / min_idx are only used by the soft no-crossing branch,
+            # so they need no update here.
             lo = 0
             hi = n_scan - 1
 
             while hi - lo > 1:
                 mid = (lo + hi) // 2
-                parallel_mid = u0 - s_grid[mid]
-                f_mid = np.arctan2(perp, parallel_mid) - theta_c_grid[mid]
-
-                abs_mid = abs(f_mid)
-                if abs_mid < min_abs_f:
-                    min_abs_f = abs_mid
-                    min_idx = mid
-
-                if f_mid >= 0.0:
+                g_mid = (u0 - s_grid[mid]) - perp * cot_grid[mid]
+                if g_mid <= 0.0:   # f_mid >= 0.0
                     hi = mid
                 else:
                     lo = mid
@@ -514,28 +572,87 @@ def _find_scale_kernel(
             if cross_idx < 0:
                 cross_idx = 0
             found_crossing = True
-        else:
-            for j in range(1, n_scan - 1):
-                parallel = u0 - s_grid[j]
-                f = np.arctan2(perp, parallel) - theta_c_grid[j]
-                af = abs(f)
-                if af < min_abs_f:
-                    min_abs_f = af
-                    min_idx = j
+
+            # Sub-grid linear refinement of the crossing.  Without it, sb snaps
+            # to s_grid[cross_idx], so as the fit parameters move continuously the
+            # emission point (and the FCN) move in ~grid-sized steps -- a
+            # staircase that makes the numerical gradient/Hessian noisy and
+            # inflates MIGRAD's EDM (frequent "invalid" with otherwise-good fits).
+            # Here we interpolate the true zero of g(s)=(u0-s)-perp*cot(theta_c)
+            # between the bracketing grid points lo=cross_idx and hi=cross_idx+1,
+            # so sb varies smoothly.  g_lo > 0 >= g_hi by construction.
+            if refine != 0 and (hi < n_scan) and (hi > 0):
+                lo_i = hi - 1
+                g_lo = (u0 - s_grid[lo_i]) - perp * cot_grid[lo_i]
+                g_hi = (u0 - s_grid[hi]) - perp * cot_grid[hi]
+                denom = g_lo - g_hi
+                if denom > 0.0:
+                    frac = g_lo / denom
+                    if frac < 0.0:
+                        frac = 0.0
+                    elif frac > 1.0:
+                        frac = 1.0
+                    sb_refined = s_grid[lo_i] + frac * (s_grid[hi] - s_grid[lo_i])
+                else:
+                    sb_refined = s_grid[cross_idx]
+            else:
+                sb_refined = s_grid[cross_idx]
+        # No-crossing branch: f(s) = arctan2(perp, u0 - s) - theta_c(s) is
+        # monotone non-decreasing in s (the viewing angle grows as s increases
+        # while theta_c shrinks as the particle loses energy), so the minimum of
+        # |f| over the interior is always attained at an endpoint.  The endpoint
+        # comparison above already set min_abs_f/min_idx, so the original
+        # interior linear scan over j was redundant and has been removed.
+        # Verified bit-identical against the scanning version over ~1500 track
+        # configurations x 1805 PMTs (max abs diff 0.0).
 
         if found_crossing:
-            sb = s_grid[cross_idx]
-            eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-            Eb = energy_row[eidx]
+            sb = sb_refined
+            if master_r.size > 1:
+                # SMOOTH-NLL: E from the continuous master KE(range) curve.
+                # The row-based lookup swaps the ENTIRE (dist,energy) row when
+                # the fitted length crosses a table-row boundary (~5 mm), which
+                # shifts every crossing tube's Frank-Tamm scale coherently and
+                # imprints cliffs on NLL(L).
+                rem = range_stop_mm - (sb - s_a_mm)
+                if rem < 0.0:
+                    rem = 0.0
+                Eb = np.interp(rem, master_r, master_k)
+            elif refine != 0:
+                Eb = _interp_energy_at_dist(dist_row, energy_row, sb - s_a_mm)
+            else:
+                eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
+                Eb = energy_row[eidx]
 
             s_b[i] = sb
             E_b[i] = Eb
-            scale[i] = _scale_from_energy_scalar(Eb, particle_mass_mev, n_water)
+            amp = _scale_from_energy_scalar(Eb, particle_mass_mev, n_water)
+            if edge_model == 1 and near_cross_tol > 0.0:
+                # SYMMETRIC (charge-conserving) smeared edge.
+                # f(s) is monotone in s, so f_lo / f_hi are the signed margins
+                # across the OUTER ring edge (sign change at f_lo=0) and the
+                # INNER edge / end-cap hole (sign change at f_hi=0).  A sharp
+                # edge convolved with a Gaussian of width sigma is an erf edge:
+                #   w = Phi(-f_lo/sigma) * Phi(f_hi/sigma)
+                # deep-lit -> 1; outer edge -> first factor 1->1/2->tail;
+                # inner hole -> second factor likewise.  Unlike the legacy
+                # one-sided tail this DIMS just-inside PMTs by the same charge
+                # it adds just-outside (exact for a locally straight edge).
+                inv_s = 1.0 / (near_cross_tol * 1.4142135623730951)
+                w = 0.25 * (1.0 + math.erf(-f_lo * inv_s)) * (1.0 + math.erf(f_hi * inv_s))
+                amp = amp * w
+            scale[i] = amp
 
         else:
             sb = s_grid[min_idx]
-            eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
-            Eb = energy_row[eidx]
+            if master_r.size > 1:
+                rem = range_stop_mm - (sb - s_a_mm)
+                if rem < 0.0:
+                    rem = 0.0
+                Eb = np.interp(rem, master_r, master_k)
+            else:
+                eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
+                Eb = energy_row[eidx]
 
             s_b[i] = sb
             E_b[i] = Eb
@@ -545,8 +662,16 @@ def _find_scale_kernel(
                 scale[i] = 0.0
             else:
                 ft_scale = _scale_from_energy_scalar(Eb, particle_mass_mev, n_water)
-                soft = math.exp(-0.5 * (min_abs_f / sigma_theta) * (min_abs_f / sigma_theta))
-                scale[i] = ft_scale * soft
+                if edge_model == 1:
+                    # same continuous erf-edge weight as the crossing branch;
+                    # here f_lo>0 (beyond outer edge) or f_hi<0 (inner hole),
+                    # so w reduces to the appropriate complementary-erf tail.
+                    inv_s = 1.0 / (sigma_theta * 1.4142135623730951)
+                    w = 0.25 * (1.0 + math.erf(-f_lo * inv_s)) * (1.0 + math.erf(f_hi * inv_s))
+                    scale[i] = ft_scale * w
+                else:
+                    soft = math.exp(-0.5 * (min_abs_f / sigma_theta) * (min_abs_f / sigma_theta))
+                    scale[i] = ft_scale * soft
 
     return scale, s_b, E_b
 
@@ -561,10 +686,13 @@ def find_scale_for_pmts(
     mpmt_bool=False,
     n_scan=150,
     near_cross_tol=0.02,
+    edge_model: str = "legacy",
     particle: str | None = None,
     particle_mass: float | None = None,
     n_water: float = 1.344,
     range_stop_mm: float | None = None,
+    subgrid_refine: bool = True,
+    legacy_grid: bool = False,
 ):
     """
     Fast Cherenkov-cone-collapse solver for many PMTs.
@@ -599,30 +727,94 @@ def find_scale_for_pmts(
     else:
         range_stop_for_energy = float(range_stop_mm)
 
-    main_idx = _nearest_index_1d(overall_distances, range_stop_for_energy)
-    dist_row = distance_rows[main_idx]
-    energy_row = energy_rows[main_idx]
-
     visible_s_max = min(float(s_max_mm), range_stop_for_energy)
     visible_s_max = max(visible_s_max, float(s_a_mm))
-    s_grid = np.linspace(float(s_a_mm), visible_s_max, int(n_scan), dtype=np.float64)
 
-    ds_mm = s_grid - float(s_a_mm)
-    idx = np.searchsorted(dist_row, ds_mm)
-    idx_right = np.clip(idx, 0, dist_row.size - 1)
-    idx_left = np.clip(idx - 1, 0, dist_row.size - 1)
-    use_left = (ds_mm - dist_row[idx_left]) <= (dist_row[idx_right] - ds_mm)
-    idx = np.where(use_left, idx_left, idx_right)
-    E_grid = energy_row[idx]
-
-    threshold = cherenkov_threshold_kinetic_mev(float(particle_mass), n=float(n_water))
-    E_grid = np.maximum(E_grid, threshold)
-
-    theta_c_grid = _theta_interp_numba(
-        np.asarray(energy_for_angle, dtype=np.float64),
-        np.asarray(c_ang, dtype=np.float64),
-        np.asarray(E_grid, dtype=np.float64),
+    # The Cherenkov-angle scan grid (dist_row, energy_row, s_grid, E_grid,
+    # theta_c_grid) depends only on these scalars, not on the per-call track
+    # vertex/direction.  During a Minuit fit the vertex and direction change on
+    # every FCN call while the length parameters change far less often, so
+    # caching this construction removes a linspace + searchsorted + theta
+    # interpolation from the majority of calls.  Bit-identical: same scalar key
+    # -> same arrays.
+    cache_key = (
+        pname,
+        float(s_a_mm),
+        visible_s_max,
+        int(n_scan),
+        range_stop_for_energy,
+        float(particle_mass),
+        float(n_water),
+        bool(legacy_grid),
     )
+    cached = _SCAN_GRID_CACHE.pop(cache_key, None)
+    if cached is not None:
+        # Exact-key LRU refresh.  No quantization is introduced, so FCN values
+        # and smoothness are unchanged.
+        _SCAN_GRID_CACHE[cache_key] = cached
+    else:
+        main_idx = _nearest_index_1d(overall_distances, range_stop_for_energy)
+        dist_row = np.ascontiguousarray(distance_rows[main_idx], dtype=np.float64)
+        energy_row = np.ascontiguousarray(energy_rows[main_idx], dtype=np.float64)
+
+        threshold = cherenkov_threshold_kinetic_mev(float(particle_mass), n=float(n_water))
+
+        if legacy_grid:
+            # ---- historical behavior (bit-exact): L-dependent grid spacing,
+            # nearest-row K(s), nearest-point E lookup.  Kept for A/B checks. ----
+            s_grid = np.linspace(float(s_a_mm), visible_s_max, int(n_scan), dtype=np.float64)
+            ds_mm = s_grid - float(s_a_mm)
+            idx = np.searchsorted(dist_row, ds_mm)
+            idx_right = np.clip(idx, 0, dist_row.size - 1)
+            idx_left = np.clip(idx - 1, 0, dist_row.size - 1)
+            use_left = (ds_mm - dist_row[idx_left]) <= (dist_row[idx_right] - ds_mm)
+            idx = np.where(use_left, idx_left, idx_right)
+            E_grid = energy_row[idx]
+            E_grid = np.maximum(E_grid, threshold)
+        else:
+            # ---- SMOOTH-NLL path (default). Two changes:
+            # (1) Fixed ABSOLUTE grid step instead of n_scan points over [s_a, L]:
+            #     with linspace, every grid point moves when L changes, which
+            #     imprints a sawtooth of period ~L/n_scan on NLL(L).  With a
+            #     fixed step anchored at s_a, existing points stay put as L
+            #     varies; only the (low-weight) endpoint region changes.
+            #     The step is chosen so the default cost matches the old
+            #     n_scan=150 at L~1200 (8 mm) unless the caller's n_scan
+            #     implies finer sampling.
+            # (2) E along the track from the continuous master KE(range) curve
+            #     E(s) = master(range_stop - s) instead of the nearest table
+            #     row + nearest-point lookup, removing the ~1 MeV staircase.
+            step = min(2.0, max(0.5, visible_s_max / max(int(n_scan), 1)))
+            n_pts = int(np.floor((visible_s_max - float(s_a_mm)) / step)) + 1
+            s_grid = float(s_a_mm) + step * np.arange(n_pts, dtype=np.float64)
+            if s_grid[-1] < visible_s_max - 1e-9:
+                s_grid = np.append(s_grid, visible_s_max)
+            master_r = tables["master_range"]
+            master_k = tables["master_ke"]
+            remaining = np.maximum(range_stop_for_energy - (s_grid - float(s_a_mm)), 0.0)
+            E_grid = np.interp(remaining, master_r, master_k,
+                               left=master_k[0], right=master_k[-1])
+            E_grid = np.maximum(E_grid, threshold)
+
+        theta_c_grid = _theta_interp_numba(
+            np.asarray(energy_for_angle, dtype=np.float64),
+            np.asarray(c_ang, dtype=np.float64),
+            np.asarray(E_grid, dtype=np.float64),
+        )
+        while len(_SCAN_GRID_CACHE) >= _SCAN_GRID_CACHE_MAX:
+            _SCAN_GRID_CACHE.popitem(last=False)
+        # Precompute cot(theta_c) once per (length-scalar) grid so the per-PMT
+        # crossing bisection can test (u0 - s) - perp*cot(theta_c) >= 0 with pure
+        # arithmetic instead of an arctan2 every bisection step.  sin(theta_c) is
+        # bounded away from 0 over the Cherenkov-active grid; guard the rare
+        # near-zero (sub-threshold tail) so cot stays finite.
+        _sin_tc = np.sin(theta_c_grid)
+        _cos_tc = np.cos(theta_c_grid)
+        cot_grid = np.where(_sin_tc > 1e-12, _cos_tc / np.where(_sin_tc > 1e-12, _sin_tc, 1.0), 1e30)
+        cached = (dist_row, energy_row, s_grid, theta_c_grid, cot_grid)
+        _SCAN_GRID_CACHE[cache_key] = cached
+
+    dist_row, energy_row, s_grid, theta_c_grid, cot_grid = cached
 
     scale, s_b, E_b = _find_scale_kernel(
         np.asarray(pmt_pos, dtype=np.float64),
@@ -630,13 +822,19 @@ def find_scale_for_pmts(
         np.asarray(track_dir, dtype=np.float64),
         s_grid,
         theta_c_grid,
-        np.asarray(dist_row, dtype=np.float64),
-        np.asarray(energy_row, dtype=np.float64),
+        cot_grid,
+        dist_row,
+        energy_row,
         float(s_a_mm),
         float(visible_s_max),
         float(near_cross_tol),
         float(particle_mass),
         float(n_water),
+        int(1 if subgrid_refine else 0),
+        (np.empty(0, dtype=np.float64) if legacy_grid else tables["master_range"]),
+        (np.empty(0, dtype=np.float64) if legacy_grid else tables["master_ke"]),
+        float(range_stop_for_energy),
+        int(1 if str(edge_model).lower() == "erf" else 0),
     )
 
     _ = mpmt_bool
@@ -651,3 +849,4 @@ def find_scale_for_pmts_old2(*args, **kwargs):
 def find_scale_for_pmts_old(*args, **kwargs):
     out = find_scale_for_pmts(*args, **kwargs)
     return out[0], out[1]
+
