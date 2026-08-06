@@ -32,18 +32,21 @@ under ``LicketyFit/``.
 from __future__ import annotations
 
 import base64
+import faulthandler
+import json
 import os
 from pathlib import Path
+import signal
 import sys
 import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-05-three-mode-nonmcs-universal-v1.12-analysis-tools-wcte-cosmic-parity-root-identity"
+UNIFIED_DRIVER_RELEASE = "2026-08-06-three-mode-nonmcs-universal-v1.15-analysis-tools-t5-dq-separated"
 
 # =============================================================================
 # USER CONFIGURATION -- EDIT THIS BLOCK
 # =============================================================================
 # Which input/calibration adapter to use: "wcsim" or "wcte".
-DEFAULT_DATA_SOURCE = "wcsim"
+DEFAULT_DATA_SOURCE = "wcte"
 
 # Exactly one of: "full_length", "absorption", "cosmic".
 DEFAULT_FIT_MODE = "full_length"
@@ -54,7 +57,7 @@ DEFAULT_NPROC = 16
 DEFAULT_OUTPUT_FILE = ""       # blank = engine-generated name
 
 # WCSim settings.
-DEFAULT_WCSIM_INPUT_FILE = ""
+DEFAULT_WCSIM_INPUT_FILE = "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.npz"
 DEFAULT_WCSIM_N_EVENTS = 100
 DEFAULT_WCSIM_LIKELIHOOD_MODE = "charge_time"
 DEFAULT_WCSIM_ENERGY_LABEL_MEV = 300.0  # label only; full_length/cosmic mandatory seeds are energy-independent
@@ -66,7 +69,7 @@ DEFAULT_USE_IWCD_GEOMETRY = False
 # ROOT file must contain an AllSecondaries-style per-step tree from the same
 # WCSim run as the fitted NPZ.
 DEFAULT_WCSIM_USE_TRUTH_ROOT = False
-DEFAULT_WCSIM_TRUTH_ROOT_FILE = ""
+DEFAULT_WCSIM_TRUTH_ROOT_FILE = "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.root"
 DEFAULT_WCSIM_TRUTH_TREE = "AllSecondaries"
 DEFAULT_WCSIM_TRUTH_EVENT_ID_OFFSET = 0
 # None / "auto" uses (0, WCTE geometry y-centre, 0) for WCTE because WCSim
@@ -88,24 +91,72 @@ DEFAULT_WCSIM_TRUTH_INCLUDE_OPTIONAL_DETAILS = False
 
 # Real-WCTE settings.
 DEFAULT_WCTE_RUN = 2079
-DEFAULT_WCTE_N_ROOT_ENTRIES = 50_000
+# Blank uses the production-v1.0 run template. Set a full ROOT path to override.
+DEFAULT_WCTE_ROOT_FILE = ""
+DEFAULT_WCTE_N_ROOT_ENTRIES = 5000
 # None means fit every selected event. Set an integer for a hard selected-event cap.
 DEFAULT_WCTE_MAX_EVENTS_TO_FIT = None
 DEFAULT_WCTE_EVENT_SOURCE = "selection"  # "selection" or "file"
 DEFAULT_WCTE_USER_EVENT_FILE = ""
-DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_only"
+DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_time"
 DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C = 430.0
-DEFAULT_WCTE_REL_EFF_MODE = "slot"
+DEFAULT_WCTE_REL_EFF_MODE = None #"slot"
 DEFAULT_WCTE_PLACEMENT_KEY = "est"
+# The selected beam population and fitted particle hypothesis are independent.
+# Nominal analysis_tools selections exist for muon, pion, electron and proton.
+# LicketyFit fit hypotheses currently exist for muon, pion, kaon and proton; an
+# electron-selected sample must therefore be fitted under an explicitly chosen
+# supported hypothesis until an electron forward model is implemented.
+DEFAULT_WCTE_PARTICLE_SELECTION_LABEL = "muon"
+DEFAULT_WCTE_SELECTION_MODE = "nominal"  # "nominal" or "custom"
+DEFAULT_WCTE_SELECTION_STEP_SIZE = "100 MB"
 # External checkout today; a local installed package or repository submodule is
 # detected automatically. This path remains only the final compatibility fallback.
 DEFAULT_WCTE_ANALYSIS_TOOLS_PATH = (
     "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/analysis_tools"
 )
+# DataLoader event/hit quality stages.
 DEFAULT_WCTE_APPLY_MPMT_DQ = True
 DEFAULT_WCTE_APPLY_VME_DQ = True
 DEFAULT_WCTE_APPLY_T5_DQ = True
+# Nominal BeamSelection controls. auto TOF follows the examples: use the run
+# scalar when positive, otherwise omit the fast-particle TOF cut. Proton nominal
+# selection requires a positive scalar or an explicit override.
+DEFAULT_WCTE_USE_ACT_EVETO_CUT = True
+DEFAULT_WCTE_USE_ACT_TAGGER_CUT = True
+DEFAULT_WCTE_TOF_CUT_MODE = "auto"       # "auto", "require", or "disable"
+DEFAULT_WCTE_PROTON_TOF_WINDOW_NS = 10.0
 DEFAULT_WCTE_REQUIRE_MUON_TAGGER = False
+# None uses vme_analysis_scalar_results.
+DEFAULT_WCTE_ACT_EVETO_CUT_OVERRIDE_PE = None
+DEFAULT_WCTE_ACT_TAGGER_CUT_OVERRIDE_PE = None
+DEFAULT_WCTE_PROTON_TOF_CUT_OVERRIDE_NS = None
+DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE = None
+# Each item is (variable, operator, value), exactly as accepted by
+# BeamSelection.selection. In nominal mode these are appended; in custom mode
+# they are the complete selection. Example:
+# (("vme_act0_l_charge", ">", 10.0), ("T5_particle_nr", "==", 1))
+DEFAULT_WCTE_EXTRA_SELECTION_CUTS = ()
+DEFAULT_WCTE_PRINT_SELECTION_DESCRIPTION = True
+DEFAULT_WCTE_PRINT_CHERENKOV_THRESHOLDS = True
+# Optional legacy/example hit-level timing prefilters. These are NOT the
+# analysis_tools DataLoader T5 event-quality cut. The official DataLoader T5 DQ
+# remains controlled by DEFAULT_WCTE_APPLY_T5_DQ above, and the fitter still
+# applies its own event-by-event peak-relative prompt window downstream.
+# Keep these disabled unless performing a deliberate comparison with the older
+# PMT-minus-T5 or run-global calibrated-time prefilters.
+DEFAULT_WCTE_USE_T5_HIT_TIME_CUT = False
+DEFAULT_WCTE_T5_PEAK_WINDOW_NS = 200.0
+DEFAULT_WCTE_T5_PEAK_BIN_WIDTH_NS = 50.0
+DEFAULT_WCTE_T5_PEAK_TIME_MIN_NS = -2000.0
+DEFAULT_WCTE_T5_PEAK_TIME_MAX_NS = 4000.0
+DEFAULT_WCTE_USE_CALIBRATED_PEAK_TIME_CUT = False
+DEFAULT_WCTE_CALIBRATED_PEAK_WINDOW_NS = 100.0
+DEFAULT_WCTE_CALIBRATED_PEAK_BIN_WIDTH_NS = 50.0
+DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MIN_NS = 0.0
+DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MAX_NS = 10000.0
+DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS = 2000
+DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS = None
 
 # Optional advanced overrides. Environment variables still take precedence.
 # Example: {"PRINT_EVENT_RESULTS": "1", "SAVE_DETAILED_EVENT_RESULTS": "1"}
@@ -113,6 +164,91 @@ EXTRA_ENV_DEFAULTS = {}
 # =============================================================================
 # END USER CONFIGURATION
 # =============================================================================
+
+
+try:
+    faulthandler.enable(all_threads=True)
+except Exception:
+    pass
+
+
+def _configure_process_runtime_environment() -> None:
+    """Configure fork-safe numerical runtimes before NumPy/Numba imports."""
+    raw_nproc = os.environ.get("NPROC", str(DEFAULT_NPROC)).strip()
+    try:
+        nproc = max(1, int(float(raw_nproc)))
+    except Exception:
+        nproc = max(1, int(DEFAULT_NPROC))
+    nested = str(os.environ.get("ALLOW_NESTED_PARALLELISM", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+
+    cache_base = (
+        os.environ.get("LF_RUNTIME_CACHE_DIR", "").strip()
+        or os.environ.get("TMPDIR", "").strip()
+        or "/tmp"
+    )
+    project_identity = str(Path(__file__).resolve().parent.parent)
+    project_tag = f"{zlib.crc32(project_identity.encode('utf-8')) & 0xffffffff:08x}"
+    runtime_root = Path(cache_base).expanduser() / (
+        f"licketyfit-{os.getuid()}-{project_tag}-"
+        f"py{sys.version_info.major}{sys.version_info.minor}"
+    )
+    try:
+        numba_cache = runtime_root / "numba"
+        native_cache = runtime_root / "native"
+        numba_cache.mkdir(parents=True, exist_ok=True)
+        native_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("NUMBA_CACHE_DIR", str(numba_cache))
+        os.environ.setdefault("LF_NATIVE_CACHE_DIR", str(native_cache))
+        os.environ.setdefault("LF_RESOLVED_RUNTIME_CACHE_DIR", str(runtime_root))
+    except OSError:
+        pass
+
+    if nproc > 1 and not nested:
+        os.environ.setdefault("NUMBA_THREADING_LAYER", "forksafe")
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OMP_DYNAMIC"] = "FALSE"
+
+
+def _receiver_status_without_prefork_native_load(
+    emitter,
+    p_locations,
+    pmt_normals,
+    *,
+    status_function,
+    native_library_path,
+    nproc: int,
+):
+    """Inspect receiver compatibility without dlopen'ing libgomp pre-fork."""
+    requested = bool(getattr(emitter, "photon_scatter_native_receiver", False))
+    if int(nproc) <= 1 or not requested:
+        status = dict(status_function(emitter, p_locations, pmt_normals))
+        status["native_receiver_probe_mode"] = "runtime_load_no_later_fork"
+        return status
+
+    setattr(emitter, "photon_scatter_native_receiver", False)
+    try:
+        status = dict(status_function(emitter, p_locations, pmt_normals))
+    finally:
+        setattr(emitter, "photon_scatter_native_receiver", requested)
+    built = bool(
+        native_library_path is not None
+        and Path(native_library_path).is_file()
+    )
+    status.update({
+        "native_receiver_requested": True,
+        "native_receiver_available": built,
+        "native_receiver_probe_mode": "build_only_before_fork",
+        "native_receiver_library_path": (
+            None if native_library_path is None else str(native_library_path)
+        ),
+        "native_receiver_first_load_location": "forked_event_worker",
+    })
+    return status
 
 _VALID_DATA_SOURCES = {"wcsim", "wcte"}
 _VALID_FIT_MODES = {"full_length", "absorption", "cosmic"}
@@ -136,7 +272,87 @@ def _truthy_text(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _selection_cut_specs_from_env(name: str, default) -> tuple[tuple[object, object, object], ...]:
+    """Parse BeamSelection cut triplets from a JSON environment override."""
+    raw = os.environ.get(name)
+    value = default if raw is None or not str(raw).strip() else json.loads(str(raw))
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a JSON list of [variable, operator, value] cuts")
+    result = []
+    for spec in value:
+        if not isinstance(spec, (list, tuple)) or len(spec) != 3:
+            raise ValueError(
+                f"{name} entries must be [variable, operator, value]; got {spec!r}"
+            )
+        variable, operator, cut_value = spec
+        if isinstance(cut_value, tuple):
+            cut_value = list(cut_value)
+        result.append((variable, operator, cut_value))
+    return tuple(result)
+
+
+_WCTE_SELECTION_PARTICLE_ALIASES = {
+    "mu": "muon", "mu-": "muon", "mu+": "muon", "muon": "muon",
+    "pi": "pion", "pi-": "pion", "pi+": "pion", "pion": "pion",
+    "e": "electron", "e-": "electron", "e+": "electron", "electron": "electron",
+    "k": "kaon", "k-": "kaon", "k+": "kaon", "kaon": "kaon",
+    "p": "proton", "p+": "proton", "proton": "proton",
+}
+_ELECTRON_FIT_ALIASES = frozenset({"e", "e-", "e+", "electron"})
+
+
+def _validate_wcte_particle_selection_contract(
+    *,
+    fit_particle_raw: str,
+    selection_label: str,
+    selection_mode: str,
+    extra_selection_cuts,
+    loader_active: bool = True,
+) -> str:
+    """Validate the deliberately separate selected-population and fit hypotheses."""
+    fit_raw = str(fit_particle_raw).strip().lower()
+    if fit_raw in _ELECTRON_FIT_ALIASES:
+        raise ValueError(
+            "analysis_tools can select electron beam events, but LicketyFit does "
+            "not yet implement an electron range/cone fit hypothesis. Set "
+            "PARTICLE_SELECTION_LABEL='electron' and choose an explicit supported "
+            "FIT_PARTICLE (muon, pion, kaon, or proton) for a hypothesis test."
+        )
+    selection_key = str(selection_label).strip().lower()
+    try:
+        selection_particle = _WCTE_SELECTION_PARTICLE_ALIASES[selection_key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported PARTICLE_SELECTION_LABEL={selection_label!r}; expected "
+            "muon, pion, electron, kaon, or proton."
+        ) from exc
+    mode = str(selection_mode).strip().lower().replace("-", "_")
+    if mode not in {"nominal", "custom"}:
+        raise ValueError("WCTE_SELECTION_MODE must be nominal or custom")
+    if loader_active and selection_particle == "kaon" and mode != "custom":
+        raise ValueError(
+            "analysis_tools defines no nominal kaon BeamSelection. For a kaon fit, "
+            "set WCTE_SELECTION_MODE='custom' and provide explicit "
+            "DEFAULT_WCTE_EXTRA_SELECTION_CUTS / WCTE_EXTRA_SELECTION_CUTS_JSON."
+        )
+    if loader_active and mode == "custom" and not tuple(extra_selection_cuts):
+        raise ValueError(
+            "WCTE_SELECTION_MODE='custom' requires at least one explicit "
+            "BeamSelection cut in WCTE_EXTRA_SELECTION_CUTS_JSON (or the driver default)."
+        )
+    return selection_particle
+
+
+def _selection_matches_fit_hypothesis(
+    selection_particle: str, fit_particle: str
+) -> bool:
+    return str(selection_particle) == str(fit_particle)
+
+
 def _apply_unified_defaults() -> tuple[str, str]:
+    _configure_process_runtime_environment()
     source = _normalize_choice(
         os.environ.get("LF_DATA_SOURCE", os.environ.get("DATA_SOURCE", DEFAULT_DATA_SOURCE)),
         _VALID_DATA_SOURCES,
@@ -259,7 +475,12 @@ def _apply_unified_defaults() -> tuple[str, str]:
         _setdefault_text("BEAM_P", repr(float(DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C)))
         _setdefault_text("REL_EFF_MODE", DEFAULT_WCTE_REL_EFF_MODE)
         _setdefault_text("WCTE_PLACEMENT_KEY", DEFAULT_WCTE_PLACEMENT_KEY)
+        _setdefault_text("PARTICLE_SELECTION_LABEL", DEFAULT_WCTE_PARTICLE_SELECTION_LABEL)
+        _setdefault_text("WCTE_SELECTION_MODE", DEFAULT_WCTE_SELECTION_MODE)
+        _setdefault_text("SELECTION_STEP_SIZE", DEFAULT_WCTE_SELECTION_STEP_SIZE)
         _setdefault_text("WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH)
+        if str(DEFAULT_WCTE_ROOT_FILE).strip():
+            _setdefault_text("CONFIG_ROOT_FILE", str(DEFAULT_WCTE_ROOT_FILE).strip())
         _setdefault_text(
             "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS",
             "1" if DEFAULT_WCTE_APPLY_MPMT_DQ else "0",
@@ -272,10 +493,50 @@ def _apply_unified_defaults() -> tuple[str, str]:
             "WCTE_APPLY_T5_EVENT_QUALITY_CUTS",
             "1" if DEFAULT_WCTE_APPLY_T5_DQ else "0",
         )
+        _setdefault_text("WCTE_USE_ACT_EVETO_CUT", "1" if DEFAULT_WCTE_USE_ACT_EVETO_CUT else "0")
+        _setdefault_text("WCTE_USE_ACT_TAGGER_CUT", "1" if DEFAULT_WCTE_USE_ACT_TAGGER_CUT else "0")
+        _setdefault_text("WCTE_TOF_CUT_MODE", DEFAULT_WCTE_TOF_CUT_MODE)
+        _setdefault_text("WCTE_PROTON_TOF_WINDOW_NS", repr(float(DEFAULT_WCTE_PROTON_TOF_WINDOW_NS)))
         _setdefault_text(
             "WCTE_REQUIRE_MUON_TAGGER",
             "1" if DEFAULT_WCTE_REQUIRE_MUON_TAGGER else "0",
         )
+        for _name, _value in (
+            ("WCTE_ACT_EVETO_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_EVETO_CUT_OVERRIDE_PE),
+            ("WCTE_ACT_TAGGER_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_TAGGER_CUT_OVERRIDE_PE),
+            ("WCTE_PROTON_TOF_CUT_OVERRIDE_NS", DEFAULT_WCTE_PROTON_TOF_CUT_OVERRIDE_NS),
+            ("WCTE_MUON_TAG_CUT_OVERRIDE", DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE),
+        ):
+            if _value is not None:
+                _setdefault_text(_name, repr(float(_value)))
+        _setdefault_text(
+            "WCTE_EXTRA_SELECTION_CUTS_JSON",
+            json.dumps([list(spec) for spec in DEFAULT_WCTE_EXTRA_SELECTION_CUTS]),
+        )
+        _setdefault_text(
+            "WCTE_PRINT_SELECTION_DESCRIPTION",
+            "1" if DEFAULT_WCTE_PRINT_SELECTION_DESCRIPTION else "0",
+        )
+        _setdefault_text(
+            "WCTE_PRINT_CHERENKOV_THRESHOLDS",
+            "1" if DEFAULT_WCTE_PRINT_CHERENKOV_THRESHOLDS else "0",
+        )
+        _setdefault_text("USE_T5_HIT_TIME_CUT", "1" if DEFAULT_WCTE_USE_T5_HIT_TIME_CUT else "0")
+        _setdefault_text("T5_PEAK_WINDOW_NS", repr(float(DEFAULT_WCTE_T5_PEAK_WINDOW_NS)))
+        _setdefault_text("T5_PEAK_BIN_WIDTH_NS", repr(float(DEFAULT_WCTE_T5_PEAK_BIN_WIDTH_NS)))
+        _setdefault_text("T5_PEAK_TIME_MIN_NS", repr(float(DEFAULT_WCTE_T5_PEAK_TIME_MIN_NS)))
+        _setdefault_text("T5_PEAK_TIME_MAX_NS", repr(float(DEFAULT_WCTE_T5_PEAK_TIME_MAX_NS)))
+        _setdefault_text(
+            "USE_CALIBRATED_PEAK_TIME_CUT",
+            "1" if DEFAULT_WCTE_USE_CALIBRATED_PEAK_TIME_CUT else "0",
+        )
+        _setdefault_text("CALIBRATED_PEAK_WINDOW_NS", repr(float(DEFAULT_WCTE_CALIBRATED_PEAK_WINDOW_NS)))
+        _setdefault_text("CALIBRATED_PEAK_BIN_WIDTH_NS", repr(float(DEFAULT_WCTE_CALIBRATED_PEAK_BIN_WIDTH_NS)))
+        _setdefault_text("CALIBRATED_PEAK_TIME_MIN_NS", repr(float(DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MIN_NS)))
+        _setdefault_text("CALIBRATED_PEAK_TIME_MAX_NS", repr(float(DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MAX_NS)))
+        _setdefault_text("WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS", int(DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS))
+        if DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS is not None:
+            _setdefault_text("WCTE_DATA_LOADER_PEAK_SAMPLE_HITS", int(DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS))
         if str(DEFAULT_WCTE_USER_EVENT_FILE).strip():
             _setdefault_text("USER_EVENT_FILE", str(DEFAULT_WCTE_USER_EVENT_FILE).strip())
 
@@ -722,23 +983,59 @@ def _important_subprocess_lines(output: str) -> list[str]:
     return selected
 
 
-def _run_cosmic_subprocess(script_dir: Path, engine_path: Path, env: dict):
-    """Run one clean cosmic subprocess without repeating its setup transcript."""
+def _subprocess_status_description(returncode: int) -> str:
+    code = int(returncode)
+    if code >= 0:
+        return f"exit status {code}"
+    number = -code
+    try:
+        name = signal.Signals(number).name
+    except Exception:
+        name = "UNKNOWN_SIGNAL"
+    return f"signal {number} ({name}); subprocess return code {code}"
+
+
+def _run_cosmic_subprocess(
+    script_dir: Path,
+    engine_path: Path,
+    env: dict,
+    *,
+    log_path: Path | None = None,
+):
+    """Run one clean cosmic subprocess and preserve native-crash evidence."""
+    child_env = dict(env)
+    child_env.setdefault("PYTHONFAULTHANDLER", "1")
+    child_env.setdefault("PYTHONUNBUFFERED", "1")
     completed = subprocess.run(
         [sys.executable, "-u", str(engine_path)],
         cwd=str(script_dir),
-        env=env,
+        env=child_env,
         close_fds=True,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    output = completed.stdout or ""
     if completed.returncode != 0:
-        if completed.stdout:
-            print(completed.stdout.rstrip(), file=sys.stderr, flush=True)
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(output)
+            except Exception:
+                pass
+        if output:
+            print(output.rstrip(), file=sys.stderr, flush=True)
+        print(
+            "Cosmic subprocess terminated by "
+            + _subprocess_status_description(completed.returncode),
+            file=sys.stderr,
+            flush=True,
+        )
+        if log_path is not None:
+            print(f"Child log retained at: {log_path}", file=sys.stderr, flush=True)
     else:
-        for line in _important_subprocess_lines(completed.stdout):
+        for line in _important_subprocess_lines(output):
             print(f"  {line}", flush=True)
     return completed
 
@@ -816,13 +1113,15 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
                 "PRINT_EVENT_RESULTS": "0",
                 "PRINT_BATCH_PROGRESS": "0",
             })
+            child_log = part_path.with_name(part_path.name + ".log")
             completed = _run_cosmic_subprocess(
-                script_dir, engine_path, child_env
+                script_dir, engine_path, child_env, log_path=child_log
             )
             if completed.returncode != 0:
                 raise RuntimeError(
-                    f"Cosmic child {part_number + 1} failed with exit status "
-                    f"{completed.returncode}; retained parts are in {part_dir}"
+                    f"Cosmic child {part_number + 1} failed by "
+                    f"{_subprocess_status_description(completed.returncode)}; "
+                    f"retained parts and log are in {part_dir}"
                 )
             with open(part_path, "rb") as stream:
                 child = pickle.load(stream)
@@ -923,11 +1222,15 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         "PRINT_EVENT_RESULTS": "0",
         "PRINT_BATCH_PROGRESS": "0",
     })
-    prepared = _run_cosmic_subprocess(script_dir, engine_path, prepare_env)
+    prepare_log = part_dir / "prepare.log"
+    prepared = _run_cosmic_subprocess(
+        script_dir, engine_path, prepare_env, log_path=prepare_log
+    )
     if prepared.returncode != 0:
         raise RuntimeError(
-            "WCTE cosmic event preparation failed with exit status "
-            f"{prepared.returncode}; retained files are in {part_dir}"
+            "WCTE cosmic event preparation failed by "
+            f"{_subprocess_status_description(prepared.returncode)}; "
+            f"retained files and log are in {part_dir}"
         )
 
     available = _read_prepared_count(prepared_path)
@@ -987,13 +1290,15 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
                 "PRINT_EVENT_RESULTS": "0",
                 "PRINT_BATCH_PROGRESS": "0",
             })
+            child_log = part_path.with_name(part_path.name + ".log")
             completed = _run_cosmic_subprocess(
-                script_dir, engine_path, child_env
+                script_dir, engine_path, child_env, log_path=child_log
             )
             if completed.returncode != 0:
                 raise RuntimeError(
-                    f"WCTE cosmic child {part_number + 1} failed with exit "
-                    f"status {completed.returncode}; retained parts are in {part_dir}"
+                    f"WCTE cosmic child {part_number + 1} failed by "
+                    f"{_subprocess_status_description(completed.returncode)}; "
+                    f"retained parts and log are in {part_dir}"
                 )
             with open(part_path, "rb") as stream:
                 child = pickle.load(stream)
@@ -4625,16 +4930,24 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
         PMT_SLOTS = np.ascontiguousarray(PMT_SLOTS, dtype=np.int32)
 
+        native_path = None
         if PHOTON_SCATTER_NATIVE_RECEIVER:
-            # Compile once in the parent without loading the shared library/OpenMP
-            # runtime. Child workers load the completed library on first use.
+            # Compile once in the parent, but do not dlopen the OpenMP-linked
+            # shared object before creating a fork worker pool.
             native_path = ensure_native_receiver_built(
                 required=PHOTON_SCATTER_NATIVE_REQUIRED
             )
             setup_print("Native photon-scatter receiver library:", native_path)
 
-        PHOTON_SCATTER_RECEIVER_STATUS = get_photon_scatter_receiver_status(
-            EMITTER_TEMPLATE, P_LOCATIONS, PMT_NORMALS
+        PHOTON_SCATTER_RECEIVER_STATUS = (
+            _receiver_status_without_prefork_native_load(
+                EMITTER_TEMPLATE,
+                P_LOCATIONS,
+                PMT_NORMALS,
+                status_function=get_photon_scatter_receiver_status,
+                native_library_path=native_path,
+                nproc=NPROC,
+            )
         )
         scatter_enabled = bool(
             getattr(EMITTER_TEMPLATE, "enable_rayleigh_scatter", False)
@@ -4939,6 +5252,15 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcsim",
                 "driver_release": str(DRIVER_RELEASE),
+                "runtime_cache_dir": os.environ.get(
+                    "LF_RESOLVED_RUNTIME_CACHE_DIR",
+                    os.environ.get("NUMBA_CACHE_DIR", ""),
+                ),
+                "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
+                "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "numba_threading_layer_requested": os.environ.get(
+                    "NUMBA_THREADING_LAYER", "default"
+                ),
                 "print_event_results": bool(PRINT_EVENT_RESULTS),
                 "save_detailed_event_results": bool(SAVE_DETAILED_EVENT_RESULTS),
                 "single_process": bool(int(NPROC) == 1),
@@ -15006,16 +15328,24 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
         PMT_SLOTS = np.ascontiguousarray(PMT_SLOTS, dtype=np.int32)
 
+        native_path = None
         if PHOTON_SCATTER_NATIVE_RECEIVER:
-            # Compile once in the parent without loading the shared library/OpenMP
-            # runtime. Child workers load the completed library on first use.
+            # Compile once in the parent, but do not dlopen the OpenMP-linked
+            # shared object before creating a fork worker pool.
             native_path = ensure_native_receiver_built(
                 required=PHOTON_SCATTER_NATIVE_REQUIRED
             )
             setup_print("Native photon-scatter receiver library:", native_path)
 
-        PHOTON_SCATTER_RECEIVER_STATUS = get_photon_scatter_receiver_status(
-            EMITTER_TEMPLATE, P_LOCATIONS, PMT_NORMALS
+        PHOTON_SCATTER_RECEIVER_STATUS = (
+            _receiver_status_without_prefork_native_load(
+                EMITTER_TEMPLATE,
+                P_LOCATIONS,
+                PMT_NORMALS,
+                status_function=get_photon_scatter_receiver_status,
+                native_library_path=native_path,
+                nproc=NPROC,
+            )
         )
         scatter_enabled = bool(
             getattr(EMITTER_TEMPLATE, "enable_rayleigh_scatter", False)
@@ -15592,6 +15922,15 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcsim",
                 "driver_release": str(DRIVER_RELEASE),
+                "runtime_cache_dir": os.environ.get(
+                    "LF_RESOLVED_RUNTIME_CACHE_DIR",
+                    os.environ.get("NUMBA_CACHE_DIR", ""),
+                ),
+                "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
+                "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "numba_threading_layer_requested": os.environ.get(
+                    "NUMBA_THREADING_LAYER", "default"
+                ),
                 "print_event_results": bool(PRINT_EVENT_RESULTS),
                 "save_detailed_event_results": bool(SAVE_DETAILED_EVENT_RESULTS),
                 "single_process": bool(int(NPROC) == 1),
@@ -16665,7 +17004,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-05-wcte-standard-analysis-tools-v3-root-identity"
+    DRIVER_RELEASE = "2026-08-06-wcte-standard-analysis-tools-v4-full-pid-controls"
 
     import hashlib
     import json
@@ -16839,44 +17178,111 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # Beam/event selection is delegated to the shared analysis_tools DataLoader
     # and BeamSelection APIs.  These switches configure only that adapter; the
     # fitter's narrower prompt window and timing reference remain below.
-    PARTICLE_SELECTION_LABEL = os.environ.get("PARTICLE_SELECTION_LABEL", FIT_PARTICLE_RAW).strip()
-    _selection_step_size_text = os.environ.get("SELECTION_STEP_SIZE", "1000").strip()
+    PARTICLE_SELECTION_LABEL = os.environ.get(
+        "PARTICLE_SELECTION_LABEL", DEFAULT_WCTE_PARTICLE_SELECTION_LABEL
+    ).strip()
+    SELECTION_MODE = os.environ.get(
+        "WCTE_SELECTION_MODE", DEFAULT_WCTE_SELECTION_MODE
+    ).strip().lower().replace("-", "_")
+    _selection_step_size_text = os.environ.get(
+        "SELECTION_STEP_SIZE", DEFAULT_WCTE_SELECTION_STEP_SIZE
+    ).strip()
     try:
         SELECTION_STEP_SIZE = max(1, int(_selection_step_size_text))
     except ValueError:
         if not _selection_step_size_text:
-            raise ValueError("SELECTION_STEP_SIZE must be a positive integer or an Uproot size string")
+            raise ValueError(
+                "SELECTION_STEP_SIZE must be a positive integer or an Uproot size string"
+            )
         SELECTION_STEP_SIZE = _selection_step_size_text
     ANALYSIS_TOOLS_PATH = os.environ.get(
-        "WCTE_ANALYSIS_TOOLS_PATH",
-        "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/analysis_tools",
+        "WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH
     ).strip()
     APPLY_MPMT_DATA_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", True
+        "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", DEFAULT_WCTE_APPLY_MPMT_DQ
     )
     APPLY_VME_EVENT_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_VME_EVENT_QUALITY_CUTS", True
+        "WCTE_APPLY_VME_EVENT_QUALITY_CUTS", DEFAULT_WCTE_APPLY_VME_DQ
     )
     APPLY_T5_EVENT_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_T5_EVENT_QUALITY_CUTS", True
+        "WCTE_APPLY_T5_EVENT_QUALITY_CUTS", DEFAULT_WCTE_APPLY_T5_DQ
     )
-    REQUIRE_MUON_TAGGER = _env_bool("WCTE_REQUIRE_MUON_TAGGER", False)
+    USE_ACT_EVETO_CUT = _env_bool(
+        "WCTE_USE_ACT_EVETO_CUT", DEFAULT_WCTE_USE_ACT_EVETO_CUT
+    )
+    USE_ACT_TAGGER_CUT = _env_bool(
+        "WCTE_USE_ACT_TAGGER_CUT", DEFAULT_WCTE_USE_ACT_TAGGER_CUT
+    )
+    TOF_CUT_MODE = os.environ.get(
+        "WCTE_TOF_CUT_MODE", DEFAULT_WCTE_TOF_CUT_MODE
+    ).strip().lower().replace("-", "_")
+    PROTON_TOF_WINDOW_NS = _env_float(
+        "WCTE_PROTON_TOF_WINDOW_NS", DEFAULT_WCTE_PROTON_TOF_WINDOW_NS
+    )
+    REQUIRE_MUON_TAGGER = _env_bool(
+        "WCTE_REQUIRE_MUON_TAGGER", DEFAULT_WCTE_REQUIRE_MUON_TAGGER
+    )
+    ACT_EVETO_CUT_OVERRIDE_PE = _env_optional_float(
+        "WCTE_ACT_EVETO_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_EVETO_CUT_OVERRIDE_PE
+    )
+    ACT_TAGGER_CUT_OVERRIDE_PE = _env_optional_float(
+        "WCTE_ACT_TAGGER_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_TAGGER_CUT_OVERRIDE_PE
+    )
+    PROTON_TOF_CUT_OVERRIDE_NS = _env_optional_float(
+        "WCTE_PROTON_TOF_CUT_OVERRIDE_NS", DEFAULT_WCTE_PROTON_TOF_CUT_OVERRIDE_NS
+    )
+    MUON_TAG_CUT_OVERRIDE = _env_optional_float(
+        "WCTE_MUON_TAG_CUT_OVERRIDE", DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE
+    )
+    EXTRA_SELECTION_CUTS = _selection_cut_specs_from_env(
+        "WCTE_EXTRA_SELECTION_CUTS_JSON", DEFAULT_WCTE_EXTRA_SELECTION_CUTS
+    )
+    PRINT_SELECTION_DESCRIPTION = _env_bool(
+        "WCTE_PRINT_SELECTION_DESCRIPTION", DEFAULT_WCTE_PRINT_SELECTION_DESCRIPTION
+    )
+    PRINT_CHERENKOV_THRESHOLDS = _env_bool(
+        "WCTE_PRINT_CHERENKOV_THRESHOLDS", DEFAULT_WCTE_PRINT_CHERENKOV_THRESHOLDS
+    )
     DATA_LOADER_PEAK_SAMPLE_EVENTS = max(
-        1, _env_int("WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS", 2000)
+        1, _env_int(
+            "WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS",
+            DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS,
+        )
     )
     DATA_LOADER_PEAK_SAMPLE_HITS = _env_optional_int(
-        "WCTE_DATA_LOADER_PEAK_SAMPLE_HITS", None
+        "WCTE_DATA_LOADER_PEAK_SAMPLE_HITS",
+        DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS,
     )
-    USE_T5_HIT_TIME_CUT = _env_bool("USE_T5_HIT_TIME_CUT", True)
-    T5_PEAK_WINDOW_NS = _env_float("T5_PEAK_WINDOW_NS", 200.0)
-    T5_PEAK_BIN_WIDTH_NS = _env_float("T5_PEAK_BIN_WIDTH_NS", 50.0)
-    T5_PEAK_TIME_MIN_NS = _env_float("T5_PEAK_TIME_MIN_NS", -2000.0)
-    T5_PEAK_TIME_MAX_NS = _env_float("T5_PEAK_TIME_MAX_NS", 4000.0)
-    USE_CALIBRATED_PEAK_TIME_CUT = _env_bool("USE_CALIBRATED_PEAK_TIME_CUT", False)
-    CALIBRATED_PEAK_WINDOW_NS = _env_float("CALIBRATED_PEAK_WINDOW_NS", 100.0)
-    CALIBRATED_PEAK_BIN_WIDTH_NS = _env_float("CALIBRATED_PEAK_BIN_WIDTH_NS", 50.0)
-    CALIBRATED_PEAK_TIME_MIN_NS = _env_float("CALIBRATED_PEAK_TIME_MIN_NS", 0.0)
-    CALIBRATED_PEAK_TIME_MAX_NS = _env_float("CALIBRATED_PEAK_TIME_MAX_NS", 10000.0)
+    USE_T5_HIT_TIME_CUT = _env_bool(
+        "USE_T5_HIT_TIME_CUT", DEFAULT_WCTE_USE_T5_HIT_TIME_CUT
+    )
+    T5_PEAK_WINDOW_NS = _env_float(
+        "T5_PEAK_WINDOW_NS", DEFAULT_WCTE_T5_PEAK_WINDOW_NS
+    )
+    T5_PEAK_BIN_WIDTH_NS = _env_float(
+        "T5_PEAK_BIN_WIDTH_NS", DEFAULT_WCTE_T5_PEAK_BIN_WIDTH_NS
+    )
+    T5_PEAK_TIME_MIN_NS = _env_float(
+        "T5_PEAK_TIME_MIN_NS", DEFAULT_WCTE_T5_PEAK_TIME_MIN_NS
+    )
+    T5_PEAK_TIME_MAX_NS = _env_float(
+        "T5_PEAK_TIME_MAX_NS", DEFAULT_WCTE_T5_PEAK_TIME_MAX_NS
+    )
+    USE_CALIBRATED_PEAK_TIME_CUT = _env_bool(
+        "USE_CALIBRATED_PEAK_TIME_CUT", DEFAULT_WCTE_USE_CALIBRATED_PEAK_TIME_CUT
+    )
+    CALIBRATED_PEAK_WINDOW_NS = _env_float(
+        "CALIBRATED_PEAK_WINDOW_NS", DEFAULT_WCTE_CALIBRATED_PEAK_WINDOW_NS
+    )
+    CALIBRATED_PEAK_BIN_WIDTH_NS = _env_float(
+        "CALIBRATED_PEAK_BIN_WIDTH_NS", DEFAULT_WCTE_CALIBRATED_PEAK_BIN_WIDTH_NS
+    )
+    CALIBRATED_PEAK_TIME_MIN_NS = _env_float(
+        "CALIBRATED_PEAK_TIME_MIN_NS", DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MIN_NS
+    )
+    CALIBRATED_PEAK_TIME_MAX_NS = _env_float(
+        "CALIBRATED_PEAK_TIME_MAX_NS", DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MAX_NS
+    )
 
     # Real-data hit preparation.
     CHARGE_ADC_PER_PE = _env_float("CHARGE_ADC_PER_PE", 143.0)
@@ -17656,7 +18062,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     )
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
+    SELECTION_PARTICLE = _validate_wcte_particle_selection_contract(
+        fit_particle_raw=FIT_PARTICLE_RAW,
+        selection_label=PARTICLE_SELECTION_LABEL,
+        selection_mode=SELECTION_MODE,
+        extra_selection_cuts=EXTRA_SELECTION_CUTS,
+        loader_active=(EVENT_SOURCE == "selection"),
+    )
     FIT_PARTICLE = canonical_particle_name(FIT_PARTICLE_RAW)
+    SELECTION_MATCHES_FIT_HYPOTHESIS = _selection_matches_fit_hypothesis(
+        SELECTION_PARTICLE, FIT_PARTICLE
+    )
+    if (
+        EVENT_SOURCE == "selection"
+        and not SELECTION_MATCHES_FIT_HYPOTHESIS
+        and not _env_bool("LF_COSMIC_CHILD_QUIET", False)
+    ):
+        print(
+            "WARNING: WCTE BeamSelection population "
+            f"{SELECTION_PARTICLE!r} is being fitted under the distinct "
+            f"LicketyFit hypothesis {FIT_PARTICLE!r}.",
+            flush=True,
+        )
     if FIT_MODE_REQUEST in {"absorption", "abrupt", "interaction", "truncated"}:
         FIT_MODE = "absorption"
     elif FIT_MODE_REQUEST in {"full_length", "full", "threshold", "range", "csda"}:
@@ -19080,6 +19507,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             extra={
                 "driver": "batch_fit_driver_wcte",
                 "driver_release": str(DRIVER_RELEASE),
+                "runtime_cache_dir": os.environ.get(
+                    "LF_RESOLVED_RUNTIME_CACHE_DIR",
+                    os.environ.get("NUMBA_CACHE_DIR", ""),
+                ),
+                "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
+                "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "numba_threading_layer_requested": os.environ.get(
+                    "NUMBA_THREADING_LAYER", "default"
+                ),
                 "detector_mode": str(DETECTOR_MODE),
                 "proxy_disable_delta": bool(PROXY_DISABLE_DELTA),
                 "proxy_disable_photon_scatter": bool(PROXY_DISABLE_PHOTON_SCATTER),
@@ -20532,7 +20968,19 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 apply_mpmt_data_quality_cuts=bool(APPLY_MPMT_DATA_QUALITY_CUTS),
                 apply_vme_event_quality_cuts=bool(APPLY_VME_EVENT_QUALITY_CUTS),
                 apply_t5_event_quality_cuts=bool(APPLY_T5_EVENT_QUALITY_CUTS),
+                selection_mode=str(SELECTION_MODE),
+                use_act_eveto_cut=bool(USE_ACT_EVETO_CUT),
+                use_act_tagger_cut=bool(USE_ACT_TAGGER_CUT),
+                tof_cut_mode=str(TOF_CUT_MODE),
+                proton_tof_window_ns=float(PROTON_TOF_WINDOW_NS),
                 require_muon_tagger=bool(REQUIRE_MUON_TAGGER),
+                act_eveto_cut_override_pe=ACT_EVETO_CUT_OVERRIDE_PE,
+                act_tagger_cut_override_pe=ACT_TAGGER_CUT_OVERRIDE_PE,
+                proton_tof_cut_override_ns=PROTON_TOF_CUT_OVERRIDE_NS,
+                muon_tag_cut_override=MUON_TAG_CUT_OVERRIDE,
+                extra_selection_cuts=EXTRA_SELECTION_CUTS,
+                print_selection_description=bool(PRINT_SELECTION_DESCRIPTION),
+                print_cherenkov_thresholds=bool(PRINT_CHERENKOV_THRESHOLDS),
                 use_t5_hit_time_cut=bool(USE_T5_HIT_TIME_CUT),
                 t5_peak_window_ns=float(T5_PEAK_WINDOW_NS),
                 t5_peak_bin_width_ns=float(T5_PEAK_BIN_WIDTH_NS),
@@ -20929,16 +21377,24 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         if MPMT_TYPE_CODES is not None and MPMT_TYPE_CODES.shape != PMT_SLOTS.shape:
             raise RuntimeError("relative-efficiency code array is not aligned with PMT ordering")
 
+        native_path = None
         if PHOTON_SCATTER_NATIVE_RECEIVER:
-            # Compile once in the parent without loading the shared library/OpenMP
-            # runtime. Child workers load the completed library on first use.
+            # Compile once in the parent, but do not dlopen the OpenMP-linked
+            # shared object before creating a fork worker pool.
             native_path = ensure_native_receiver_built(
                 required=PHOTON_SCATTER_NATIVE_REQUIRED
             )
             setup_print("Native photon-scatter receiver library:", native_path)
 
-        PHOTON_SCATTER_RECEIVER_STATUS = get_photon_scatter_receiver_status(
-            EMITTER_TEMPLATE, P_LOCATIONS, PMT_NORMALS
+        PHOTON_SCATTER_RECEIVER_STATUS = (
+            _receiver_status_without_prefork_native_load(
+                EMITTER_TEMPLATE,
+                P_LOCATIONS,
+                PMT_NORMALS,
+                status_function=get_photon_scatter_receiver_status,
+                native_library_path=native_path,
+                nproc=NPROC,
+            )
         )
         scatter_enabled = bool(
             getattr(EMITTER_TEMPLATE, "enable_rayleigh_scatter", False)
@@ -21256,6 +21712,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcte",
                 "driver_release": str(DRIVER_RELEASE),
+                "runtime_cache_dir": os.environ.get(
+                    "LF_RESOLVED_RUNTIME_CACHE_DIR",
+                    os.environ.get("NUMBA_CACHE_DIR", ""),
+                ),
+                "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
+                "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "numba_threading_layer_requested": os.environ.get(
+                    "NUMBA_THREADING_LAYER", "default"
+                ),
                 "print_event_results": bool(PRINT_EVENT_RESULTS),
                 "save_detailed_event_results": bool(SAVE_DETAILED_EVENT_RESULTS),
                 "single_process": bool(int(NPROC) == 1),
@@ -21405,6 +21870,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
                     "particle_label": str(PARTICLE_SELECTION_LABEL),
+                    "canonical_particle": str(SELECTION_PARTICLE),
+                    "fit_particle_hypothesis": str(FIT_PARTICLE),
+                    "selection_matches_fit_hypothesis": bool(
+                        SELECTION_MATCHES_FIT_HYPOTHESIS
+                    ),
                     "loader": "analysis_tools.DataLoader",
                     "beam_selection": "analysis_tools.BeamSelection",
                     "analysis_tools_path_requested": (
@@ -21419,7 +21889,25 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     "apply_t5_event_quality_cuts": bool(
                         APPLY_T5_EVENT_QUALITY_CUTS
                     ),
+                    "selection_mode": str(SELECTION_MODE),
+                    "use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
+                    "use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
+                    "tof_cut_mode": str(TOF_CUT_MODE),
+                    "proton_tof_window_ns": float(PROTON_TOF_WINDOW_NS),
                     "require_muon_tagger": bool(REQUIRE_MUON_TAGGER),
+                    "act_eveto_cut_override_pe": ACT_EVETO_CUT_OVERRIDE_PE,
+                    "act_tagger_cut_override_pe": ACT_TAGGER_CUT_OVERRIDE_PE,
+                    "proton_tof_cut_override_ns": PROTON_TOF_CUT_OVERRIDE_NS,
+                    "muon_tag_cut_override": MUON_TAG_CUT_OVERRIDE,
+                    "extra_selection_cuts": [
+                        list(spec) for spec in EXTRA_SELECTION_CUTS
+                    ],
+                    "print_selection_description": bool(
+                        PRINT_SELECTION_DESCRIPTION
+                    ),
+                    "print_cherenkov_thresholds": bool(
+                        PRINT_CHERENKOV_THRESHOLDS
+                    ),
                     "use_t5_hit_time_cut": bool(USE_T5_HIT_TIME_CUT),
                     "t5_peak_window_ns": float(T5_PEAK_WINDOW_NS),
                     "t5_peak_bin_width_ns": float(T5_PEAK_BIN_WIDTH_NS),
@@ -21927,7 +22415,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-05-wcte-cosmic-v17-analysis-tools-core-parity-root-identity"
+    DRIVER_RELEASE = "2026-08-06-wcte-cosmic-v18-analysis-tools-full-pid-controls"
 
     import hashlib
     import json
@@ -22123,44 +22611,111 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # Beam/event selection is delegated to the shared analysis_tools DataLoader
     # and BeamSelection APIs.  These switches configure only that adapter; the
     # fitter's narrower prompt window and timing reference remain below.
-    PARTICLE_SELECTION_LABEL = os.environ.get("PARTICLE_SELECTION_LABEL", FIT_PARTICLE_RAW).strip()
-    _selection_step_size_text = os.environ.get("SELECTION_STEP_SIZE", "1000").strip()
+    PARTICLE_SELECTION_LABEL = os.environ.get(
+        "PARTICLE_SELECTION_LABEL", DEFAULT_WCTE_PARTICLE_SELECTION_LABEL
+    ).strip()
+    SELECTION_MODE = os.environ.get(
+        "WCTE_SELECTION_MODE", DEFAULT_WCTE_SELECTION_MODE
+    ).strip().lower().replace("-", "_")
+    _selection_step_size_text = os.environ.get(
+        "SELECTION_STEP_SIZE", DEFAULT_WCTE_SELECTION_STEP_SIZE
+    ).strip()
     try:
         SELECTION_STEP_SIZE = max(1, int(_selection_step_size_text))
     except ValueError:
         if not _selection_step_size_text:
-            raise ValueError("SELECTION_STEP_SIZE must be a positive integer or an Uproot size string")
+            raise ValueError(
+                "SELECTION_STEP_SIZE must be a positive integer or an Uproot size string"
+            )
         SELECTION_STEP_SIZE = _selection_step_size_text
     ANALYSIS_TOOLS_PATH = os.environ.get(
-        "WCTE_ANALYSIS_TOOLS_PATH",
-        "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/analysis_tools",
+        "WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH
     ).strip()
     APPLY_MPMT_DATA_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", True
+        "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", DEFAULT_WCTE_APPLY_MPMT_DQ
     )
     APPLY_VME_EVENT_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_VME_EVENT_QUALITY_CUTS", True
+        "WCTE_APPLY_VME_EVENT_QUALITY_CUTS", DEFAULT_WCTE_APPLY_VME_DQ
     )
     APPLY_T5_EVENT_QUALITY_CUTS = _env_bool(
-        "WCTE_APPLY_T5_EVENT_QUALITY_CUTS", True
+        "WCTE_APPLY_T5_EVENT_QUALITY_CUTS", DEFAULT_WCTE_APPLY_T5_DQ
     )
-    REQUIRE_MUON_TAGGER = _env_bool("WCTE_REQUIRE_MUON_TAGGER", False)
+    USE_ACT_EVETO_CUT = _env_bool(
+        "WCTE_USE_ACT_EVETO_CUT", DEFAULT_WCTE_USE_ACT_EVETO_CUT
+    )
+    USE_ACT_TAGGER_CUT = _env_bool(
+        "WCTE_USE_ACT_TAGGER_CUT", DEFAULT_WCTE_USE_ACT_TAGGER_CUT
+    )
+    TOF_CUT_MODE = os.environ.get(
+        "WCTE_TOF_CUT_MODE", DEFAULT_WCTE_TOF_CUT_MODE
+    ).strip().lower().replace("-", "_")
+    PROTON_TOF_WINDOW_NS = _env_float(
+        "WCTE_PROTON_TOF_WINDOW_NS", DEFAULT_WCTE_PROTON_TOF_WINDOW_NS
+    )
+    REQUIRE_MUON_TAGGER = _env_bool(
+        "WCTE_REQUIRE_MUON_TAGGER", DEFAULT_WCTE_REQUIRE_MUON_TAGGER
+    )
+    ACT_EVETO_CUT_OVERRIDE_PE = _env_optional_float(
+        "WCTE_ACT_EVETO_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_EVETO_CUT_OVERRIDE_PE
+    )
+    ACT_TAGGER_CUT_OVERRIDE_PE = _env_optional_float(
+        "WCTE_ACT_TAGGER_CUT_OVERRIDE_PE", DEFAULT_WCTE_ACT_TAGGER_CUT_OVERRIDE_PE
+    )
+    PROTON_TOF_CUT_OVERRIDE_NS = _env_optional_float(
+        "WCTE_PROTON_TOF_CUT_OVERRIDE_NS", DEFAULT_WCTE_PROTON_TOF_CUT_OVERRIDE_NS
+    )
+    MUON_TAG_CUT_OVERRIDE = _env_optional_float(
+        "WCTE_MUON_TAG_CUT_OVERRIDE", DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE
+    )
+    EXTRA_SELECTION_CUTS = _selection_cut_specs_from_env(
+        "WCTE_EXTRA_SELECTION_CUTS_JSON", DEFAULT_WCTE_EXTRA_SELECTION_CUTS
+    )
+    PRINT_SELECTION_DESCRIPTION = _env_bool(
+        "WCTE_PRINT_SELECTION_DESCRIPTION", DEFAULT_WCTE_PRINT_SELECTION_DESCRIPTION
+    )
+    PRINT_CHERENKOV_THRESHOLDS = _env_bool(
+        "WCTE_PRINT_CHERENKOV_THRESHOLDS", DEFAULT_WCTE_PRINT_CHERENKOV_THRESHOLDS
+    )
     DATA_LOADER_PEAK_SAMPLE_EVENTS = max(
-        1, _env_int("WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS", 2000)
+        1, _env_int(
+            "WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS",
+            DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS,
+        )
     )
     DATA_LOADER_PEAK_SAMPLE_HITS = _env_optional_int(
-        "WCTE_DATA_LOADER_PEAK_SAMPLE_HITS", None
+        "WCTE_DATA_LOADER_PEAK_SAMPLE_HITS",
+        DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS,
     )
-    USE_T5_HIT_TIME_CUT = _env_bool("USE_T5_HIT_TIME_CUT", True)
-    T5_PEAK_WINDOW_NS = _env_float("T5_PEAK_WINDOW_NS", 200.0)
-    T5_PEAK_BIN_WIDTH_NS = _env_float("T5_PEAK_BIN_WIDTH_NS", 50.0)
-    T5_PEAK_TIME_MIN_NS = _env_float("T5_PEAK_TIME_MIN_NS", -2000.0)
-    T5_PEAK_TIME_MAX_NS = _env_float("T5_PEAK_TIME_MAX_NS", 4000.0)
-    USE_CALIBRATED_PEAK_TIME_CUT = _env_bool("USE_CALIBRATED_PEAK_TIME_CUT", False)
-    CALIBRATED_PEAK_WINDOW_NS = _env_float("CALIBRATED_PEAK_WINDOW_NS", 100.0)
-    CALIBRATED_PEAK_BIN_WIDTH_NS = _env_float("CALIBRATED_PEAK_BIN_WIDTH_NS", 50.0)
-    CALIBRATED_PEAK_TIME_MIN_NS = _env_float("CALIBRATED_PEAK_TIME_MIN_NS", 0.0)
-    CALIBRATED_PEAK_TIME_MAX_NS = _env_float("CALIBRATED_PEAK_TIME_MAX_NS", 10000.0)
+    USE_T5_HIT_TIME_CUT = _env_bool(
+        "USE_T5_HIT_TIME_CUT", DEFAULT_WCTE_USE_T5_HIT_TIME_CUT
+    )
+    T5_PEAK_WINDOW_NS = _env_float(
+        "T5_PEAK_WINDOW_NS", DEFAULT_WCTE_T5_PEAK_WINDOW_NS
+    )
+    T5_PEAK_BIN_WIDTH_NS = _env_float(
+        "T5_PEAK_BIN_WIDTH_NS", DEFAULT_WCTE_T5_PEAK_BIN_WIDTH_NS
+    )
+    T5_PEAK_TIME_MIN_NS = _env_float(
+        "T5_PEAK_TIME_MIN_NS", DEFAULT_WCTE_T5_PEAK_TIME_MIN_NS
+    )
+    T5_PEAK_TIME_MAX_NS = _env_float(
+        "T5_PEAK_TIME_MAX_NS", DEFAULT_WCTE_T5_PEAK_TIME_MAX_NS
+    )
+    USE_CALIBRATED_PEAK_TIME_CUT = _env_bool(
+        "USE_CALIBRATED_PEAK_TIME_CUT", DEFAULT_WCTE_USE_CALIBRATED_PEAK_TIME_CUT
+    )
+    CALIBRATED_PEAK_WINDOW_NS = _env_float(
+        "CALIBRATED_PEAK_WINDOW_NS", DEFAULT_WCTE_CALIBRATED_PEAK_WINDOW_NS
+    )
+    CALIBRATED_PEAK_BIN_WIDTH_NS = _env_float(
+        "CALIBRATED_PEAK_BIN_WIDTH_NS", DEFAULT_WCTE_CALIBRATED_PEAK_BIN_WIDTH_NS
+    )
+    CALIBRATED_PEAK_TIME_MIN_NS = _env_float(
+        "CALIBRATED_PEAK_TIME_MIN_NS", DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MIN_NS
+    )
+    CALIBRATED_PEAK_TIME_MAX_NS = _env_float(
+        "CALIBRATED_PEAK_TIME_MAX_NS", DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MAX_NS
+    )
 
     # Real-data hit preparation.
     CHARGE_ADC_PER_PE = _env_float("CHARGE_ADC_PER_PE", 143.0)
@@ -23207,7 +23762,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     )
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
+    SELECTION_PARTICLE = _validate_wcte_particle_selection_contract(
+        fit_particle_raw=FIT_PARTICLE_RAW,
+        selection_label=PARTICLE_SELECTION_LABEL,
+        selection_mode=SELECTION_MODE,
+        extra_selection_cuts=EXTRA_SELECTION_CUTS,
+        loader_active=(EVENT_SOURCE == "selection"),
+    )
     FIT_PARTICLE = canonical_particle_name(FIT_PARTICLE_RAW)
+    SELECTION_MATCHES_FIT_HYPOTHESIS = _selection_matches_fit_hypothesis(
+        SELECTION_PARTICLE, FIT_PARTICLE
+    )
+    if (
+        EVENT_SOURCE == "selection"
+        and not SELECTION_MATCHES_FIT_HYPOTHESIS
+        and not _env_bool("LF_COSMIC_CHILD_QUIET", False)
+    ):
+        print(
+            "WARNING: WCTE BeamSelection population "
+            f"{SELECTION_PARTICLE!r} is being fitted under the distinct "
+            f"LicketyFit hypothesis {FIT_PARTICLE!r}.",
+            flush=True,
+        )
     BOUNDARY_CLIPPED_TRACK = False
     AUTO_CLIPPED_TRACK = bool(_AUTO_CLIPPED_MODE_REQUESTED)
     if not AUTO_CLIPPED_TRACK:
@@ -31655,7 +32231,19 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 apply_mpmt_data_quality_cuts=bool(APPLY_MPMT_DATA_QUALITY_CUTS),
                 apply_vme_event_quality_cuts=bool(APPLY_VME_EVENT_QUALITY_CUTS),
                 apply_t5_event_quality_cuts=bool(APPLY_T5_EVENT_QUALITY_CUTS),
+                selection_mode=str(SELECTION_MODE),
+                use_act_eveto_cut=bool(USE_ACT_EVETO_CUT),
+                use_act_tagger_cut=bool(USE_ACT_TAGGER_CUT),
+                tof_cut_mode=str(TOF_CUT_MODE),
+                proton_tof_window_ns=float(PROTON_TOF_WINDOW_NS),
                 require_muon_tagger=bool(REQUIRE_MUON_TAGGER),
+                act_eveto_cut_override_pe=ACT_EVETO_CUT_OVERRIDE_PE,
+                act_tagger_cut_override_pe=ACT_TAGGER_CUT_OVERRIDE_PE,
+                proton_tof_cut_override_ns=PROTON_TOF_CUT_OVERRIDE_NS,
+                muon_tag_cut_override=MUON_TAG_CUT_OVERRIDE,
+                extra_selection_cuts=EXTRA_SELECTION_CUTS,
+                print_selection_description=bool(PRINT_SELECTION_DESCRIPTION),
+                print_cherenkov_thresholds=bool(PRINT_CHERENKOV_THRESHOLDS),
                 use_t5_hit_time_cut=bool(USE_T5_HIT_TIME_CUT),
                 t5_peak_window_ns=float(T5_PEAK_WINDOW_NS),
                 t5_peak_bin_width_ns=float(T5_PEAK_BIN_WIDTH_NS),
@@ -32112,16 +32700,24 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         if MPMT_TYPE_CODES is not None and MPMT_TYPE_CODES.shape != PMT_SLOTS.shape:
             raise RuntimeError("relative-efficiency code array is not aligned with PMT ordering")
 
+        native_path = None
         if PHOTON_SCATTER_NATIVE_RECEIVER:
-            # Compile once in the parent without loading the shared library/OpenMP
-            # runtime. Child workers load the completed library on first use.
+            # Compile once in the parent, but do not dlopen the OpenMP-linked
+            # shared object before creating a fork worker pool.
             native_path = ensure_native_receiver_built(
                 required=PHOTON_SCATTER_NATIVE_REQUIRED
             )
             setup_print("Native photon-scatter receiver library:", native_path)
 
-        PHOTON_SCATTER_RECEIVER_STATUS = get_photon_scatter_receiver_status(
-            EMITTER_TEMPLATE, P_LOCATIONS, PMT_NORMALS
+        PHOTON_SCATTER_RECEIVER_STATUS = (
+            _receiver_status_without_prefork_native_load(
+                EMITTER_TEMPLATE,
+                P_LOCATIONS,
+                PMT_NORMALS,
+                status_function=get_photon_scatter_receiver_status,
+                native_library_path=native_path,
+                nproc=NPROC,
+            )
         )
         scatter_enabled = bool(
             getattr(EMITTER_TEMPLATE, "enable_rayleigh_scatter", False)
@@ -32718,6 +33314,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcte",
                 "driver_release": str(DRIVER_RELEASE),
+                "runtime_cache_dir": os.environ.get(
+                    "LF_RESOLVED_RUNTIME_CACHE_DIR",
+                    os.environ.get("NUMBA_CACHE_DIR", ""),
+                ),
+                "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
+                "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "numba_threading_layer_requested": os.environ.get(
+                    "NUMBA_THREADING_LAYER", "default"
+                ),
                 "print_event_results": bool(PRINT_EVENT_RESULTS),
                 "save_detailed_event_results": bool(SAVE_DETAILED_EVENT_RESULTS),
                 "single_process": bool(int(NPROC) == 1),
@@ -33114,6 +33719,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
                     "particle_label": str(PARTICLE_SELECTION_LABEL),
+                    "canonical_particle": str(SELECTION_PARTICLE),
+                    "fit_particle_hypothesis": str(FIT_PARTICLE),
+                    "selection_matches_fit_hypothesis": bool(
+                        SELECTION_MATCHES_FIT_HYPOTHESIS
+                    ),
                     "loader": "analysis_tools.DataLoader",
                     "beam_selection": "analysis_tools.BeamSelection",
                     "analysis_tools_path_requested": (
@@ -33128,7 +33738,25 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     "apply_t5_event_quality_cuts": bool(
                         APPLY_T5_EVENT_QUALITY_CUTS
                     ),
+                    "selection_mode": str(SELECTION_MODE),
+                    "use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
+                    "use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
+                    "tof_cut_mode": str(TOF_CUT_MODE),
+                    "proton_tof_window_ns": float(PROTON_TOF_WINDOW_NS),
                     "require_muon_tagger": bool(REQUIRE_MUON_TAGGER),
+                    "act_eveto_cut_override_pe": ACT_EVETO_CUT_OVERRIDE_PE,
+                    "act_tagger_cut_override_pe": ACT_TAGGER_CUT_OVERRIDE_PE,
+                    "proton_tof_cut_override_ns": PROTON_TOF_CUT_OVERRIDE_NS,
+                    "muon_tag_cut_override": MUON_TAG_CUT_OVERRIDE,
+                    "extra_selection_cuts": [
+                        list(spec) for spec in EXTRA_SELECTION_CUTS
+                    ],
+                    "print_selection_description": bool(
+                        PRINT_SELECTION_DESCRIPTION
+                    ),
+                    "print_cherenkov_thresholds": bool(
+                        PRINT_CHERENKOV_THRESHOLDS
+                    ),
                     "use_t5_hit_time_cut": bool(USE_T5_HIT_TIME_CUT),
                     "t5_peak_window_ns": float(T5_PEAK_WINDOW_NS),
                     "t5_peak_bin_width_ns": float(T5_PEAK_BIN_WIDTH_NS),

@@ -1,3 +1,6 @@
 ./work_dir/sample_data/
 ./work_dir/
 ./work_dir/
+
+# Local generated working files
+/work_dir/

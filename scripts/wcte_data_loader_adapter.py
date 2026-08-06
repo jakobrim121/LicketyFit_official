@@ -1,20 +1,30 @@
-"""Thin real-WCTE input adapter built on the shared ``analysis_tools`` API.
+"""Real-WCTE input adapter built on the shared ``analysis_tools`` API.
 
-The fitter owns reconstruction, detector geometry, prompt conditioning, charge
-conversion, calibration, and output.  This module owns only the production ROOT
-input layer:
+The fitter owns reconstruction, geometry, calibration, prompt conditioning and
+output.  This module owns only the production ROOT input layer:
 
-* resolve/import the external ``analysis_tools`` checkout (or an installed/
-  submodule copy);
+* resolve/import ``analysis_tools`` from an installed package, submodule, or
+  external checkout;
 * use :class:`analysis_tools.DataLoader` for ROOT access and data-quality cuts;
-* use :class:`analysis_tools.BeamSelection` for the run-derived particle PID;
-* convert selected jagged hit records into LicketyFit's compact ``N x 5`` hit
-  table ``[global_pmt_id, charge_adc, calibrated_time_ns,
-  root_entry_index, event_number]``.
+* use :class:`analysis_tools.BeamSelection` for nominal or custom beam PID;
+* preserve both the raw ``WCTEReadoutWindows`` ROOT entry and production
+  ``event_number``;
+* convert selected jagged hits to LicketyFit's compact ``N x 5`` table
+  ``[global_pmt_id, charge_adc, calibrated_time_ns, root_entry, event_number]``.
 
-No reconstruction code and no WCSim truth is used here.  The returned calibrated
-PMT times are deliberately left in the production-file convention; the batch
-fitter applies its existing prompt window and event-time reference afterwards.
+The nominal selections reproduce the supplied analysis-tools examples:
+
+* electron: ``act_eveto > cut`` and optional fast-TOF cut;
+* muon: ``act_eveto < cut``, ``act_tagger > cut``, optional fast-TOF cut,
+  and optional muon-tagger cut;
+* pion: ``act_eveto < cut``, ``act_tagger < cut``, optional fast-TOF cut;
+* proton: TOF in ``[proton_tof_cut, proton_tof_cut + window]``.
+
+The examples explicitly say these nominal cuts must be adapted to the run.  The
+configuration therefore exposes independent ACT/TOF toggles, scalar overrides,
+a proton-window width, and arbitrary additional/custom ``BeamSelection`` cuts.
+No nominal kaon selection is defined by analysis_tools; kaon-labelled data must
+use ``selection_mode='custom'`` with explicit cuts.
 """
 
 from __future__ import annotations
@@ -44,18 +54,20 @@ _PARTICLE_ALIASES = {
     "mu": "muon", "mu-": "muon", "mu+": "muon", "muon": "muon",
     "pi": "pion", "pi-": "pion", "pi+": "pion", "pion": "pion",
     "e": "electron", "e-": "electron", "e+": "electron", "electron": "electron",
+    "k": "kaon", "k-": "kaon", "k+": "kaon", "kaon": "kaon",
     "p": "proton", "p+": "proton", "proton": "proton",
 }
+_NOMINAL_PARTICLES = frozenset({"muon", "pion", "electron", "proton"})
+_SELECTION_MODES = frozenset({"nominal", "custom"})
+_TOF_CUT_MODES = frozenset({"auto", "require", "disable"})
+_SUPPORTED_OPERATORS = frozenset({">", "<", ">=", "<=", "==", "!=", "between"})
 
-_BASE_REQUIRED_BRANCHES = (
+_BASE_HIT_BRANCHES = (
     "event_number",
     "hit_mpmt_slot_ids",
     "hit_pmt_position_ids",
     "hit_pmt_charges",
     "hit_pmt_calibrated_times",
-    "vme_act_eveto",
-    "vme_act_tagger",
-    "vme_tof_corr",
 )
 _OPTIONAL_ID_BRANCHES = ("run_id", "sub_run_id", "spill_counter", "readout_number")
 _MPMT_DQ_BRANCHES = ("window_data_quality_mask", "hit_pmt_readout_mask")
@@ -65,6 +77,14 @@ _T5_DQ_BRANCHES = (
     "T5_HasMultipleScintillatorsHit",
     "T5_HasInTimeWindow",
 )
+_SELECTION_VARIABLE_ALIASES = {
+    "act_eveto": "vme_act_eveto",
+    "act_tagger": "vme_act_tagger",
+    "tof": "vme_tof_corr",
+    "mu_tag_total": "vme_mu_tag_total",
+    "act_0_charge": "vme_act0_l_charge",
+    "T5_particle_nr": "T5_particle_nr",
+}
 _ROOT_ENTRY_FIELD = "__licketyfit_root_entry_index"
 
 
@@ -75,18 +95,41 @@ class WCTESelectionConfig:
     particle: str = "muon"
     max_root_entries: int | None = 50_000
     max_selected_events: int | None = None
-    step_size: int | str = 1000
+    step_size: int | str = "100 MB"
 
     apply_mpmt_data_quality_cuts: bool = True
     apply_vme_event_quality_cuts: bool = True
     apply_t5_event_quality_cuts: bool = True
-    require_muon_tagger: bool = False
-    tof_fallback_when_zero_ns: float = 999.0
 
-    # Additional *hit-level* selection used by the historical LicketyFit loader
-    # and by the supplied analysis-tools example.  These are independent of the
-    # fitter's later narrow prompt window.
-    use_t5_hit_time_cut: bool = True
+    # PID construction. ``nominal`` follows the repository examples. ``custom``
+    # applies only ``extra_selection_cuts`` and is required for a kaon label.
+    selection_mode: str = "nominal"
+    use_act_eveto_cut: bool = True
+    use_act_tagger_cut: bool = True
+    # auto: use run scalar when >0, otherwise omit for fast particles;
+    # require: fail if no positive scalar/override; disable: omit.
+    tof_cut_mode: str = "auto"
+    proton_tof_window_ns: float = 10.0
+    require_muon_tagger: bool = False
+
+    # Optional run-scalar overrides. None means use vme_analysis_scalar_results.
+    act_eveto_cut_override_pe: float | None = None
+    act_tagger_cut_override_pe: float | None = None
+    proton_tof_cut_override_ns: float | None = None
+    muon_tag_cut_override: float | None = None
+
+    # Each item is [variable, operator, value], exactly as accepted by
+    # BeamSelection.selection. In nominal mode these are appended; in custom mode
+    # they are the complete selection.
+    extra_selection_cuts: Sequence[Sequence[Any]] = ()
+    print_selection_description: bool = True
+    print_cherenkov_thresholds: bool = True
+
+    # Optional legacy/example hit-level timing preselection. This is distinct
+    # from DataLoader.apply_t5_event_quality_cuts(), which operates on event-level
+    # T5 validity flags. Disabled by default so the official DataLoader DQ is the
+    # only T5 selection before LicketyFit's later event-specific prompt window.
+    use_t5_hit_time_cut: bool = False
     t5_peak_window_ns: float = 200.0
     t5_peak_bin_width_ns: float = 50.0
     t5_peak_time_min_ns: float = -2000.0
@@ -115,8 +158,57 @@ def _canonical_particle(value: str) -> str:
     except KeyError as exc:
         raise ValueError(
             f"Unsupported WCTE particle selection {value!r}; expected one of "
-            "muon, pion, electron, or proton."
+            "muon, pion, electron, kaon, or proton."
         ) from exc
+
+
+def _canonical_selection_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode not in _SELECTION_MODES:
+        raise ValueError("WCTE selection_mode must be 'nominal' or 'custom'")
+    return mode
+
+
+def _canonical_tof_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_")
+    aliases = {"on": "require", "true": "require", "off": "disable", "false": "disable"}
+    mode = aliases.get(mode, mode)
+    if mode not in _TOF_CUT_MODES:
+        raise ValueError("WCTE tof_cut_mode must be auto, require, or disable")
+    return mode
+
+
+def _normalise_cut_spec(spec: Sequence[Any]) -> list[Any]:
+    if not isinstance(spec, (list, tuple)) or len(spec) != 3:
+        raise ValueError(
+            "Every WCTE selection cut must be [variable, operator, value]; "
+            f"got {spec!r}"
+        )
+    variable, operator, value = spec
+    variable = str(variable).strip()
+    operator = str(operator).strip()
+    if not variable:
+        raise ValueError(f"WCTE selection cut has an empty variable: {spec!r}")
+    if operator not in _SUPPORTED_OPERATORS:
+        raise ValueError(
+            f"Unsupported WCTE selection operator {operator!r}; expected one of "
+            + ", ".join(sorted(_SUPPORTED_OPERATORS))
+        )
+    if operator == "between":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"'between' requires [low, high], got {value!r}")
+        value = [value[0], value[1]]
+    return [variable, operator, value]
+
+
+def _selection_branch_name(variable: str) -> str:
+    name = str(variable).strip()
+    if name in _SELECTION_VARIABLE_ALIASES:
+        return _SELECTION_VARIABLE_ALIASES[name]
+    if name.startswith("vme_") or name.startswith("T5_"):
+        return name
+    # This matches analysis_tools.beam_selection._parse_cut_spec.
+    return f"vme_{name}"
 
 
 def _sha256_file(path: Path | None) -> str | None:
@@ -151,10 +243,8 @@ def _candidate_import_roots(
     add(explicit_path)
     add(os.environ.get("WCTE_ANALYSIS_TOOLS_PATH"))
     add(os.environ.get("ANALYSIS_TOOLS_PATH"))
-
     if project_root is not None:
         root = Path(project_root)
-        # Current external checkout, plus conventional future submodule homes.
         for relative in (
             "analysis_tools",
             "external/analysis_tools",
@@ -165,20 +255,160 @@ def _candidate_import_roots(
             "../data_production_v1/analysis_tools",
         ):
             add(root / relative)
-
     add(DEFAULT_ANALYSIS_TOOLS_PATH)
     return candidates
 
 
 def _sys_path_root_for_candidate(candidate: Path) -> Path | None:
-    """Return the path that must be on ``sys.path`` for ``import analysis_tools``."""
-    # Repository root: <candidate>/analysis_tools/__init__.py
     if (candidate / "analysis_tools" / "__init__.py").is_file():
         return candidate
-    # Package directory itself: <candidate>/__init__.py
     if candidate.name == "analysis_tools" and (candidate / "__init__.py").is_file():
         return candidate.parent
     return None
+
+
+def _component_source_files(candidate: Path) -> tuple[Path, Path] | None:
+    """Return the two lightweight source modules needed by LicketyFit.
+
+    The public ``analysis_tools`` package initializer imports calibration-DB,
+    waveform-processing and geometry helpers in addition to DataLoader/PID.  Some
+    of those unrelated helpers have optional dependencies such as ``requests``.
+    LicketyFit must not require those dependencies merely to read a merged ROOT
+    file, so a component-only fallback loads the actual repository source files
+    directly when the public package import fails.
+    """
+    package_dir: Path | None = None
+    if (candidate / "analysis_tools" / "data_loader.py").is_file():
+        package_dir = candidate / "analysis_tools"
+    elif candidate.name == "analysis_tools" and (candidate / "data_loader.py").is_file():
+        package_dir = candidate
+    if package_dir is None:
+        return None
+    data_loader_file = package_dir / "data_loader.py"
+    beam_selection_file = package_dir / "beam_selection.py"
+    if not (data_loader_file.is_file() and beam_selection_file.is_file()):
+        return None
+    return data_loader_file, beam_selection_file
+
+
+def _load_source_module(source_file: Path, role: str):
+    digest = hashlib.sha256(str(source_file.resolve()).encode("utf-8")).hexdigest()[:16]
+    module_name = f"_licketyfit_analysis_tools_{role}_{digest}"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, source_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create an import specification for {source_file}")
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses and similar runtime inspection require the module to be visible
+    # while its body executes.
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _import_analysis_tools_components(
+    *,
+    explicit_path: str | os.PathLike[str] | None = None,
+    project_root: str | os.PathLike[str] | None = None,
+) -> tuple[type, type, Any, dict[str, Any]]:
+    """Resolve only DataLoader, BeamSelection and the threshold printer.
+
+    Prefer the public package API.  If its broad ``__init__`` fails because an
+    unrelated optional dependency is absent, use the repository's *actual*
+    ``data_loader.py`` and ``beam_selection.py`` modules directly.  This is not a
+    reimplementation of their behavior.
+    """
+    attempts: list[str] = []
+
+    def load_public() -> tuple[type, type, Any, dict[str, Any]]:
+        module = importlib.import_module("analysis_tools")
+        DataLoader = getattr(module, "DataLoader")
+        BeamSelection = getattr(module, "BeamSelection")
+        print_thresholds = getattr(module, "print_cherenkov_thresholds", None)
+        module_file = Path(inspect.getfile(module)).resolve()
+        data_file = Path(inspect.getfile(DataLoader)).resolve()
+        beam_file = Path(inspect.getfile(BeamSelection)).resolve()
+        metadata = {
+            "module": "analysis_tools",
+            "import_mode": "public_package_api",
+            "module_file": str(module_file),
+            "repository_root": str(module_file.parent.parent),
+            "data_loader_file": str(data_file),
+            "beam_selection_file": str(beam_file),
+            "data_loader_sha256": _sha256_file(data_file),
+            "beam_selection_sha256": _sha256_file(beam_file),
+        }
+        return DataLoader, BeamSelection, print_thresholds, metadata
+
+    try:
+        return load_public()
+    except Exception as exc:
+        attempts.append(f"normal public-package import: {exc!r}")
+
+    root_path = Path(project_root).resolve() if project_root is not None else None
+    for candidate in _candidate_import_roots(
+        explicit_path=explicit_path, project_root=root_path
+    ):
+        import_root = _sys_path_root_for_candidate(candidate)
+        if import_root is not None:
+            text = str(import_root)
+            if text not in sys.path:
+                sys.path.insert(0, text)
+            for module_name in tuple(sys.modules):
+                if module_name == "analysis_tools" or module_name.startswith("analysis_tools."):
+                    sys.modules.pop(module_name, None)
+            try:
+                DataLoader, BeamSelection, print_thresholds, metadata = load_public()
+                metadata["resolved_from_candidate"] = str(candidate)
+                metadata["sys_path_root"] = text
+                return DataLoader, BeamSelection, print_thresholds, metadata
+            except Exception as exc:
+                attempts.append(f"{candidate} public-package import: {exc!r}")
+
+        components = _component_source_files(candidate)
+        if components is None:
+            if import_root is None:
+                attempts.append(f"{candidate}: no analysis_tools component sources found")
+            continue
+        data_file, beam_file = components
+        try:
+            data_module = _load_source_module(data_file, "data_loader")
+            beam_module = _load_source_module(beam_file, "beam_selection")
+            DataLoader = getattr(data_module, "DataLoader")
+            BeamSelection = getattr(beam_module, "BeamSelection")
+            print_thresholds = getattr(beam_module, "print_cherenkov_thresholds", None)
+            metadata = {
+                "module": "analysis_tools component sources",
+                "import_mode": "direct_component_files",
+                "repository_root": str(data_file.parent.parent),
+                "resolved_from_candidate": str(candidate),
+                "data_loader_file": str(data_file.resolve()),
+                "beam_selection_file": str(beam_file.resolve()),
+                "data_loader_sha256": _sha256_file(data_file),
+                "beam_selection_sha256": _sha256_file(beam_file),
+                "public_package_import_bypassed": True,
+                "reason": (
+                    "The package initializer imports unrelated optional subsystems; "
+                    "LicketyFit loaded the repository's DataLoader/BeamSelection "
+                    "source modules directly."
+                ),
+            }
+            return DataLoader, BeamSelection, print_thresholds, metadata
+        except Exception as exc:
+            attempts.append(f"{candidate} direct-component import: {exc!r}")
+
+    raise AnalysisToolsImportError(
+        "Could not import the WCTE analysis_tools DataLoader/BeamSelection "
+        "components. Set WCTE_ANALYSIS_TOOLS_PATH to the repository root "
+        "(the directory containing analysis_tools/data_loader.py). Attempts:\n  - "
+        + "\n  - ".join(attempts)
+    )
 
 
 def import_analysis_tools(
@@ -186,67 +416,14 @@ def import_analysis_tools(
     explicit_path: str | os.PathLike[str] | None = None,
     project_root: str | os.PathLike[str] | None = None,
 ) -> tuple[type, type, dict[str, Any]]:
-    """Resolve and import ``DataLoader`` and ``BeamSelection``.
-
-    Normal Python import is attempted first, which makes a future installed or
-    submodule-packaged dependency work without path configuration.  Explicit and
-    conventional checkout paths are then tried in deterministic order.
-    """
-    attempts: list[str] = []
-
-    def load() -> tuple[type, type, dict[str, Any]]:
-        module = importlib.import_module("analysis_tools")
-        DataLoader = getattr(module, "DataLoader")
-        BeamSelection = getattr(module, "BeamSelection")
-        module_file = Path(inspect.getfile(module)).resolve()
-        metadata = {
-            "module": "analysis_tools",
-            "module_file": str(module_file),
-            "repository_root": str(module_file.parent.parent),
-            "data_loader_file": str(Path(inspect.getfile(DataLoader)).resolve()),
-            "beam_selection_file": str(Path(inspect.getfile(BeamSelection)).resolve()),
-            "data_loader_sha256": _sha256_file(Path(inspect.getfile(DataLoader)).resolve()),
-            "beam_selection_sha256": _sha256_file(Path(inspect.getfile(BeamSelection)).resolve()),
-        }
-        return DataLoader, BeamSelection, metadata
-
-    try:
-        return load()
-    except Exception as exc:
-        attempts.append(f"normal import: {exc!r}")
-
-    root_path = Path(project_root).resolve() if project_root is not None else None
-    for candidate in _candidate_import_roots(
-        explicit_path=explicit_path, project_root=root_path
-    ):
-        import_root = _sys_path_root_for_candidate(candidate)
-        if import_root is None:
-            attempts.append(f"{candidate}: no analysis_tools package found")
-            continue
-        text = str(import_root)
-        if text not in sys.path:
-            sys.path.insert(0, text)
-        # An earlier failed import can leave the package or one of its imported
-        # submodules behind. Purge the complete namespace before retrying another
-        # checkout so DataLoader and BeamSelection cannot come from mixed roots.
-        for module_name in tuple(sys.modules):
-            if module_name == "analysis_tools" or module_name.startswith("analysis_tools."):
-                sys.modules.pop(module_name, None)
-        try:
-            DataLoader, BeamSelection, metadata = load()
-            metadata["resolved_from_candidate"] = str(candidate)
-            metadata["sys_path_root"] = text
-            return DataLoader, BeamSelection, metadata
-        except Exception as exc:
-            attempts.append(f"{candidate}: {exc!r}")
-
-    raise AnalysisToolsImportError(
-        "Could not import the WCTE analysis_tools package. Set "
-        "WCTE_ANALYSIS_TOOLS_PATH to the repository root (the directory that "
-        "contains analysis_tools/__init__.py). Attempts:\n  - "
-        + "\n  - ".join(attempts)
+    """Backward-compatible public resolver for DataLoader and BeamSelection."""
+    DataLoader, BeamSelection, _print_thresholds, metadata = (
+        _import_analysis_tools_components(
+            explicit_path=explicit_path,
+            project_root=project_root,
+        )
     )
-
+    return DataLoader, BeamSelection, metadata
 
 def production_root_file(run: int, override: str | None = None) -> str:
     return str(override).strip() if override and str(override).strip() else (
@@ -269,48 +446,218 @@ def _scalar(value: Any, label: str) -> float:
     return float(finite[0])
 
 
-def _selection_thresholds(loader: Any, tof_fallback: float) -> dict[str, float]:
+def _optional_override(value: float | None, label: str) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} override must be finite or None")
+    return number
+
+
+def _selection_thresholds(
+    loader: Any, cfg: WCTESelectionConfig, particle: str
+) -> dict[str, Any]:
+    """Resolve only the run scalars required by the selected nominal PID.
+
+    The production scalar record normally contains every key, but a proton-only
+    or custom analysis must not fail because an unrelated ACT/muon-tagger scalar
+    is absent. User overrides remove the corresponding metadata dependency.
+    """
     values = loader.get_vme_analysis_scalar_results()
-    tof = _scalar(values["proton_tof_cut"], "proton_tof_cut")
-    if tof == 0.0:
-        tof = float(tof_fallback)
+    mode = _canonical_selection_mode(cfg.selection_mode)
+    tof_mode = _canonical_tof_mode(cfg.tof_cut_mode)
+
+    eveto_override = _optional_override(
+        cfg.act_eveto_cut_override_pe, "act_eveto_cut_pe"
+    )
+    tagger_override = _optional_override(
+        cfg.act_tagger_cut_override_pe, "act_tagger_cut_pe"
+    )
+    tof_override = _optional_override(
+        cfg.proton_tof_cut_override_ns, "proton_tof_cut_ns"
+    )
+    mu_override = _optional_override(cfg.muon_tag_cut_override, "mu_tag_cut")
+
+    def read_scalar(key: str, label: str, *, required: bool) -> float | None:
+        try:
+            return _scalar(values[key], label)
+        except Exception:
+            if required:
+                raise RuntimeError(
+                    f"The nominal {particle} selection requires {key!r} in "
+                    "vme_analysis_scalar_results, but it is unavailable and no "
+                    "corresponding override was supplied."
+                )
+            return None
+
+    nominal = mode == "nominal"
+    need_eveto = bool(
+        nominal and cfg.use_act_eveto_cut
+        and particle in {"muon", "pion", "electron"}
+        and eveto_override is None
+    )
+    need_tagger = bool(
+        nominal and cfg.use_act_tagger_cut
+        and particle in {"muon", "pion"}
+        and tagger_override is None
+    )
+    need_mu_tag = bool(
+        nominal and particle == "muon" and cfg.require_muon_tagger
+        and mu_override is None
+    )
+    need_tof = bool(
+        nominal and tof_mode != "disable" and tof_override is None
+        and (particle == "proton" or tof_mode == "require")
+    )
+
+    raw_tof = read_scalar(
+        "proton_tof_cut", "proton_tof_cut", required=need_tof
+    )
+    raw_eveto = read_scalar(
+        "act_eveto_cut", "act_eveto_cut", required=need_eveto
+    )
+    raw_tagger = read_scalar(
+        "act_tagger_cut", "act_tagger_cut", required=need_tagger
+    )
+    raw_mu_tag = read_scalar(
+        "mu_tag_cut", "mu_tag_cut", required=need_mu_tag
+    )
+
+    if tof_mode == "disable":
+        resolved_tof = None
+        tof_source = "disabled"
+    elif tof_override is not None:
+        resolved_tof = float(tof_override)
+        tof_source = "user_override"
+    elif raw_tof is not None and math.isfinite(raw_tof) and raw_tof > 0.0:
+        resolved_tof = float(raw_tof)
+        tof_source = "vme_analysis_scalar_results"
+    elif tof_mode == "require":
+        raise RuntimeError(
+            "WCTE TOF selection was required, but proton_tof_cut is zero/nonpositive "
+            "or unavailable and no WCTE_PROTON_TOF_CUT_OVERRIDE_NS was supplied."
+        )
+    else:
+        # The analysis-tools examples explicitly instruct users to omit the TOF
+        # cut when proton_tof_cut is zero. Do not silently turn 999 ns into a
+        # pseudo-threshold; record the omission explicitly.
+        resolved_tof = None
+        tof_source = "omitted_because_run_scalar_is_zero_or_unavailable"
+
+    def resolve_value(
+        raw: float | None, override: float | None, label: str, required: bool
+    ) -> tuple[float | None, str]:
+        if override is not None:
+            return float(override), "user_override"
+        if raw is not None and math.isfinite(raw):
+            return float(raw), "vme_analysis_scalar_results"
+        if required:
+            raise RuntimeError(f"Required WCTE selection scalar {label!r} is unavailable")
+        return None, "not_required_or_unavailable"
+
+    eveto, eveto_source = resolve_value(
+        raw_eveto, eveto_override, "act_eveto_cut", need_eveto
+    )
+    tagger, tagger_source = resolve_value(
+        raw_tagger, tagger_override, "act_tagger_cut", need_tagger
+    )
+    mu_tag, mu_source = resolve_value(
+        raw_mu_tag, mu_override, "mu_tag_cut", need_mu_tag
+    )
     return {
-        "proton_tof_cut_ns": float(tof),
-        "act_eveto_cut_pe": _scalar(values["act_eveto_cut"], "act_eveto_cut"),
-        "act_tagger_cut_pe": _scalar(values["act_tagger_cut"], "act_tagger_cut"),
-        "mu_tag_cut": _scalar(values["mu_tag_cut"], "mu_tag_cut"),
+        "raw_proton_tof_cut_ns": raw_tof,
+        "raw_act_eveto_cut_pe": raw_eveto,
+        "raw_act_tagger_cut_pe": raw_tagger,
+        "raw_mu_tag_cut": raw_mu_tag,
+        "proton_tof_cut_ns": resolved_tof,
+        "proton_tof_cut_source": tof_source,
+        "act_eveto_cut_pe": eveto,
+        "act_eveto_cut_source": eveto_source,
+        "act_tagger_cut_pe": tagger,
+        "act_tagger_cut_source": tagger_source,
+        "mu_tag_cut": mu_tag,
+        "mu_tag_cut_source": mu_source,
     }
 
 
-def _build_selection(BeamSelection: type, particle: str, cuts: Mapping[str, float], *, require_muon_tagger: bool):
-    tof = float(cuts["proton_tof_cut_ns"])
-    eveto = float(cuts["act_eveto_cut_pe"])
-    tagger = float(cuts["act_tagger_cut_pe"])
-    mu_tag = float(cuts["mu_tag_cut"])
+def _selection_specs(
+    particle: str, cuts: Mapping[str, Any], cfg: WCTESelectionConfig
+) -> list[list[Any]]:
+    mode = _canonical_selection_mode(cfg.selection_mode)
+    extra = [_normalise_cut_spec(spec) for spec in cfg.extra_selection_cuts]
+    if mode == "custom":
+        if not extra:
+            raise ValueError(
+                "WCTE selection_mode='custom' requires at least one item in "
+                "WCTE_EXTRA_SELECTION_CUTS."
+            )
+        return extra
+
+    if particle not in _NOMINAL_PARTICLES:
+        raise ValueError(
+            f"analysis_tools defines no nominal {particle!r} BeamSelection in the "
+            "supplied examples. Use WCTE_SELECTION_MODE='custom' and provide "
+            "WCTE_EXTRA_SELECTION_CUTS explicitly."
+        )
+    if cfg.require_muon_tagger and particle != "muon":
+        raise ValueError(
+            "WCTE_REQUIRE_MUON_TAGGER is only part of the nominal muon selection. "
+            "For another particle, express the desired cut explicitly in "
+            "WCTE_EXTRA_SELECTION_CUTS."
+        )
+
+    eveto = cuts.get("act_eveto_cut_pe")
+    tagger = cuts.get("act_tagger_cut_pe")
+    tof = cuts.get("proton_tof_cut_ns")
+    mu_tag = cuts.get("mu_tag_cut")
+    specs: list[list[Any]] = []
+
     if particle == "muon":
-        specs: list[list[Any]] = [
-            ["vme_act_eveto", "<", eveto],
-            ["vme_act_tagger", ">", tagger],
-            ["vme_tof_corr", "<", tof],
-        ]
-        if require_muon_tagger:
-            specs.append(["vme_mu_tag_total", ">", mu_tag])
+        if cfg.use_act_eveto_cut:
+            specs.append(["vme_act_eveto", "<", float(eveto)])
+        if cfg.use_act_tagger_cut:
+            specs.append(["vme_act_tagger", ">", float(tagger)])
+        if tof is not None:
+            specs.append(["vme_tof_corr", "<", float(tof)])
+        if cfg.require_muon_tagger:
+            specs.append(["vme_mu_tag_total", ">", float(mu_tag)])
     elif particle == "pion":
-        specs = [
-            ["vme_act_eveto", "<", eveto],
-            ["vme_act_tagger", "<", tagger],
-            ["vme_tof_corr", "<", tof],
-        ]
+        if cfg.use_act_eveto_cut:
+            specs.append(["vme_act_eveto", "<", float(eveto)])
+        if cfg.use_act_tagger_cut:
+            specs.append(["vme_act_tagger", "<", float(tagger)])
+        if tof is not None:
+            specs.append(["vme_tof_corr", "<", float(tof)])
     elif particle == "electron":
-        specs = [
-            ["vme_act_eveto", ">", eveto],
-            ["vme_tof_corr", "<", tof],
-        ]
+        if cfg.use_act_eveto_cut:
+            specs.append(["vme_act_eveto", ">", float(eveto)])
+        # The nominal example does not use act_tagger for electrons.
+        if tof is not None:
+            specs.append(["vme_tof_corr", "<", float(tof)])
     elif particle == "proton":
-        specs = [["vme_tof_corr", "between", [tof, tof + 10.0]]]
-    else:  # pragma: no cover - guarded by canonicalization
-        raise AssertionError(particle)
-    return BeamSelection.selection(particle, *specs)
+        if tof is None:
+            raise RuntimeError(
+                "The nominal proton selection requires a positive proton_tof_cut. "
+                "This run reports no TOF separation. Supply "
+                "WCTE_PROTON_TOF_CUT_OVERRIDE_NS, or use a custom selection."
+            )
+        window = float(cfg.proton_tof_window_ns)
+        if not math.isfinite(window) or window <= 0.0:
+            raise ValueError("WCTE_PROTON_TOF_WINDOW_NS must be positive")
+        specs.append(["vme_tof_corr", "between", [float(tof), float(tof) + window]])
+
+    specs.extend(extra)
+    if not specs:
+        raise ValueError(
+            f"The nominal {particle} selection contains no enabled cuts. Enable a "
+            "nominal cut or provide WCTE_EXTRA_SELECTION_CUTS."
+        )
+    return [_normalise_cut_spec(spec) for spec in specs]
+
+
+def _build_selection(BeamSelection: type, particle: str, specs: Sequence[Sequence[Any]]):
+    return BeamSelection.selection(particle, *[list(spec) for spec in specs])
 
 
 def _configure_dq(loader: Any, cfg: WCTESelectionConfig) -> None:
@@ -322,27 +669,26 @@ def _configure_dq(loader: Any, cfg: WCTESelectionConfig) -> None:
         loader.apply_t5_event_quality_cuts()
 
 
+def _available_branches(DataLoader: type, root_file: str) -> set[str]:
+    probe = DataLoader(root_file, branches_to_load=[])
+    try:
+        return set(str(x) for x in probe.file["WCTEReadoutWindows"].keys())
+    finally:
+        probe.file.close()
+
+
 def _loader_with_branches(
     DataLoader: type,
     cfg: WCTESelectionConfig,
     *,
+    selection_specs: Sequence[Sequence[Any]],
     require_t5_time: bool,
 ) -> tuple[Any, list[str], set[str]]:
-    probe = DataLoader(cfg.root_file, branches_to_load=[])
-    try:
-        available = set(str(x) for x in probe.file["WCTEReadoutWindows"].keys())
-    finally:
-        probe.file.close()
-
-    required = list(_BASE_REQUIRED_BRANCHES)
-    if cfg.require_muon_tagger:
-        required.append("vme_mu_tag_total")
+    available = _available_branches(DataLoader, cfg.root_file)
+    required = list(_BASE_HIT_BRANCHES)
+    required.extend(_selection_branch_name(str(spec[0])) for spec in selection_specs)
     if require_t5_time:
         required.append("T5_hit_time")
-    # DataLoader intentionally adds these masks only when they exist.  When a
-    # corresponding DQ operation is requested, however, absence is a hard input
-    # error rather than something that should fail later with an opaque KeyError
-    # inside DataLoader._apply_all_data_quality_cuts().
     if cfg.apply_mpmt_data_quality_cuts:
         required.extend(_MPMT_DQ_BRANCHES)
     if cfg.apply_vme_event_quality_cuts:
@@ -357,7 +703,6 @@ def _loader_with_branches(
             f"WCTE production file {cfg.root_file!r} is missing required branches: "
             + ", ".join(missing)
         )
-
     branches = required + [name for name in _OPTIONAL_ID_BRANCHES if name in available]
     loader = DataLoader(cfg.root_file, branches_to_load=list(dict.fromkeys(branches)))
     _configure_dq(loader, cfg)
@@ -402,28 +747,14 @@ def _iterate_selected(
     selection: Any,
     cfg: WCTESelectionConfig,
 ) -> Iterable[tuple[Any, np.ndarray]]:
-    """Yield selected batches together with original ROOT entry indices.
-
-    ``DataLoader.iterate`` intentionally returns only the post-DQ awkward
-    batch.  The analysis-tools LicketyFit example therefore attaches the raw
-    ``WCTEReadoutWindows`` entry index before calling DataLoader's common DQ
-    implementation.  We follow that example here so event identity survives
-    event-level DQ cuts exactly rather than being replaced by a selected-list
-    counter.
-
-    The private method is used narrowly and guarded explicitly because the
-    current analysis-tools public iterator does not expose uproot reports or
-    raw entry indices.  A future public indexed iterator can replace this
-    block without changing the adapter output contract.
-    """
+    """Yield selected batches together with original ROOT entry indices."""
     try:
         import awkward as ak
-    except Exception as exc:  # pragma: no cover - real ROOT operation requires ak
+    except Exception as exc:
         raise RuntimeError(
             "Indexed WCTE DataLoader iteration requires awkward, which is also "
             "a dependency of analysis_tools.DataLoader."
         ) from exc
-
     apply_dq = getattr(loader, "_apply_all_data_quality_cuts", None)
     if not callable(apply_dq):
         raise RuntimeError(
@@ -448,9 +779,7 @@ def _iterate_selected(
         if raw_length == 0:
             continue
         raw_indices = np.arange(
-            raw_entry_cursor,
-            raw_entry_cursor + raw_length,
-            dtype=np.int64,
+            raw_entry_cursor, raw_entry_cursor + raw_length, dtype=np.int64
         )
         raw_entry_cursor += raw_length
         indexed = ak.with_field(raw_batch, raw_indices, _ROOT_ENTRY_FIELD)
@@ -465,29 +794,24 @@ def _iterate_selected(
         ).ravel()
         if indices.size != len(selected):
             raise RuntimeError(
-                "DataLoader selection returned a ROOT-index array with the "
-                "wrong length."
+                "DataLoader selection returned a ROOT-index array with the wrong length."
             )
         yield selected, indices
 
 
 def _estimate_optional_peaks(
     DataLoader: type,
-    BeamSelection: type,
     cfg: WCTESelectionConfig,
-    cuts: Mapping[str, float],
+    selection: Any,
+    selection_specs: Sequence[Sequence[Any]],
 ) -> tuple[float | None, float | None, dict[str, int]]:
     if not (cfg.use_t5_hit_time_cut or cfg.use_calibrated_peak_time_cut):
         return None, None, {"events": 0, "hits": 0}
-
     loader, _, _ = _loader_with_branches(
-        DataLoader, cfg, require_t5_time=cfg.use_t5_hit_time_cut
-    )
-    selection = _build_selection(
-        BeamSelection,
-        cfg.particle,
-        cuts,
-        require_muon_tagger=cfg.require_muon_tagger,
+        DataLoader,
+        cfg,
+        selection_specs=selection_specs,
+        require_t5_time=cfg.use_t5_hit_time_cut,
     )
     t5_chunks: list[np.ndarray] = []
     calibrated_chunks: list[np.ndarray] = []
@@ -538,7 +862,6 @@ def _estimate_optional_peaks(
         low=cfg.calibrated_peak_time_min_ns,
         high=cfg.calibrated_peak_time_max_ns,
     ) if cfg.use_calibrated_peak_time_cut else None
-
     if cfg.use_t5_hit_time_cut and t5_peak is None:
         raise RuntimeError(
             "Could not estimate the selected-event PMT-minus-T5 timing peak "
@@ -571,7 +894,6 @@ def _record_to_event(
             f"slot={slots.size}, position={positions.size}, charge={charges.size}, "
             f"time={times.size}."
         )
-
     keep = (
         np.isfinite(charges)
         & np.isfinite(times)
@@ -613,6 +935,20 @@ def _record_to_event(
     ))
 
 
+def _try_run_info(loader: Any) -> tuple[Any | None, dict[str, float] | None]:
+    try:
+        record = loader.get_vme_analysis_run_info()
+        fields = set(getattr(record, "fields", ()))
+        metadata = {
+            key: _scalar(record[key], key)
+            for key in ("run_momentum", "n_eveto", "n_tagger")
+            if key in fields
+        }
+        return record, metadata
+    except Exception:
+        return None, None
+
+
 def load_selected_events(
     config: WCTESelectionConfig,
     *,
@@ -621,45 +957,64 @@ def load_selected_events(
 ) -> list[np.ndarray] | tuple[list[np.ndarray], dict[str, Any]]:
     """Load beam-selected real-WCTE events through ``analysis_tools``."""
     particle = _canonical_particle(config.particle)
-    cfg = WCTESelectionConfig(**{**asdict(config), "particle": particle})
-    DataLoader, BeamSelection, import_metadata = import_analysis_tools(
-        explicit_path=cfg.analysis_tools_path,
-        project_root=project_root,
+    mode = _canonical_selection_mode(config.selection_mode)
+    tof_mode = _canonical_tof_mode(config.tof_cut_mode)
+    normalised_extra = tuple(
+        tuple(_normalise_cut_spec(spec)) for spec in config.extra_selection_cuts
+    )
+    cfg = WCTESelectionConfig(**{
+        **asdict(config),
+        "particle": particle,
+        "selection_mode": mode,
+        "tof_cut_mode": tof_mode,
+        "extra_selection_cuts": normalised_extra,
+    })
+    DataLoader, BeamSelection, print_thresholds, import_metadata = (
+        _import_analysis_tools_components(
+            explicit_path=cfg.analysis_tools_path,
+            project_root=project_root,
+        )
     )
 
-    # Read run-derived PID thresholds once through DataLoader.
-    threshold_loader, branches, available = _loader_with_branches(
-        DataLoader, cfg, require_t5_time=cfg.use_t5_hit_time_cut
-    )
+    threshold_loader = DataLoader(cfg.root_file, branches_to_load=[])
     try:
-        cuts = _selection_thresholds(
-            threshold_loader, cfg.tof_fallback_when_zero_ns
-        )
-        run_info = None
-        try:
-            info = threshold_loader.get_vme_analysis_run_info()
-            run_info = {
-                key: _scalar(info[key], key)
-                for key in ("run_momentum", "n_eveto", "n_tagger")
-                if key in info.fields
-            }
-        except Exception:
-            run_info = None
+        if mode == "nominal":
+            cuts = _selection_thresholds(threshold_loader, cfg, particle)
+        else:
+            # Custom selection has no hidden dependency on the scalar-results
+            # tree. Retain optional scalar metadata when available.
+            try:
+                cuts = _selection_thresholds(threshold_loader, cfg, particle)
+            except Exception as exc:
+                cuts = {"custom_selection_scalar_metadata_error": repr(exc)}
+        run_info_record, run_info = _try_run_info(threshold_loader)
     finally:
         threshold_loader.file.close()
 
-    t5_peak, calibrated_peak, peak_stats = _estimate_optional_peaks(
-        DataLoader, BeamSelection, cfg, cuts
-    )
+    specs = _selection_specs(particle, cuts, cfg)
+    selection = _build_selection(BeamSelection, particle, specs)
 
-    loader, branches, _ = _loader_with_branches(
-        DataLoader, cfg, require_t5_time=cfg.use_t5_hit_time_cut
+    if cfg.verbose and cfg.print_cherenkov_thresholds and run_info_record is not None:
+        try:
+            if print_thresholds is None:
+                raise RuntimeError("analysis_tools beam_selection module has no threshold printer")
+            print("WCTE ACT Cherenkov-threshold diagnostic")
+            print_thresholds(run_info_record)
+            print("")
+        except Exception as exc:
+            print(f"WARNING: could not print ACT Cherenkov thresholds: {exc!r}")
+    if cfg.verbose and cfg.print_selection_description:
+        selection.describe()
+        print("")
+
+    t5_peak, calibrated_peak, peak_stats = _estimate_optional_peaks(
+        DataLoader, cfg, selection, specs
     )
-    selection = _build_selection(
-        BeamSelection,
-        particle,
-        cuts,
-        require_muon_tagger=cfg.require_muon_tagger,
+    loader, branches, available = _loader_with_branches(
+        DataLoader,
+        cfg,
+        selection_specs=specs,
+        require_t5_time=cfg.use_t5_hit_time_cut,
     )
     events: list[np.ndarray] = []
     selected_before_hit_cut = 0
@@ -701,6 +1056,9 @@ def load_selected_events(
         "config": asdict(cfg),
         "root_file": cfg.root_file,
         "particle": particle,
+        "selection_mode": mode,
+        "selection_cut_specs": [list(spec) for spec in specs],
+        "selection_cut_branches": [_selection_branch_name(spec[0]) for spec in specs],
         "branches_requested": branches,
         "available_branch_count": int(len(available)),
         "selection_thresholds": dict(cuts),
@@ -730,7 +1088,8 @@ def load_selected_events(
     if cfg.verbose:
         print("WCTE analysis_tools DataLoader selection")
         print("  ROOT file:", cfg.root_file)
-        print("  particle:", particle)
+        print("  particle label:", particle)
+        print("  selection mode:", mode)
         print("  raw entry limit:", cfg.max_root_entries)
         print("  selected-event cap:", cfg.max_selected_events)
         print("  DQ cuts (mPMT/VME/T5):", (
@@ -738,7 +1097,7 @@ def load_selected_events(
             cfg.apply_vme_event_quality_cuts,
             cfg.apply_t5_event_quality_cuts,
         ))
-        print("  run-derived cuts:", cuts)
+        print("  applied PID cuts:", specs)
         print("  PMT-minus-T5 peak [ns]:", t5_peak)
         print("  calibrated-time peak [ns]:", calibrated_peak)
         print("  selected / returned / empty:", (
