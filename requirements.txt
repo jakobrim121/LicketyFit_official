@@ -1,0 +1,8 @@
+numpy
+numba
+scipy
+uproot
+awkward
+matplotlib
+pandas
+iminuit

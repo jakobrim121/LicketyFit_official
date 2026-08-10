@@ -24,10 +24,7 @@ import sys
 FIT_MODE = "cosmic"
 
 # Digitized WCSim NPZ input.
-INPUT_FILE = (
-    "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/"
-    "100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.npz"
-)
+INPUT_FILE = ""  # Required: set this to your WCSim NPZ file.
 
 # Number of events to fit and the first input event index.
 N_EVENTS = 100
@@ -48,11 +45,14 @@ OUTPUT_FILE = ""
 
 # --- 2. Detector geometry and seed label -------------------------------------
 
-# Select exactly one bundled detector mode.
+# Select exactly one detector mode.
 USE_WCTE_GEOMETRY = True
 USE_IWCD_GEOMETRY = False
 
-# Optional explicit .geo file. Blank uses the bundled geometry selected above.
+# WCTE: blank uses Geometry/examples/wcte_bldg157.geo from the pinned Geometry
+# submodule. IWCD: an explicit, independently validated .geo file is currently
+# required; the upstream Geometry repository does not ship a serialized IWCD
+# geometry and LicketyFit does not silently generate one.
 GEOMETRY_FILE = ""
 
 # Metadata and optional seed guidance only. It is not truth and does not
@@ -64,10 +64,7 @@ ENERGY_LABEL_MEV = 300.0
 
 # Truth is diagnostic only and never enters the likelihood.
 USE_TRUTH_ROOT = False
-TRUTH_ROOT_FILE = (
-    "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/"
-    "100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.root"
-)
+TRUTH_ROOT_FILE = ""  # Required only when USE_TRUTH_ROOT = True.
 TRUTH_TREE = "AllSecondaries"
 TRUTH_EVENT_ID_OFFSET = 0
 
@@ -126,6 +123,8 @@ EXTRA_DRIVER_ENV = {}
 
 
 _DRIVER = Path(__file__).resolve().with_name("batch_fit_driver.py")
+_PROJECT_ROOT = _DRIVER.parent.parent
+_GEOMETRY_SUBMODULE = _PROJECT_ROOT / "Geometry"
 _FIT_MODES = {"full_length", "absorption", "cosmic"}
 _FIT_PARTICLES = {"muon", "pion", "kaon", "proton"}
 _LIKELIHOODS = {"charge_only", "charge_time", "timing_only"}
@@ -135,6 +134,20 @@ def _require_file(value: str, label: str) -> None:
     path = Path(str(value)).expanduser()
     if not path.is_file():
         raise ValueError(f"{label} does not exist or is not a file: {path}")
+
+
+def _require_geometry_submodule() -> None:
+    required = (
+        _GEOMETRY_SUBMODULE / "Geometry" / "Device.py",
+        _GEOMETRY_SUBMODULE / "Geometry" / "WCD.py",
+        _GEOMETRY_SUBMODULE / "examples" / "wcte_bldg157.geo",
+    )
+    if not all(path.is_file() for path in required):
+        raise ValueError(
+            "The Geometry submodule is missing or uninitialized at "
+            f"{_GEOMETRY_SUBMODULE}. From LicketyFit_official run: "
+            "git submodule update --init Geometry"
+        )
 
 
 def _validate(*, check_paths: bool) -> None:
@@ -148,6 +161,11 @@ def _validate(*, check_paths: bool) -> None:
         raise ValueError("N_EVENTS and NPROC must be positive; EVENT_START_INDEX must be nonnegative")
     if bool(USE_WCTE_GEOMETRY) == bool(USE_IWCD_GEOMETRY):
         raise ValueError("Select exactly one of USE_WCTE_GEOMETRY and USE_IWCD_GEOMETRY")
+    if USE_IWCD_GEOMETRY and not str(GEOMETRY_FILE).strip():
+        raise ValueError(
+            "USE_IWCD_GEOMETRY=True requires an explicit GEOMETRY_FILE. The "
+            "Geometry submodule does not contain a validated serialized IWCD .geo file."
+        )
     if (PROMPT_TIME_MIN_NS is None) != (PROMPT_TIME_MAX_NS is None):
         raise ValueError("Set both PROMPT_TIME_MIN_NS and PROMPT_TIME_MAX_NS, or neither")
     if PROMPT_TIME_MIN_NS is not None and float(PROMPT_TIME_MAX_NS) <= float(PROMPT_TIME_MIN_NS):
@@ -157,7 +175,17 @@ def _validate(*, check_paths: bool) -> None:
     if INACTIVE_SLOTS is not None:
         for value in INACTIVE_SLOTS:
             int(value)
+    if "GEOMETRY_PATH" in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV["GEOMETRY_PATH"]).strip():
+        raise ValueError(
+            "GEOMETRY_PATH overrides are no longer supported; remove "
+            "GEOMETRY_PATH from EXTRA_DRIVER_ENV and use the Geometry submodule"
+        )
     if check_paths:
+        _require_geometry_submodule()
+        if not str(INPUT_FILE).strip():
+            raise ValueError("Set INPUT_FILE to the WCSim NPZ file you want to fit")
+        if USE_TRUTH_ROOT and not str(TRUTH_ROOT_FILE).strip():
+            raise ValueError("USE_TRUTH_ROOT=True requires TRUTH_ROOT_FILE")
         _require_file(INPUT_FILE, "INPUT_FILE")
         if USE_TRUTH_ROOT:
             _require_file(TRUTH_ROOT_FILE, "TRUTH_ROOT_FILE")
@@ -177,6 +205,11 @@ def _encode(value):
 
 
 def _configuration_items() -> list[tuple[str, object]]:
+    if "GEOMETRY_PATH" in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV["GEOMETRY_PATH"]).strip():
+        raise ValueError(
+            "GEOMETRY_PATH overrides are no longer supported; remove "
+            "GEOMETRY_PATH from EXTRA_DRIVER_ENV"
+        )
     geometry_file = str(GEOMETRY_FILE).strip() or None
     mapping_file = str(WCSIM_WCTE_MAPPING_FILE).strip() or None
     output_file = str(OUTPUT_FILE).strip() or None
@@ -192,6 +225,8 @@ def _configuration_items() -> list[tuple[str, object]]:
         ("LF_OUTPUT_FILE", output_file),
         ("LF_WCTE", USE_WCTE_GEOMETRY), ("LF_IWCD", USE_IWCD_GEOMETRY),
         ("WCD_GEOMETRY_FILE", geometry_file), ("WCTE_GEOMETRY_FILE", geometry_file),
+        ("GEOMETRY_PATH", None),
+        ("LF_GEOMETRY_POLICY", "required_repository_submodule"),
         ("ENERGY_TRUE", ENERGY_LABEL_MEV),
         ("WCSIM_USE_TRUTH_ROOT", USE_TRUTH_ROOT),
         ("WCSIM_TRUTH_ROOT_FILE", TRUTH_ROOT_FILE),
@@ -249,6 +284,7 @@ def build_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 def _print_configuration() -> None:
     print(f"Launcher: {Path(__file__).resolve()}")
     print(f"Driver:   {_DRIVER}")
+    print(f"Geometry submodule: {_GEOMETRY_SUBMODULE}")
     for name, value in _configuration_items():
         shown = "<unset>" if value is None else _encode(value)
         print(f"{name}={shown}")

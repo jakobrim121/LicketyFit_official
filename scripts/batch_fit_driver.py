@@ -43,7 +43,7 @@ import signal
 import sys
 import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.21-separate-run-configs"
+UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.23-portable-runtime-submodules"
 
 # =============================================================================
 # BACKWARD-COMPATIBILITY FALLBACK DEFAULTS
@@ -63,7 +63,7 @@ DEFAULT_NPROC = 16
 DEFAULT_OUTPUT_FILE = ""       # blank = engine-generated name
 
 # WCSim settings.
-DEFAULT_WCSIM_INPUT_FILE = "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.npz"
+DEFAULT_WCSIM_INPUT_FILE = ""  # required when the driver is executed directly
 DEFAULT_WCSIM_N_EVENTS = 100
 DEFAULT_WCSIM_LIKELIHOOD_MODE = "charge_time"
 DEFAULT_WCSIM_ENERGY_LABEL_MEV = 300.0  # label only; full_length/cosmic mandatory seeds are energy-independent
@@ -75,7 +75,7 @@ DEFAULT_USE_IWCD_GEOMETRY = False
 # ROOT file must contain an AllSecondaries-style per-step tree from the same
 # WCSim run as the fitted NPZ.
 DEFAULT_WCSIM_USE_TRUTH_ROOT = False
-DEFAULT_WCSIM_TRUTH_ROOT_FILE = "/eos/home-j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/100mu-_700MeV_x0y2924z-2500_cx0cy-0.707cz0.707.root"
+DEFAULT_WCSIM_TRUTH_ROOT_FILE = ""  # required only when truth diagnostics are enabled
 DEFAULT_WCSIM_TRUTH_TREE = "AllSecondaries"
 DEFAULT_WCSIM_TRUTH_EVENT_ID_OFFSET = 0
 # None / "auto" uses (0, WCTE geometry y-centre, 0) for WCTE because WCSim
@@ -154,11 +154,6 @@ DEFAULT_WCTE_GLOBAL_CHARGE_SCALE = None
 DEFAULT_WCTE_PARTICLE_SELECTION_LABEL = "muon"
 DEFAULT_WCTE_SELECTION_MODE = "nominal"  # "nominal" or "custom"
 DEFAULT_WCTE_SELECTION_STEP_SIZE = "100 MB"
-# External checkout today; a local installed package or repository submodule is
-# detected automatically. This path remains only the final compatibility fallback.
-DEFAULT_WCTE_ANALYSIS_TOOLS_PATH = (
-    "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/analysis_tools"
-)
 # DataLoader event/hit quality stages.
 DEFAULT_WCTE_APPLY_MPMT_DQ = True
 DEFAULT_WCTE_APPLY_VME_DQ = True
@@ -450,13 +445,37 @@ def _apply_unified_defaults() -> tuple[str, str]:
             "Set WCSIM_USE_TRUTH_ROOT=0 for real data."
         )
 
-    # Prefer the geometry repository bundled beside LicketyFit_official.  This
-    # makes the frozen package self-contained while still allowing an explicit
-    # GEOMETRY_PATH environment override for another detector repository.
-    package_root = Path(__file__).resolve().parents[2]
-    bundled_geometry = package_root / "geometry_repository"
-    if bundled_geometry.is_dir():
-        _setdefault_text("GEOMETRY_PATH", str(bundled_geometry))
+    # Geometry's Python implementation is a pinned, direct dependency of this
+    # repository.  Resolve it only from the top-level Geometry submodule so a
+    # profile-local checkout or a globally installed package cannot silently
+    # change detector coordinates.  An explicit WCD_GEOMETRY_FILE may still
+    # select a different serialized detector, but it is opened with the pinned
+    # Geometry implementation.
+    project_root = Path(__file__).resolve().parents[1]
+    geometry_submodule = project_root / "Geometry"
+    requested_geometry_path = os.environ.get("GEOMETRY_PATH", "").strip()
+    if requested_geometry_path:
+        requested = Path(requested_geometry_path).expanduser().resolve()
+        expected = geometry_submodule.resolve()
+        if requested != expected:
+            raise ValueError(
+                "External GEOMETRY_PATH overrides are no longer supported. "
+                "Initialize the pinned submodule at LicketyFit_official/Geometry "
+                "with: git submodule update --init Geometry"
+            )
+    required_geometry_sources = (
+        geometry_submodule / "Geometry" / "Device.py",
+        geometry_submodule / "Geometry" / "WCD.py",
+        geometry_submodule / "examples" / "wcte_bldg157.geo",
+    )
+    if not all(path.is_file() for path in required_geometry_sources):
+        raise ValueError(
+            "The Geometry submodule is missing or uninitialized at "
+            f"{geometry_submodule}. From LicketyFit_official run: "
+            "git submodule update --init Geometry"
+        )
+    os.environ["GEOMETRY_PATH"] = str(geometry_submodule)
+    os.environ["LF_GEOMETRY_POLICY"] = "required_repository_submodule"
 
     _setdefault_text("FIT_PARTICLE", DEFAULT_FIT_PARTICLE)
     _setdefault_text("NPROC", int(DEFAULT_NPROC))
@@ -521,7 +540,34 @@ def _apply_unified_defaults() -> tuple[str, str]:
             )
         if str(DEFAULT_WCSIM_INPUT_FILE).strip():
             _setdefault_text("WCSIM_INPUT_FILE", str(DEFAULT_WCSIM_INPUT_FILE).strip())
+        if not os.environ.get("WCSIM_INPUT_FILE", "").strip():
+            raise ValueError(
+                "WCSim input is required. Set INPUT_FILE in scripts/run_wcsim.py "
+                "or set WCSIM_INPUT_FILE when executing the driver directly."
+            )
+        if (
+            _truthy_text(os.environ.get("WCSIM_USE_TRUTH_ROOT", "0"))
+            and not os.environ.get("WCSIM_TRUTH_ROOT_FILE", "").strip()
+        ):
+            raise ValueError(
+                "WCSIM_USE_TRUTH_ROOT=1 requires WCSIM_TRUTH_ROOT_FILE."
+            )
     else:
+        forbidden_analysis_tools_paths = {
+            name: os.environ.get(name, "").strip()
+            for name in ("WCTE_ANALYSIS_TOOLS_PATH", "ANALYSIS_TOOLS_PATH")
+            if os.environ.get(name, "").strip()
+        }
+        if forbidden_analysis_tools_paths:
+            names = ", ".join(sorted(forbidden_analysis_tools_paths))
+            raise ValueError(
+                f"External analysis_tools path override(s) {names} are no longer "
+                "supported. Initialize LicketyFit_official/analysis_tools as the "
+                "repository submodule."
+            )
+        os.environ.pop("WCTE_ANALYSIS_TOOLS_PATH", None)
+        os.environ.pop("ANALYSIS_TOOLS_PATH", None)
+        os.environ["LF_ANALYSIS_TOOLS_POLICY"] = "required_repository_submodule"
         _setdefault_text("RUN", int(DEFAULT_WCTE_RUN))
         _setdefault_text("N_EVENTS", int(DEFAULT_WCTE_N_ROOT_ENTRIES))
         _setdefault_text("N_ROOT_ENTRIES", int(DEFAULT_WCTE_N_ROOT_ENTRIES))
@@ -559,7 +605,6 @@ def _apply_unified_defaults() -> tuple[str, str]:
         _setdefault_text("PARTICLE_SELECTION_LABEL", DEFAULT_WCTE_PARTICLE_SELECTION_LABEL)
         _setdefault_text("WCTE_SELECTION_MODE", DEFAULT_WCTE_SELECTION_MODE)
         _setdefault_text("SELECTION_STEP_SIZE", DEFAULT_WCTE_SELECTION_STEP_SIZE)
-        _setdefault_text("WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH)
         if str(DEFAULT_WCTE_ROOT_FILE).strip():
             _setdefault_text("CONFIG_ROOT_FILE", str(DEFAULT_WCTE_ROOT_FILE).strip())
         _setdefault_text(
@@ -1980,7 +2025,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     FIT_MODE_REQUEST = os.environ.get("FIT_MODE", "full_length").strip().lower().replace("-", "_")
     LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_time").strip().lower().replace("-", "_")
 
-    # Common local-checkout layout and CERN-compatible defaults.
+    # Common repository-relative layout.
     SCRIPT_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = SCRIPT_DIR.parent
     LICKETYFIT_DIR = PROJECT_ROOT / "LicketyFit"
@@ -1988,22 +2033,27 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         os.environ.get("TABLE_DIR", os.environ.get("LF_TABLE_DIR", PROJECT_ROOT / "tables"))
     ).expanduser()
     GEOMETRY_PATH = Path(
-        os.environ.get("GEOMETRY_PATH", "/eos/user/j/jrimmer/Geometry")
+        os.environ.get("GEOMETRY_PATH", str(PROJECT_ROOT / "Geometry"))
     ).expanduser()
     DEFAULT_GEOMETRY_FILE = (
-        GEOMETRY_PATH / "examples" / "wcte_bldg157.geo"
-        if WCTE else PROJECT_ROOT / "iwcd.geo"
+        GEOMETRY_PATH / "examples" / "wcte_bldg157.geo" if WCTE else None
     )
-    GEOMETRY_FILE = Path(
+    _geometry_file_text = os.environ.get(
+        "WCD_GEOMETRY_FILE",
         os.environ.get(
-            "WCD_GEOMETRY_FILE",
-            os.environ.get("WCTE_GEOMETRY_FILE", str(DEFAULT_GEOMETRY_FILE)),
+            "WCTE_GEOMETRY_FILE",
+            "" if DEFAULT_GEOMETRY_FILE is None else str(DEFAULT_GEOMETRY_FILE),
+        ),
+    ).strip()
+    if not _geometry_file_text:
+        raise ValueError(
+            "IWCD mode requires an explicit WCD_GEOMETRY_FILE/GEOMETRY_FILE. "
+            "The Geometry submodule supplies the Python geometry implementation "
+            "but does not contain a validated serialized IWCD .geo file."
         )
-    ).expanduser()
+    GEOMETRY_FILE = Path(_geometry_file_text).expanduser()
     DEFAULT_WCSIM_INPUT_FILE = os.environ.get(
-        "DEFAULT_WCSIM_INPUT_FILE",
-        "/eos/user/j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/with_ex_situ/"
-        "100mu-_300MeV_bp_exsitu.npz",
+        "DEFAULT_WCSIM_INPUT_FILE", ""
     ).strip()
     INPUT_FILE = os.environ.get("WCSIM_INPUT_FILE", DEFAULT_WCSIM_INPUT_FILE).strip()
     OUTPUT_FILE_OVERRIDE = os.environ.get("LF_OUTPUT_FILE", "").strip()
@@ -6145,7 +6195,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     }
     LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_time").strip().lower().replace("-", "_")
 
-    # Common local-checkout layout and CERN-compatible defaults.
+    # Common repository-relative layout.
     SCRIPT_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = SCRIPT_DIR.parent
     LICKETYFIT_DIR = PROJECT_ROOT / "LicketyFit"
@@ -6153,22 +6203,27 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         os.environ.get("TABLE_DIR", os.environ.get("LF_TABLE_DIR", PROJECT_ROOT / "tables"))
     ).expanduser()
     GEOMETRY_PATH = Path(
-        os.environ.get("GEOMETRY_PATH", "/eos/user/j/jrimmer/Geometry")
+        os.environ.get("GEOMETRY_PATH", str(PROJECT_ROOT / "Geometry"))
     ).expanduser()
     DEFAULT_GEOMETRY_FILE = (
-        GEOMETRY_PATH / "examples" / "wcte_bldg157.geo"
-        if WCTE else PROJECT_ROOT / "iwcd.geo"
+        GEOMETRY_PATH / "examples" / "wcte_bldg157.geo" if WCTE else None
     )
-    GEOMETRY_FILE = Path(
+    _geometry_file_text = os.environ.get(
+        "WCD_GEOMETRY_FILE",
         os.environ.get(
-            "WCD_GEOMETRY_FILE",
-            os.environ.get("WCTE_GEOMETRY_FILE", str(DEFAULT_GEOMETRY_FILE)),
+            "WCTE_GEOMETRY_FILE",
+            "" if DEFAULT_GEOMETRY_FILE is None else str(DEFAULT_GEOMETRY_FILE),
+        ),
+    ).strip()
+    if not _geometry_file_text:
+        raise ValueError(
+            "IWCD mode requires an explicit WCD_GEOMETRY_FILE/GEOMETRY_FILE. "
+            "The Geometry submodule supplies the Python geometry implementation "
+            "but does not contain a validated serialized IWCD .geo file."
         )
-    ).expanduser()
+    GEOMETRY_FILE = Path(_geometry_file_text).expanduser()
     DEFAULT_WCSIM_INPUT_FILE = os.environ.get(
-        "DEFAULT_WCSIM_INPUT_FILE",
-        "/eos/user/j/jrimmer/sim_work_dir/WCSim/sim_data/mu-/with_ex_situ/"
-        "100mu-_300MeV_bp_exsitu.npz",
+        "DEFAULT_WCSIM_INPUT_FILE", ""
     ).strip()
     INPUT_FILE = os.environ.get("WCSIM_INPUT_FILE", DEFAULT_WCSIM_INPUT_FILE).strip()
     OUTPUT_FILE_OVERRIDE = os.environ.get("LF_OUTPUT_FILE", "").strip()
@@ -17377,7 +17432,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # separate because they are not interchangeable for a massive particle.
     ENERGY_TRUE = _env_float("WCTE_EXPECTED_KE_MEV", 300.0)
 
-    # Common local-checkout layout and CERN-compatible defaults.
+    # Common repository-relative layout.
     SCRIPT_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = SCRIPT_DIR.parent
     LICKETYFIT_DIR = PROJECT_ROOT / "LicketyFit"
@@ -17385,7 +17440,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         os.environ.get("TABLE_DIR", os.environ.get("LF_TABLE_DIR", PROJECT_ROOT / "tables"))
     ).expanduser()
     GEOMETRY_PATH = Path(
-        os.environ.get("GEOMETRY_PATH", "/eos/user/j/jrimmer/Geometry")
+        os.environ.get("GEOMETRY_PATH", str(PROJECT_ROOT / "Geometry"))
     ).expanduser()
     DEFAULT_GEOMETRY_FILE = GEOMETRY_PATH / "examples" / "wcte_bldg157.geo"
     GEOMETRY_FILE = Path(
@@ -17429,9 +17484,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "SELECTION_STEP_SIZE must be a positive integer or an Uproot size string"
             )
         SELECTION_STEP_SIZE = _selection_step_size_text
-    ANALYSIS_TOOLS_PATH = os.environ.get(
-        "WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH
-    ).strip()
+    # The adapter resolves the pinned repository submodule; no external path is
+    # passed through either embedded real-WCTE engine.
+    ANALYSIS_TOOLS_PATH = ""
     APPLY_MPMT_DATA_QUALITY_CUTS = _env_bool(
         "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", DEFAULT_WCTE_APPLY_MPMT_DQ
     )
@@ -22988,7 +23043,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # separate because they are not interchangeable for a massive particle.
     ENERGY_TRUE = _env_float("WCTE_EXPECTED_KE_MEV", 300.0)
 
-    # Common local-checkout layout and CERN-compatible defaults.
+    # Common repository-relative layout.
     SCRIPT_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = SCRIPT_DIR.parent
     LICKETYFIT_DIR = PROJECT_ROOT / "LicketyFit"
@@ -22996,7 +23051,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         os.environ.get("TABLE_DIR", os.environ.get("LF_TABLE_DIR", PROJECT_ROOT / "tables"))
     ).expanduser()
     GEOMETRY_PATH = Path(
-        os.environ.get("GEOMETRY_PATH", "/eos/user/j/jrimmer/Geometry")
+        os.environ.get("GEOMETRY_PATH", str(PROJECT_ROOT / "Geometry"))
     ).expanduser()
     DEFAULT_GEOMETRY_FILE = GEOMETRY_PATH / "examples" / "wcte_bldg157.geo"
     GEOMETRY_FILE = Path(
@@ -23053,9 +23108,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "SELECTION_STEP_SIZE must be a positive integer or an Uproot size string"
             )
         SELECTION_STEP_SIZE = _selection_step_size_text
-    ANALYSIS_TOOLS_PATH = os.environ.get(
-        "WCTE_ANALYSIS_TOOLS_PATH", DEFAULT_WCTE_ANALYSIS_TOOLS_PATH
-    ).strip()
+    # The adapter resolves the pinned repository submodule; no external path is
+    # passed through either embedded real-WCTE engine.
+    ANALYSIS_TOOLS_PATH = ""
     APPLY_MPMT_DATA_QUALITY_CUTS = _env_bool(
         "WCTE_APPLY_MPMT_DATA_QUALITY_CUTS", DEFAULT_WCTE_APPLY_MPMT_DQ
     )

@@ -156,9 +156,8 @@ def _table_dirs():
         str(Path.cwd()),
     ])
 
-    # Preserve old CERN locations as last-resort fallbacks only.
+    # Preserve the collaboration-wide CERN location as a last-resort fallback.
     dirs.extend([
-        "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables",
         "/eos/experiment/wcte/wcte_tests/mPMT_led_events/LicketyFit_stuff",
     ])
 
@@ -256,7 +255,6 @@ def _load_cerenkov_angle_table(particle: str):
         cang_paths = [
             *(_candidate_paths("cherenkov_angle_vs_E_muon_n1344.npy")),
             *(_candidate_paths("mu_cAng_vs_E_n1344.npy")),
-            "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables/mu_cAng_vs_E_n1344.npy",
         ]
         for path in cang_paths:
             if path and os.path.exists(path):
@@ -849,4 +847,3 @@ def find_scale_for_pmts_old2(*args, **kwargs):
 def find_scale_for_pmts_old(*args, **kwargs):
     out = find_scale_for_pmts(*args, **kwargs)
     return out[0], out[1]
-

@@ -30,8 +30,7 @@ def _default_table_dirs():
         str(Path.cwd() / "tables"),
         str(script_dir),
         str(Path.cwd()),
-        # Old CERN locations are last-resort fallbacks only.
-        "/eos/user/j/jrimmer/SWAN_projects/beam/LicketyFit2/tables",
+        # Collaboration-wide CERN location is a last-resort fallback only.
         "/eos/experiment/wcte/wcte_tests/mPMT_led_events/LicketyFit_stuff",
     ])
     unique = []

@@ -3,8 +3,8 @@
 The fitter owns reconstruction, geometry, calibration, prompt conditioning and
 output.  This module owns only the production ROOT input layer:
 
-* resolve/import ``analysis_tools`` from an installed package, submodule, or
-  external checkout;
+* resolve/import ``analysis_tools`` only from the repository submodule at
+  ``LicketyFit_official/analysis_tools``;
 * use :class:`analysis_tools.DataLoader` for ROOT access and data-quality cuts;
 * use :class:`analysis_tools.BeamSelection` for nominal or custom beam PID;
 * resolve good-PMT masks from a user list or a run DQ/merged ROOT without
@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
 import math
@@ -45,9 +46,11 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-DEFAULT_ANALYSIS_TOOLS_PATH = (
-    "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/analysis_tools"
-)
+# Retained as a compatibility export for code that imported the old constant.
+# External-path overrides are deliberately unsupported: the pinned repository
+# submodule is the single authoritative analysis_tools source.
+DEFAULT_ANALYSIS_TOOLS_PATH: None = None
+ANALYSIS_TOOLS_SUBMODULE_DIRNAME = "analysis_tools"
 DEFAULT_PRODUCTION_TEMPLATE = (
     "/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/"
     "production_v1_0/{run}/WCTE_merged_production_R{run}.root"
@@ -241,36 +244,19 @@ def _sha256_file(path: Path | None) -> str | None:
 def _candidate_import_roots(
     *, explicit_path: str | os.PathLike[str] | None, project_root: Path | None
 ) -> list[Path]:
-    candidates: list[Path] = []
-
-    def add(value: str | os.PathLike[str] | None) -> None:
-        if value is None or not str(value).strip():
-            return
-        path = Path(value).expanduser()
-        try:
-            path = path.resolve()
-        except Exception:
-            path = path.absolute()
-        if path not in candidates:
-            candidates.append(path)
-
-    add(explicit_path)
-    add(os.environ.get("WCTE_ANALYSIS_TOOLS_PATH"))
-    add(os.environ.get("ANALYSIS_TOOLS_PATH"))
-    if project_root is not None:
-        root = Path(project_root)
-        for relative in (
-            "analysis_tools",
-            "external/analysis_tools",
-            "extern/analysis_tools",
-            "third_party/analysis_tools",
-            "vendor/analysis_tools",
-            "../analysis_tools",
-            "../data_production_v1/analysis_tools",
-        ):
-            add(root / relative)
-    add(DEFAULT_ANALYSIS_TOOLS_PATH)
-    return candidates
+    if explicit_path is not None and str(explicit_path).strip():
+        raise AnalysisToolsImportError(
+            "External analysis_tools paths are no longer supported. Initialize "
+            "the pinned submodule at LicketyFit_official/analysis_tools instead."
+        )
+    if project_root is None:
+        raise AnalysisToolsImportError(
+            "The LicketyFit repository root is required to resolve the "
+            "analysis_tools submodule."
+        )
+    return [
+        (Path(project_root).resolve() / ANALYSIS_TOOLS_SUBMODULE_DIRNAME).resolve()
+    ]
 
 
 def _sys_path_root_for_candidate(candidate: Path) -> Path | None:
@@ -333,12 +319,26 @@ def _import_analysis_tools_components(
 ) -> tuple[type, type, Any, dict[str, Any]]:
     """Resolve only DataLoader, BeamSelection and the threshold printer.
 
-    Prefer the public package API.  If its broad ``__init__`` fails because an
-    unrelated optional dependency is absent, use the repository's *actual*
-    ``data_loader.py`` and ``beam_selection.py`` modules directly.  This is not a
-    reimplementation of their behavior.
+    Resolve the pinned repository submodule and prefer its public package API.
+    If its broad ``__init__`` fails because an unrelated optional dependency is
+    absent, use the same submodule's *actual* ``data_loader.py`` and
+    ``beam_selection.py`` modules directly.  This is not a reimplementation of
+    their behavior, and an installed/global package is never accepted.
     """
     attempts: list[str] = []
+
+    root_path = Path(project_root).resolve() if project_root is not None else None
+    candidates = _candidate_import_roots(
+        explicit_path=explicit_path, project_root=root_path
+    )
+    candidate = candidates[0]
+
+    def is_within(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except ValueError:
+            return False
 
     def load_public() -> tuple[type, type, Any, dict[str, Any]]:
         module = importlib.import_module("analysis_tools")
@@ -348,6 +348,15 @@ def _import_analysis_tools_components(
         module_file = Path(inspect.getfile(module)).resolve()
         data_file = Path(inspect.getfile(DataLoader)).resolve()
         beam_file = Path(inspect.getfile(BeamSelection)).resolve()
+        for label, source_file in (
+            ("analysis_tools", module_file),
+            ("DataLoader", data_file),
+            ("BeamSelection", beam_file),
+        ):
+            if not is_within(source_file, candidate):
+                raise ImportError(
+                    f"{label} resolved outside the required submodule: {source_file}"
+                )
         metadata = {
             "module": "analysis_tools",
             "import_mode": "public_package_api",
@@ -357,70 +366,69 @@ def _import_analysis_tools_components(
             "beam_selection_file": str(beam_file),
             "data_loader_sha256": _sha256_file(data_file),
             "beam_selection_sha256": _sha256_file(beam_file),
+            "source_policy": "required_repository_submodule",
+            "submodule_root": str(candidate),
         }
         return DataLoader, BeamSelection, print_thresholds, metadata
 
+    import_root = _sys_path_root_for_candidate(candidate)
+    components = _component_source_files(candidate)
+    if import_root is None or components is None:
+        raise AnalysisToolsImportError(
+            "The required analysis_tools submodule is missing or uninitialized at "
+            f"{candidate}. From LicketyFit_official run: "
+            "git submodule update --init analysis_tools"
+        )
+
+    text = str(import_root)
+    if text in sys.path:
+        sys.path.remove(text)
+    sys.path.insert(0, text)
+    for module_name in tuple(sys.modules):
+        if module_name == "analysis_tools" or module_name.startswith("analysis_tools."):
+            sys.modules.pop(module_name, None)
     try:
-        return load_public()
+        DataLoader, BeamSelection, print_thresholds, metadata = load_public()
+        metadata["resolved_from_candidate"] = str(candidate)
+        metadata["sys_path_root"] = text
+        return DataLoader, BeamSelection, print_thresholds, metadata
     except Exception as exc:
-        attempts.append(f"normal public-package import: {exc!r}")
+        attempts.append(f"{candidate} public-package import: {exc!r}")
 
-    root_path = Path(project_root).resolve() if project_root is not None else None
-    for candidate in _candidate_import_roots(
-        explicit_path=explicit_path, project_root=root_path
-    ):
-        import_root = _sys_path_root_for_candidate(candidate)
-        if import_root is not None:
-            text = str(import_root)
-            if text not in sys.path:
-                sys.path.insert(0, text)
-            for module_name in tuple(sys.modules):
-                if module_name == "analysis_tools" or module_name.startswith("analysis_tools."):
-                    sys.modules.pop(module_name, None)
-            try:
-                DataLoader, BeamSelection, print_thresholds, metadata = load_public()
-                metadata["resolved_from_candidate"] = str(candidate)
-                metadata["sys_path_root"] = text
-                return DataLoader, BeamSelection, print_thresholds, metadata
-            except Exception as exc:
-                attempts.append(f"{candidate} public-package import: {exc!r}")
-
-        components = _component_source_files(candidate)
-        if components is None:
-            if import_root is None:
-                attempts.append(f"{candidate}: no analysis_tools component sources found")
-            continue
-        data_file, beam_file = components
-        try:
-            data_module = _load_source_module(data_file, "data_loader")
-            beam_module = _load_source_module(beam_file, "beam_selection")
-            DataLoader = getattr(data_module, "DataLoader")
-            BeamSelection = getattr(beam_module, "BeamSelection")
-            print_thresholds = getattr(beam_module, "print_cherenkov_thresholds", None)
-            metadata = {
-                "module": "analysis_tools component sources",
-                "import_mode": "direct_component_files",
-                "repository_root": str(data_file.parent.parent),
-                "resolved_from_candidate": str(candidate),
-                "data_loader_file": str(data_file.resolve()),
-                "beam_selection_file": str(beam_file.resolve()),
-                "data_loader_sha256": _sha256_file(data_file),
-                "beam_selection_sha256": _sha256_file(beam_file),
-                "public_package_import_bypassed": True,
-                "reason": (
-                    "The package initializer imports unrelated optional subsystems; "
-                    "LicketyFit loaded the repository's DataLoader/BeamSelection "
-                    "source modules directly."
-                ),
-            }
-            return DataLoader, BeamSelection, print_thresholds, metadata
-        except Exception as exc:
-            attempts.append(f"{candidate} direct-component import: {exc!r}")
+    data_file, beam_file = components
+    try:
+        data_module = _load_source_module(data_file, "data_loader")
+        beam_module = _load_source_module(beam_file, "beam_selection")
+        DataLoader = getattr(data_module, "DataLoader")
+        BeamSelection = getattr(beam_module, "BeamSelection")
+        print_thresholds = getattr(beam_module, "print_cherenkov_thresholds", None)
+        metadata = {
+            "module": "analysis_tools component sources",
+            "import_mode": "direct_component_files",
+            "repository_root": str(data_file.parent.parent),
+            "resolved_from_candidate": str(candidate),
+            "submodule_root": str(candidate),
+            "source_policy": "required_repository_submodule",
+            "data_loader_file": str(data_file.resolve()),
+            "beam_selection_file": str(beam_file.resolve()),
+            "data_loader_sha256": _sha256_file(data_file),
+            "beam_selection_sha256": _sha256_file(beam_file),
+            "public_package_import_bypassed": True,
+            "reason": (
+                "The package initializer imports unrelated optional subsystems; "
+                "LicketyFit loaded the submodule's DataLoader/BeamSelection "
+                "source modules directly."
+            ),
+        }
+        return DataLoader, BeamSelection, print_thresholds, metadata
+    except Exception as exc:
+        attempts.append(f"{candidate} direct-component import: {exc!r}")
 
     raise AnalysisToolsImportError(
-        "Could not import the WCTE analysis_tools DataLoader/BeamSelection "
-        "components. Set WCTE_ANALYSIS_TOOLS_PATH to the repository root "
-        "(the directory containing analysis_tools/data_loader.py). Attempts:\n  - "
+        "Could not import DataLoader/BeamSelection from the required "
+        f"analysis_tools submodule at {candidate}. Ensure its Python "
+        "dependencies are installed, or reinitialize it with "
+        "'git submodule update --init analysis_tools'. Attempts:\n  - "
         + "\n  - ".join(attempts)
     )
 
@@ -999,7 +1007,7 @@ def _iterate_selected(
     apply_dq = getattr(loader, "_apply_all_data_quality_cuts", None)
     if not callable(apply_dq):
         raise RuntimeError(
-            "The installed analysis_tools.DataLoader does not provide the "
+            "The analysis_tools submodule's DataLoader does not provide the "
             "indexed-DQ hook used by the supplied LF_data_loader example "
             "(_apply_all_data_quality_cuts). Update the adapter for the new "
             "analysis_tools API rather than silently losing ROOT entry identity."
@@ -1482,11 +1490,14 @@ def load_good_wcte_pmts(
     project_root: str | os.PathLike[str] | None = None,
 ) -> tuple[set[int], dict[str, Any]]:
     """Read ``Configuration/good_wcte_pmts`` from merged or DQ ROOT."""
+    # Resolving the pinned submodule is mandatory even when the standalone DQ
+    # file later needs the direct-Configuration Uproot fallback. This prevents a
+    # missing or profile-local analysis_tools checkout from being hidden.
+    DataLoader, _, import_metadata = import_analysis_tools(
+        explicit_path=analysis_tools_path,
+        project_root=project_root,
+    )
     try:
-        DataLoader, _, import_metadata = import_analysis_tools(
-            explicit_path=analysis_tools_path,
-            project_root=project_root,
-        )
         loader = DataLoader(str(root_file), branches_to_load=[])
         try:
             slots, positions = loader.get_good_wcte_pmts()
@@ -1511,6 +1522,7 @@ def load_good_wcte_pmts(
         }
     except Exception as data_loader_error:
         good, metadata = _load_good_wcte_pmts_direct_uproot(root_file)
+        metadata["analysis_tools"] = import_metadata
         metadata["analysis_tools_loader_error"] = (
             f"{type(data_loader_error).__name__}: "
             + str(data_loader_error).splitlines()[0]

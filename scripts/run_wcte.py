@@ -27,9 +27,9 @@ FIT_MODE = "cosmic"
 # Supported fit hypotheses: "muon", "pion", "kaon", or "proton".
 FIT_PARTICLE = "muon"
 
-# Choose your likelihood mode - "charge_time", "charge_only", or "time_only"
-# "charge_time" is recommended
-LIKELIHOOD_MODE = "charge_time"
+# "charge_only" is the established real-data default. Other choices are
+# "charge_time" and "timing_only".
+LIKELIHOOD_MODE = "charge_only"
 
 # Number of event-level worker processes.
 NPROC = 16
@@ -42,7 +42,7 @@ OUTPUT_FILE = ""
 
 # "selection": load the collaboration ROOT and run DataLoader/BeamSelection.
 # "file": load already-selected events from USER_EVENT_FILE.
-EVENT_SOURCE = "file"
+EVENT_SOURCE = "selection"
 
 # In selection mode this chooses the collaboration run. In file mode it does
 # not alter the user events, but it still chooses the run mask when
@@ -54,13 +54,13 @@ RUN = 2079
 COLLABORATION_ROOT_FILE = ""
 
 # Required only when EVENT_SOURCE = "file". Supported: NPY, NPZ, PKL, PICKLE.
-USER_EVENT_FILE = "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/r2079.npy"
+USER_EVENT_FILE = ""
 
 # Optional NPZ/pickle key when a user event container is ambiguous.
 USER_EVENT_KEY = ""
 
 # Selection mode: maximum raw ROOT entries inspected before event selection.
-N_ROOT_ENTRIES = 5000
+N_ROOT_ENTRIES = 50_000
 
 # Maximum selected events actually fitted. None means all selected events.
 MAX_EVENTS_TO_FIT = None
@@ -74,10 +74,10 @@ EVENT_START_INDEX = 0
 # "auto": use GOOD_PMT_FILE when nonblank, otherwise discover the mask for RUN.
 # "file": require GOOD_PMT_FILE.
 # "run": read Configuration/good_wcte_pmts from a DQ/merged ROOT for RUN.
-GOOD_PMT_SOURCE = "run"
+GOOD_PMT_SOURCE = "auto"
 
 # NPY/NPZ/TXT/CSV/JSON list of active WCTE PMTs. Required for source "file".
-GOOD_PMT_FILE = "NPY"
+GOOD_PMT_FILE = ""
 GOOD_PMT_FILE_KEY = ""  # Usually blank; selects an array in an ambiguous NPZ.
 
 # Optional exact standalone DQ or merged ROOT override for source "run".
@@ -147,17 +147,17 @@ TIME_REFERENCE_BIN_WIDTH_NS = 0.5
 TIME_REFERENCE_LOCAL_HALF_WIDTH_NS = 1.0
 
 
-# --- 6. External paths --------------------------------------------------------
+# --- 6. Geometry and selection I/O -------------------------------------------
 
-# Blank GEOMETRY_FILE uses the geometry_repository bundled with this package.
+# Blank uses Geometry/examples/wcte_bldg157.geo from the pinned Geometry
+# submodule. Set a file only when deliberately using another serialized detector.
 GEOMETRY_FILE = ""
 
-# DataLoader/BeamSelection checkout. An installed analysis_tools package is also
-# detected; this path is the CERN compatibility fallback.
-ANALYSIS_TOOLS_PATH = (
-    "/eos/user/j/jrimmer/SWAN_projects/beam/"
-    "data_production_v1/analysis_tools"
-)
+# Geometry and DataLoader/BeamSelection always come from the two pinned Git
+# submodules at LicketyFit_official/Geometry and
+# LicketyFit_official/analysis_tools. There are intentionally no source-path
+# settings here. Initialize both once with:
+# git submodule update --init analysis_tools Geometry
 SELECTION_STEP_SIZE = "100 MB"
 
 
@@ -186,6 +186,9 @@ EXTRA_DRIVER_ENV = {}
 
 
 _DRIVER = Path(__file__).resolve().with_name("batch_fit_driver.py")
+_PROJECT_ROOT = _DRIVER.parent.parent
+_ANALYSIS_TOOLS_SUBMODULE = _PROJECT_ROOT / "analysis_tools"
+_GEOMETRY_SUBMODULE = _PROJECT_ROOT / "Geometry"
 _FIT_MODES = {"full_length", "absorption", "cosmic"}
 _FIT_PARTICLES = {"muon", "pion", "kaon", "proton"}
 _LIKELIHOODS = {"charge_only", "charge_time", "timing_only"}
@@ -195,6 +198,33 @@ def _require_file(value: str, label: str) -> None:
     path = Path(str(value)).expanduser()
     if not path.is_file():
         raise ValueError(f"{label} does not exist or is not a file: {path}")
+
+
+def _require_analysis_tools_submodule() -> None:
+    required = (
+        _ANALYSIS_TOOLS_SUBMODULE / "analysis_tools" / "data_loader.py",
+        _ANALYSIS_TOOLS_SUBMODULE / "analysis_tools" / "beam_selection.py",
+    )
+    if not all(path.is_file() for path in required):
+        raise ValueError(
+            "The analysis_tools submodule is missing or uninitialized at "
+            f"{_ANALYSIS_TOOLS_SUBMODULE}. From LicketyFit_official run: "
+            "git submodule update --init analysis_tools"
+        )
+
+
+def _require_geometry_submodule() -> None:
+    required = (
+        _GEOMETRY_SUBMODULE / "Geometry" / "Device.py",
+        _GEOMETRY_SUBMODULE / "Geometry" / "WCD.py",
+        _GEOMETRY_SUBMODULE / "examples" / "wcte_bldg157.geo",
+    )
+    if not all(path.is_file() for path in required):
+        raise ValueError(
+            "The Geometry submodule is missing or uninitialized at "
+            f"{_GEOMETRY_SUBMODULE}. From LicketyFit_official run: "
+            "git submodule update --init Geometry"
+        )
 
 
 def _validate(*, check_paths: bool) -> None:
@@ -260,7 +290,23 @@ def _validate(*, check_paths: bool) -> None:
         if not isinstance(cut, (tuple, list)) or len(cut) != 3:
             raise ValueError(f"Malformed selection cut: {cut!r}")
     json.dumps([list(cut) for cut in EXTRA_SELECTION_CUTS])
+    forbidden_path_overrides = {
+        name for name in ("WCTE_ANALYSIS_TOOLS_PATH", "ANALYSIS_TOOLS_PATH")
+        if name in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV[name]).strip()
+    }
+    if forbidden_path_overrides:
+        raise ValueError(
+            "analysis_tools path overrides are no longer supported; remove "
+            + ", ".join(sorted(forbidden_path_overrides))
+            + " from EXTRA_DRIVER_ENV and use the repository submodule"
+        )
+    if "GEOMETRY_PATH" in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV["GEOMETRY_PATH"]).strip():
+        raise ValueError(
+            "GEOMETRY_PATH overrides are no longer supported; remove "
+            "GEOMETRY_PATH from EXTRA_DRIVER_ENV and use the Geometry submodule"
+        )
     if check_paths:
+        _require_geometry_submodule()
         if EVENT_SOURCE == "file":
             _require_file(USER_EVENT_FILE, "USER_EVENT_FILE")
         if EVENT_SOURCE == "selection" and str(COLLABORATION_ROOT_FILE).strip():
@@ -268,6 +314,8 @@ def _validate(*, check_paths: bool) -> None:
         use_user_mask = GOOD_PMT_SOURCE == "file" or (
             GOOD_PMT_SOURCE == "auto" and bool(str(GOOD_PMT_FILE).strip())
         )
+        if EVENT_SOURCE == "selection" or not use_user_mask:
+            _require_analysis_tools_submodule()
         if use_user_mask:
             _require_file(GOOD_PMT_FILE, "GOOD_PMT_FILE")
         if not use_user_mask and str(GOOD_PMT_ROOT_FILE).strip():
@@ -286,6 +334,21 @@ def _encode(value):
 
 
 def _configuration_items() -> list[tuple[str, object]]:
+    forbidden_path_overrides = {
+        name for name in ("WCTE_ANALYSIS_TOOLS_PATH", "ANALYSIS_TOOLS_PATH")
+        if name in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV[name]).strip()
+    }
+    if forbidden_path_overrides:
+        raise ValueError(
+            "analysis_tools path overrides are no longer supported; remove "
+            + ", ".join(sorted(forbidden_path_overrides))
+            + " from EXTRA_DRIVER_ENV"
+        )
+    if "GEOMETRY_PATH" in EXTRA_DRIVER_ENV and str(EXTRA_DRIVER_ENV["GEOMETRY_PATH"]).strip():
+        raise ValueError(
+            "GEOMETRY_PATH overrides are no longer supported; remove "
+            "GEOMETRY_PATH from EXTRA_DRIVER_ENV"
+        )
     root_file = str(COLLABORATION_ROOT_FILE).strip() or None
     geometry_file = str(GEOMETRY_FILE).strip() or None
     output_file = str(OUTPUT_FILE).strip() or None
@@ -338,7 +401,11 @@ def _configuration_items() -> list[tuple[str, object]]:
         ("WCTE_TIME_REFERENCE_BIN_WIDTH_NS", TIME_REFERENCE_BIN_WIDTH_NS),
         ("WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS", TIME_REFERENCE_LOCAL_HALF_WIDTH_NS),
         ("WCD_GEOMETRY_FILE", geometry_file), ("WCTE_GEOMETRY_FILE", geometry_file),
-        ("WCTE_ANALYSIS_TOOLS_PATH", ANALYSIS_TOOLS_PATH),
+        ("GEOMETRY_PATH", None),
+        ("LF_GEOMETRY_POLICY", "required_repository_submodule"),
+        ("WCTE_ANALYSIS_TOOLS_PATH", None),
+        ("ANALYSIS_TOOLS_PATH", None),
+        ("LF_ANALYSIS_TOOLS_POLICY", "required_repository_submodule"),
         ("SELECTION_STEP_SIZE", SELECTION_STEP_SIZE),
         ("N_EVENTS_PER_BATCH", N_EVENTS_PER_BATCH),
         ("WARM_FIT_KERNELS", WARM_FIT_KERNELS),
@@ -381,6 +448,8 @@ def build_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 def _print_configuration() -> None:
     print(f"Launcher: {Path(__file__).resolve()}")
     print(f"Driver:   {_DRIVER}")
+    print(f"analysis_tools submodule: {_ANALYSIS_TOOLS_SUBMODULE}")
+    print(f"Geometry submodule:       {_GEOMETRY_SUBMODULE}")
     for name, value in _configuration_items():
         shown = "<unset>" if value is None else _encode(value)
         print(f"{name}={shown}")
