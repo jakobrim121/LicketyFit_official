@@ -1,8 +1,9 @@
 """Single-file LicketyFit batch driver for WCSim and real WCTE data.
 
-This is the only batch-driver script that needs to be installed or executed.
-It contains the complete driver logic for both data adapters and all three
-public fit modes:
+This file contains the complete driver logic for both data adapters and all
+three public fit modes. Normal users should configure and launch it through
+``run_wcte.py`` or ``run_wcsim.py`` in this directory rather than editing this
+large implementation file directly:
 
     FIT_MODE = "full_length"
         Fast seven-parameter internal-start fit. The fitted longitudinal
@@ -17,8 +18,10 @@ public fit modes:
         More careful geometry-clipped fit supporting all four combinations of
         start inside/outside and stop inside/outside.
 
-Select the input adapter with DATA_SOURCE = "wcsim" or "wcte" in the compact
-configuration block below. Environment variables override edited defaults.
+The two launcher files translate their short, documented Python configuration
+sections into the driver's environment interface and then execute this file
+directly. Direct execution and the fallback defaults below remain supported for
+backward compatibility.
 The four engine implementations are embedded in this file, so no
 ``_batch_fit_driver_*`` files and no separate cosmic supervisor are required.
 Both WCSim and real-WCTE cosmic operation use the same compact-charge,
@@ -40,13 +43,16 @@ import signal
 import sys
 import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.20-authoritative-wcte-pmt"
+UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.21-separate-run-configs"
 
 # =============================================================================
-# USER CONFIGURATION -- EDIT THIS BLOCK
+# BACKWARD-COMPATIBILITY FALLBACK DEFAULTS
 # =============================================================================
+# Most users should NOT edit this block. Edit and run scripts/run_wcte.py or
+# scripts/run_wcsim.py instead. These values are retained so older direct-driver
+# workflows and batch submissions continue to work.
 # Which input/calibration adapter to use: "wcsim" or "wcte".
-DEFAULT_DATA_SOURCE = "wcte"
+DEFAULT_DATA_SOURCE = "wcsim"
 
 # Exactly one of: "full_length", "absorption", "cosmic".
 DEFAULT_FIT_MODE = "cosmic"
@@ -100,15 +106,15 @@ DEFAULT_WCTE_ROOT_FILE = ""
 DEFAULT_WCTE_N_ROOT_ENTRIES = 50_000
 # None means fit every selected event. Set an integer for a hard selected-event cap.
 DEFAULT_WCTE_MAX_EVENTS_TO_FIT = None
-DEFAULT_WCTE_EVENT_SOURCE = "file"  # "selection" or "file"
-DEFAULT_WCTE_USER_EVENT_FILE = "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/r2079.npy"
+DEFAULT_WCTE_EVENT_SOURCE = "selection"  # "selection" or "file"
+DEFAULT_WCTE_USER_EVENT_FILE = ""
 # Channel-mask source, independent of the event source:
 #   "auto"     -> use GOOD_PMT_FILE when supplied, otherwise discover by RUN;
 #   "file"     -> require a user NPY/NPZ/TXT/CSV/JSON good-PMT list;
 #   "run"      -> discover Configuration/good_wcte_pmts for DEFAULT_WCTE_RUN;
 # Real-WCTE fits require one of those authoritative lists.  The WCSim inactive-
 # slot policy is never applied in WCTE mode.
-DEFAULT_WCTE_GOOD_PMT_SOURCE = "run"
+DEFAULT_WCTE_GOOD_PMT_SOURCE = "auto"
 DEFAULT_WCTE_GOOD_PMT_FILE = ""
 DEFAULT_WCTE_GOOD_PMT_FILE_KEY = ""
 # Optional exact DQ or merged ROOT override. Blank discovers the standalone DQ
@@ -120,7 +126,7 @@ DEFAULT_WCTE_GOOD_PMT_ROOT_SEARCH_BASES = ()
 # Reject silent integer truncation, mixed per-event identities, non-finite hit
 # values, negative charge and malformed WCTE PMT IDs in user event files.
 DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION = True
-DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_time"
+DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_only"
 DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C = 430.0
 DEFAULT_WCTE_REL_EFF_MODE = "slot"
 DEFAULT_WCTE_PLACEMENT_KEY = "est"
@@ -196,11 +202,11 @@ DEFAULT_WCTE_CALIBRATED_PEAK_TIME_MAX_NS = 10000.0
 DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_EVENTS = 2000
 DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS = None
 
-# Optional advanced overrides. Environment variables still take precedence.
+# Optional legacy direct-driver overrides. Environment variables still take precedence.
 # Example: {"PRINT_EVENT_RESULTS": "1", "SAVE_DETAILED_EVENT_RESULTS": "1"}
 EXTRA_ENV_DEFAULTS = {}
 # =============================================================================
-# END USER CONFIGURATION
+# END BACKWARD-COMPATIBILITY FALLBACK DEFAULTS
 # =============================================================================
 
 
@@ -308,6 +314,20 @@ def _setdefault_text(name: str, value) -> None:
 
 def _truthy_text(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _run_config_provenance() -> dict[str, str] | None:
+    """Return provenance supplied by run_wcte.py or run_wcsim.py."""
+    config_file = os.environ.get("LF_RUN_CONFIG_FILE", "").strip()
+    config_kind = os.environ.get("LF_RUN_CONFIG_KIND", "").strip()
+    config_sha256 = os.environ.get("LF_RUN_CONFIG_SHA256", "").strip()
+    if not (config_file or config_kind or config_sha256):
+        return None
+    return {
+        "kind": config_kind,
+        "file": config_file,
+        "sha256": config_sha256,
+    }
 
 
 def _selection_cut_specs_from_env(name: str, default) -> tuple[tuple[object, object, object], ...]:
@@ -1788,6 +1808,14 @@ if _UNIFIED_FIT_MODE != "cosmic" or _env_bool("VERBOSE_SETUP", False):
         f"DATA_SOURCE={_UNIFIED_DATA_SOURCE}, FIT_MODE={_UNIFIED_FIT_MODE}",
         flush=True,
     )
+    _config_provenance = _run_config_provenance()
+    if _config_provenance is not None:
+        print(
+            "Run configuration:",
+            _config_provenance.get("file", ""),
+            f"[{_config_provenance.get('kind', '')}]",
+            flush=True,
+        )
 
 if (
     _UNIFIED_FIT_MODE == "cosmic"
@@ -5432,6 +5460,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcsim",
                 "driver_release": str(DRIVER_RELEASE),
+                "public_driver_release": os.environ.get(
+                    "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                ),
+                "run_config": _run_config_provenance(),
                 "runtime_cache_dir": os.environ.get(
                     "LF_RESOLVED_RUNTIME_CACHE_DIR",
                     os.environ.get("NUMBA_CACHE_DIR", ""),
@@ -16110,6 +16142,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcsim",
                 "driver_release": str(DRIVER_RELEASE),
+                "public_driver_release": os.environ.get(
+                    "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                ),
+                "run_config": _run_config_provenance(),
                 "runtime_cache_dir": os.environ.get(
                     "LF_RESOLVED_RUNTIME_CACHE_DIR",
                     os.environ.get("NUMBA_CACHE_DIR", ""),
@@ -19833,6 +19869,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             extra={
                 "driver": "batch_fit_driver_wcte",
                 "driver_release": str(DRIVER_RELEASE),
+                "public_driver_release": os.environ.get(
+                    "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                ),
+                "run_config": _run_config_provenance(),
                 "runtime_cache_dir": os.environ.get(
                     "LF_RESOLVED_RUNTIME_CACHE_DIR",
                     os.environ.get("NUMBA_CACHE_DIR", ""),
@@ -22009,6 +22049,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "metadata": {
                 "driver": "batch_fit_driver_wcte",
                 "driver_release": str(DRIVER_RELEASE),
+                "public_driver_release": os.environ.get(
+                    "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                ),
+                "run_config": _run_config_provenance(),
                 "runtime_cache_dir": os.environ.get(
                     "LF_RESOLVED_RUNTIME_CACHE_DIR",
                     os.environ.get("NUMBA_CACHE_DIR", ""),
@@ -34186,6 +34230,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "source_event_start_index": int(INPUT_SOURCE_START_INDEX),
                 "source_event_stop_exclusive": int(INPUT_SOURCE_STOP_EXCLUSIVE),
                 "cosmic_supervised_child": bool(COSMIC_SUPERVISED_CHILD),
+                "public_driver_release": os.environ.get(
+                    "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                ),
+                "run_config": _run_config_provenance(),
                 "safe_process_generation_capacity": int(
                     _cosmic_generation_capacity(max(n_completed, 1))
                 ),
