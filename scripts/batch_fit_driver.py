@@ -40,7 +40,7 @@ import signal
 import sys
 import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-06-three-mode-nonmcs-universal-v1.15-analysis-tools-t5-dq-separated"
+UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.20-authoritative-wcte-pmt"
 
 # =============================================================================
 # USER CONFIGURATION -- EDIT THIS BLOCK
@@ -49,7 +49,7 @@ UNIFIED_DRIVER_RELEASE = "2026-08-06-three-mode-nonmcs-universal-v1.15-analysis-
 DEFAULT_DATA_SOURCE = "wcte"
 
 # Exactly one of: "full_length", "absorption", "cosmic".
-DEFAULT_FIT_MODE = "full_length"
+DEFAULT_FIT_MODE = "cosmic"
 
 # Shared settings.
 DEFAULT_FIT_PARTICLE = "muon"
@@ -91,17 +91,55 @@ DEFAULT_WCSIM_TRUTH_INCLUDE_OPTIONAL_DETAILS = False
 
 # Real-WCTE settings.
 DEFAULT_WCTE_RUN = 2079
-# Blank uses the production-v1.0 run template. Set a full ROOT path to override.
+# Blank uses the production-v1.0 *merged* run file.  This one ROOT file is the
+# runtime DataLoader input: the upstream production merger has already copied the
+# event DQ masks and Configuration/good_wcte_pmts from dq_flags into it.  The
+# standalone dq_flags ROOT file is an intermediate production input, not a second
+# event file that LicketyFit normally opens.
 DEFAULT_WCTE_ROOT_FILE = ""
-DEFAULT_WCTE_N_ROOT_ENTRIES = 5000
+DEFAULT_WCTE_N_ROOT_ENTRIES = 50_000
 # None means fit every selected event. Set an integer for a hard selected-event cap.
 DEFAULT_WCTE_MAX_EVENTS_TO_FIT = None
-DEFAULT_WCTE_EVENT_SOURCE = "selection"  # "selection" or "file"
-DEFAULT_WCTE_USER_EVENT_FILE = ""
+DEFAULT_WCTE_EVENT_SOURCE = "file"  # "selection" or "file"
+DEFAULT_WCTE_USER_EVENT_FILE = "/eos/user/j/jrimmer/SWAN_projects/beam/data_production_v1/r2079.npy"
+# Channel-mask source, independent of the event source:
+#   "auto"     -> use GOOD_PMT_FILE when supplied, otherwise discover by RUN;
+#   "file"     -> require a user NPY/NPZ/TXT/CSV/JSON good-PMT list;
+#   "run"      -> discover Configuration/good_wcte_pmts for DEFAULT_WCTE_RUN;
+# Real-WCTE fits require one of those authoritative lists.  The WCSim inactive-
+# slot policy is never applied in WCTE mode.
+DEFAULT_WCTE_GOOD_PMT_SOURCE = "run"
+DEFAULT_WCTE_GOOD_PMT_FILE = ""
+DEFAULT_WCTE_GOOD_PMT_FILE_KEY = ""
+# Optional exact DQ or merged ROOT override. Blank discovers the standalone DQ
+# product when visible on EOS and otherwise the merged production run ROOT.
+DEFAULT_WCTE_GOOD_PMT_ROOT_FILE = ""
+# Optional additional EOS/local discovery roots, searched before built-in WCTE
+# production locations. Each item is a directory, not a ROOT filename.
+DEFAULT_WCTE_GOOD_PMT_ROOT_SEARCH_BASES = ()
+# Reject silent integer truncation, mixed per-event identities, non-finite hit
+# values, negative charge and malformed WCTE PMT IDs in user event files.
+DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION = True
 DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_time"
 DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C = 430.0
-DEFAULT_WCTE_REL_EFF_MODE = None #"slot"
+DEFAULT_WCTE_REL_EFF_MODE = "slot"
 DEFAULT_WCTE_PLACEMENT_KEY = "est"
+# Event-time zero.  The default is the centre of the modal bin of the
+# propagation-corrected prompt-hit times.  It is robust to isolated early hits,
+# does not select PMTs merely because they are physically close to the beam-entry
+# reference, and showed negligible event-level correlation with fitted z/length
+# in the run-2079 study.  "beam_corrected_local_median" retains the optional
+# local-median refinement; "beam_earliest" retains the historical raw-earliest-ten
+# estimator for controlled comparisons.
+DEFAULT_WCTE_TIME_REFERENCE_MODE = "beam_corrected_peak"
+DEFAULT_WCTE_TIME_REFERENCE_BIN_WIDTH_NS = 0.5
+DEFAULT_WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS = 1.0
+# Charge normalization.  "event_mean" is the historical shape-only likelihood:
+# every prediction is rescaled to the observed event total.  "global_scale" keeps
+# absolute light-yield information and requires an independently calibrated scale.
+# It is intentionally not the default until a detector/run calibration is frozen.
+DEFAULT_WCTE_CHARGE_NORMALIZATION_MODE = "event_mean"
+DEFAULT_WCTE_GLOBAL_CHARGE_SCALE = None
 # The selected beam population and fitted particle hypothesis are independent.
 # Nominal analysis_tools selections exist for muon, pion, electron and proton.
 # LicketyFit fit hypotheses currently exist for muon, pion, kaon and proton; an
@@ -471,10 +509,33 @@ def _apply_unified_defaults() -> tuple[str, str]:
             _setdefault_text("MAX_EVENTS_TO_FIT", int(DEFAULT_WCTE_MAX_EVENTS_TO_FIT))
             _setdefault_text("TOT_EVENTS", int(DEFAULT_WCTE_MAX_EVENTS_TO_FIT))
         _setdefault_text("EVENT_SOURCE", DEFAULT_WCTE_EVENT_SOURCE)
+        _setdefault_text("WCTE_GOOD_PMT_SOURCE", DEFAULT_WCTE_GOOD_PMT_SOURCE)
+        _setdefault_text(
+            "WCTE_STRICT_USER_EVENT_VALIDATION",
+            "1" if DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION else "0",
+        )
         _setdefault_text("LIKELIHOOD_MODE", DEFAULT_WCTE_LIKELIHOOD_MODE)
         _setdefault_text("BEAM_P", repr(float(DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C)))
         _setdefault_text("REL_EFF_MODE", DEFAULT_WCTE_REL_EFF_MODE)
         _setdefault_text("WCTE_PLACEMENT_KEY", DEFAULT_WCTE_PLACEMENT_KEY)
+        _setdefault_text("WCTE_TIME_REFERENCE_MODE", DEFAULT_WCTE_TIME_REFERENCE_MODE)
+        _setdefault_text(
+            "WCTE_TIME_REFERENCE_BIN_WIDTH_NS",
+            repr(float(DEFAULT_WCTE_TIME_REFERENCE_BIN_WIDTH_NS)),
+        )
+        _setdefault_text(
+            "WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS",
+            repr(float(DEFAULT_WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS)),
+        )
+        _setdefault_text(
+            "WCTE_CHARGE_NORMALIZATION_MODE",
+            DEFAULT_WCTE_CHARGE_NORMALIZATION_MODE,
+        )
+        if DEFAULT_WCTE_GLOBAL_CHARGE_SCALE is not None:
+            _setdefault_text(
+                "WCTE_GLOBAL_CHARGE_SCALE",
+                repr(float(DEFAULT_WCTE_GLOBAL_CHARGE_SCALE)),
+            )
         _setdefault_text("PARTICLE_SELECTION_LABEL", DEFAULT_WCTE_PARTICLE_SELECTION_LABEL)
         _setdefault_text("WCTE_SELECTION_MODE", DEFAULT_WCTE_SELECTION_MODE)
         _setdefault_text("SELECTION_STEP_SIZE", DEFAULT_WCTE_SELECTION_STEP_SIZE)
@@ -539,11 +600,33 @@ def _apply_unified_defaults() -> tuple[str, str]:
             _setdefault_text("WCTE_DATA_LOADER_PEAK_SAMPLE_HITS", int(DEFAULT_WCTE_DATA_LOADER_PEAK_SAMPLE_HITS))
         if str(DEFAULT_WCTE_USER_EVENT_FILE).strip():
             _setdefault_text("USER_EVENT_FILE", str(DEFAULT_WCTE_USER_EVENT_FILE).strip())
+        if str(DEFAULT_WCTE_GOOD_PMT_FILE).strip():
+            _setdefault_text(
+                "WCTE_GOOD_PMT_FILE", str(DEFAULT_WCTE_GOOD_PMT_FILE).strip()
+            )
+        if str(DEFAULT_WCTE_GOOD_PMT_FILE_KEY).strip():
+            _setdefault_text(
+                "WCTE_GOOD_PMT_FILE_KEY",
+                str(DEFAULT_WCTE_GOOD_PMT_FILE_KEY).strip(),
+            )
+        if str(DEFAULT_WCTE_GOOD_PMT_ROOT_FILE).strip():
+            _setdefault_text(
+                "WCTE_GOOD_PMT_ROOT_FILE",
+                str(DEFAULT_WCTE_GOOD_PMT_ROOT_FILE).strip(),
+            )
+        if DEFAULT_WCTE_GOOD_PMT_ROOT_SEARCH_BASES:
+            _setdefault_text(
+                "WCTE_GOOD_PMT_ROOT_SEARCH_BASES",
+                os.pathsep.join(
+                    str(value)
+                    for value in DEFAULT_WCTE_GOOD_PMT_ROOT_SEARCH_BASES
+                ),
+            )
 
         # Prefer the surveyed-geometry receiver table when it is installed.
         table = (
             Path(__file__).resolve().parent.parent / "tables" /
-            "photon_scatter_receiver_moments_wcte_est_active1805_50mm_v1.npz"
+            "photon_scatter_receiver_moments_wcte_est_all2014_50mm_v1.npz"
         )
         if table.is_file():
             _setdefault_text("EMITTER_PHOTON_SCATTER_RECEIVER_TABLE", str(table))
@@ -1189,6 +1272,28 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
     part_dir.mkdir(parents=True, exist_ok=False)
     engine_path = Path(__file__).resolve()
     prepared_path = part_dir / "raw_selected_events.pkl"
+    prepared_metadata_path = prepared_path.with_name(
+        prepared_path.name + ".metadata.pkl"
+    )
+
+    original_event_source = os.environ.get("EVENT_SOURCE", "selection").strip().lower()
+    if original_event_source in {"selected", "internal", "event_loader", "auto"}:
+        original_event_source = "selection"
+    elif original_event_source in {"file", "user", "custom", "user_file", "provided"}:
+        original_event_source = "file"
+    original_user_event_file = os.environ.get("USER_EVENT_FILE", "").strip()
+    original_user_event_key = os.environ.get("USER_EVENT_KEY", "").strip() or None
+    original_run = _env_int("RUN", 2079)
+    original_config_root = os.environ.get(
+        "CONFIG_ROOT_FILE",
+        "/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/"
+        f"production_v1_0/{original_run}/WCTE_merged_production_R{original_run}.root",
+    ).strip()
+    original_input_file = (
+        original_config_root
+        if original_event_source == "selection"
+        else original_user_event_file
+    )
 
     source_start = max(0, _env_int("LF_EVENT_START_INDEX", 0))
     request_text = os.environ.get(
@@ -1232,6 +1337,15 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             f"{_subprocess_status_description(prepared.returncode)}; "
             f"retained files and log are in {part_dir}"
         )
+    if not prepared_metadata_path.is_file():
+        raise RuntimeError(
+            "WCTE cosmic preparation did not create its provenance sidecar: "
+            f"{prepared_metadata_path}"
+        )
+    with prepared_metadata_path.open("rb") as stream:
+        prepared_metadata = pickle.load(stream)
+    if not isinstance(prepared_metadata, dict):
+        raise RuntimeError("WCTE cosmic preparation provenance is not a dictionary")
 
     available = _read_prepared_count(prepared_path)
     requested = max(0, available - source_start)
@@ -1272,6 +1386,7 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
                 "EVENT_SOURCE": "file",
                 "USER_EVENT_FILE": str(prepared_path),
                 "USER_EVENT_KEY": "",
+                "LF_WCTE_INTERNAL_PREPARED_EVENT_FILE": "1",
                 "LF_COSMIC_SUPERVISED_CHILD": "1",
                 "LF_WCTE_PREPARE_EVENTS_ONLY": "0",
                 "LF_EVENT_START_INDEX": str(int(absolute_start)),
@@ -1337,9 +1452,66 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         )
         merged["metadata"].update({
             "wcte_raw_event_preparation_file": prepared_path.name,
+            "wcte_raw_event_preparation_file_retained": False,
             "wcte_raw_events_available": int(available),
-            "event_source_requested": os.environ.get("EVENT_SOURCE", "selection"),
+            "event_source_requested": str(original_event_source),
+            "event_source": str(original_event_source),
+            "input_file": str(original_input_file),
+            "config_root_file": str(original_config_root),
+            "user_event_file": (
+                str(original_user_event_file)
+                if original_event_source == "file" else None
+            ),
+            "user_event_key": (
+                original_user_event_key
+                if original_event_source == "file" else None
+            ),
+            "wcte_data_loader": dict(
+                prepared_metadata.get("wcte_data_loader", {})
+            ),
         })
+        selection_metadata = dict(merged["metadata"].get("selection", {}))
+        selection_applied = original_event_source == "selection"
+        selection_metadata.update({
+            "applied": bool(selection_applied),
+            "bypassed_reason": (
+                None if selection_applied
+                else "EVENT_SOURCE=file; input events are assumed preselected"
+            ),
+            "loader": (
+                "analysis_tools.DataLoader" if selection_applied else None
+            ),
+            "beam_selection": (
+                "analysis_tools.BeamSelection" if selection_applied else None
+            ),
+        })
+        for key in (
+            "apply_mpmt_data_quality_cuts",
+            "apply_vme_event_quality_cuts",
+            "apply_t5_event_quality_cuts",
+        ):
+            requested_key = "requested_" + key
+            requested_value = selection_metadata.get(
+                requested_key, selection_metadata.get(key, False)
+            )
+            selection_metadata[requested_key] = bool(requested_value)
+            selection_metadata[key] = (
+                bool(requested_value) if selection_applied else False
+            )
+        if selection_applied:
+            for key in (
+                "particle_label",
+                "canonical_particle",
+                "selection_matches_fit_hypothesis",
+                "selection_mode",
+                "use_act_eveto_cut",
+                "use_act_tagger_cut",
+                "tof_cut_mode",
+            ):
+                requested_key = "requested_" + key
+                if requested_key in selection_metadata:
+                    selection_metadata[key] = selection_metadata[requested_key]
+        merged["metadata"]["selection"] = selection_metadata
         _atomic_pickle(final_output, merged)
         success = True
         completed_total = int(merged["metadata"].get("n_events_completed", 0))
@@ -3263,6 +3435,8 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "reflection_in_charge",
             "reflection_bsrff",
             "reflection_pmt_aperture_radius_mm",
+            "charge_normalization_mode",
+            "global_charge_scale",
         )
         configuration: dict[str, object] = {
             "proxy_enable_delta_e": proxy_delta,
@@ -4874,6 +5048,12 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 else None
             ),
         )
+        if _UNIFIED_DATA_SOURCE == "wcte":
+            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+            emitter.global_charge_scale = (
+                None if GLOBAL_CHARGE_SCALE is None
+                else float(GLOBAL_CHARGE_SCALE)
+            )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -9612,6 +9792,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "reflection_in_charge",
             "reflection_bsrff",
             "reflection_pmt_aperture_radius_mm",
+            "charge_normalization_mode",
+            "global_charge_scale",
         )
         configuration: dict[str, object] = {
             "proxy_enable_delta_e": proxy_delta,
@@ -15272,6 +15454,12 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 if (FIT_MODE == "absorption" or AUTO_CLIPPED_TRACK) else None
             ),
         )
+        if _UNIFIED_DATA_SOURCE == "wcte":
+            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+            emitter.global_charge_scale = (
+                None if GLOBAL_CHARGE_SCALE is None
+                else float(GLOBAL_CHARGE_SCALE)
+            )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -16982,8 +17170,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
     * selected events are loaded from WCTE production ROOT files (or an already-
       selected user event file);
-    * run Configuration good-PMT masks and real inactive slots define the active
-      channel ordering;
+    * the user or run/DQ good-PMT list authoritatively defines the real-data
+      active-channel ordering; WCSim inactive-slot masks are not applied;
     * observed charge is converted from calibrated ADC to PE;
     * per-slot or per-mPMT-type data/MC relative-efficiency curves are applied to
       every proxy, exact objective, and optional MCS continuation;
@@ -17004,7 +17192,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-06-wcte-standard-analysis-tools-v4-full-pid-controls"
+    DRIVER_RELEASE = "2026-08-10-wcte-standard-v6-authoritative-pmt"
 
     import hashlib
     import json
@@ -17129,6 +17317,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     USER_EVENT_FILE = os.environ.get("USER_EVENT_FILE", "").strip()
     USER_EVENT_KEY = os.environ.get("USER_EVENT_KEY", "").strip() or None
     USER_EVENT_APPLY_PROMPT_WINDOW = _env_bool("USER_EVENT_APPLY_PROMPT_WINDOW", True)
+    STRICT_USER_EVENT_VALIDATION = _env_bool(
+        "WCTE_STRICT_USER_EVENT_VALIDATION",
+        DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION,
+    )
+    INTERNAL_PREPARED_EVENT_FILE = _env_bool(
+        "LF_WCTE_INTERNAL_PREPARED_EVENT_FILE", False
+    )
 
     # Event-level multiprocessing. NPROC is the number of concurrent event workers,
     # not the intrinsic single-event latency.
@@ -17168,6 +17363,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # real-data driver. This affects mPMT locations at the O(10 mm) level in the
     # supplied geometry and therefore must be part of the proxy-cache identity.
     WCTE_PLACEMENT_KEY = os.environ.get("WCTE_PLACEMENT_KEY", "est").strip().lower()
+    # Historical environment name retained for compatibility.  This is the
+    # complete merged production ROOT used for both event iteration and run
+    # metadata; it is not the standalone dq_flags intermediate file.
     CONFIG_ROOT_FILE = os.environ.get(
         "CONFIG_ROOT_FILE",
         f"/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/"
@@ -17294,10 +17492,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     PROMPT_BIN_WIDTH_NS = _env_float("WCTE_PROMPT_BIN_WIDTH_NS", 1.0)
     PROMPT_PRE_PEAK_NS = _env_float("WCTE_PROMPT_PRE_PEAK_NS", 20.0)
     PROMPT_POST_PEAK_NS = _env_float("WCTE_PROMPT_POST_PEAK_NS", 5.0)
-    TIME_REFERENCE_MODE = os.environ.get("WCTE_TIME_REFERENCE_MODE", "beam_earliest").strip().lower().replace("-", "_")
+    TIME_REFERENCE_MODE = os.environ.get(
+        "WCTE_TIME_REFERENCE_MODE", DEFAULT_WCTE_TIME_REFERENCE_MODE
+    ).strip().lower().replace("-", "_")
     TIME_REFERENCE_POINT_MM = _env_vector3("WCTE_TIME_REFERENCE_POINT_MM", (0.0, 0.0, -1350.0))
     TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS = _env_float("WCTE_TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS", 223.0598645833333)
     TIME_REFERENCE_N_EARLIEST = max(1, _env_int("WCTE_TIME_REFERENCE_N_EARLIEST", 10))
+    TIME_REFERENCE_BIN_WIDTH_NS = _env_float(
+        "WCTE_TIME_REFERENCE_BIN_WIDTH_NS",
+        DEFAULT_WCTE_TIME_REFERENCE_BIN_WIDTH_NS,
+    )
+    TIME_REFERENCE_LOCAL_HALF_WIDTH_NS = _env_float(
+        "WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS",
+        DEFAULT_WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS,
+    )
+    CHARGE_NORMALIZATION_MODE = os.environ.get(
+        "WCTE_CHARGE_NORMALIZATION_MODE",
+        DEFAULT_WCTE_CHARGE_NORMALIZATION_MODE,
+    ).strip().lower().replace("-", "_")
+    GLOBAL_CHARGE_SCALE = _env_optional_float(
+        "WCTE_GLOBAL_CHARGE_SCALE", DEFAULT_WCTE_GLOBAL_CHARGE_SCALE
+    )
 
     # Run-channel and data/MC relative-efficiency calibration.
     REL_EFF_MODE = os.environ.get("REL_EFF_MODE", "slot").strip().lower().replace("-", "_")
@@ -17310,7 +17525,22 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     SLOT_REL_MPMT_EFF_PATH = Path(
         os.environ.get("SLOT_REL_MPMT_EFF_PATH", TABLE_DIR / "single_data_MC_ratio.dict")
     ).expanduser()
-    ALLOW_MISSING_GOOD_PMTS = _env_bool("ALLOW_MISSING_GOOD_PMTS", EVENT_SOURCE == "file")
+    GOOD_PMT_SOURCE = os.environ.get(
+        "WCTE_GOOD_PMT_SOURCE", DEFAULT_WCTE_GOOD_PMT_SOURCE
+    ).strip().lower().replace("-", "_")
+    GOOD_PMT_FILE = os.environ.get("WCTE_GOOD_PMT_FILE", "").strip()
+    GOOD_PMT_FILE_KEY = os.environ.get("WCTE_GOOD_PMT_FILE_KEY", "").strip() or None
+    GOOD_PMT_ROOT_FILE = os.environ.get("WCTE_GOOD_PMT_ROOT_FILE", "").strip()
+    GOOD_PMT_ROOT_SEARCH_BASES = tuple(
+        value for value in os.environ.get(
+            "WCTE_GOOD_PMT_ROOT_SEARCH_BASES", ""
+        ).split(os.pathsep) if value.strip()
+    )
+    if _env_bool("ALLOW_MISSING_GOOD_PMTS", False):
+        raise ValueError(
+            "ALLOW_MISSING_GOOD_PMTS is not supported for real-WCTE fits; "
+            "provide an authoritative user or run/DQ good-PMT list"
+        )
 
     # =============================================================================
     # END ROUTINE USER CONFIGURATION
@@ -17481,15 +17711,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     EXACT_STEPS = None
     TIMING_STEPS = None
 
-    # Real WCTE channel mask. Slots 9 and 67 are retained from the historical
-    # real-data driver in addition to the geometry-level WCTE inactive list.
-    REAL_WCTE_DEFAULT_INACTIVE_SLOTS = (27, 32, 45, 74, 77, 79, 85, 91, 99, 9, 67)
-    _inactive_slots_env = os.environ.get("INACTIVE_SLOTS")
-    INACTIVE_SLOTS = (
-        set(REAL_WCTE_DEFAULT_INACTIVE_SLOTS)
-        if _inactive_slots_env is None
-        else set(_env_int_list("INACTIVE_SLOTS", ()))
-    )
+    # Kept as an empty compatibility value for shared emitter/cache interfaces.
+    # The authoritative real-WCTE user/run mask is the sole channel-status mask.
+    INACTIVE_SLOTS = set()
     RING_MASK_MODE = os.environ.get("RING_MASK_MODE", "none").strip().lower()
 
     # Detector-specific optical policies. WCTE keeps its exact prism/reflection
@@ -18057,8 +18281,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     from particle_range_lookup import ParticleRangeLookup
     from wcte_data_loader_adapter import (
         WCTESelectionConfig,
-        load_good_wcte_pmts as load_good_wcte_pmts_via_analysis_tools,
+        authoritative_active_wcte_pmts,
         load_selected_events as load_selected_wcte_events,
+        resolve_good_wcte_pmts,
+    )
+    from wcte_user_event_file import (
+        coerce_event_array as coerce_user_event_array,
+        load_user_event_file as load_validated_user_event_file,
+        source_event_id as validated_source_event_id,
+        source_root_entry_index as validated_source_root_entry_index,
     )
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
@@ -18114,8 +18345,35 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         raise ValueError("invalid WCTE prompt histogram range or bin width")
     if CHARGE_ADC_PER_PE <= 0.0:
         raise ValueError("CHARGE_ADC_PER_PE must be positive")
-    if TIME_REFERENCE_MODE not in {"beam_earliest", "none"}:
-        raise ValueError("WCTE_TIME_REFERENCE_MODE must be beam_earliest or none")
+    if TIME_REFERENCE_MODE == "beam_corrected_mode":
+        TIME_REFERENCE_MODE = "beam_corrected_peak"
+    if TIME_REFERENCE_MODE not in {
+        "beam_earliest", "beam_corrected_peak",
+        "beam_corrected_local_median", "beam_all_median", "none",
+    }:
+        raise ValueError(
+            "WCTE_TIME_REFERENCE_MODE must be beam_corrected_peak, "
+            "beam_corrected_local_median, beam_all_median, beam_earliest, or none"
+        )
+    if TIME_REFERENCE_BIN_WIDTH_NS <= 0.0:
+        raise ValueError("WCTE_TIME_REFERENCE_BIN_WIDTH_NS must be positive")
+    if TIME_REFERENCE_LOCAL_HALF_WIDTH_NS < 0.0:
+        raise ValueError(
+            "WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS must be non-negative"
+        )
+    if CHARGE_NORMALIZATION_MODE not in {"event_mean", "global_scale"}:
+        raise ValueError(
+            "WCTE_CHARGE_NORMALIZATION_MODE must be event_mean or global_scale"
+        )
+    if CHARGE_NORMALIZATION_MODE == "global_scale" and (
+        GLOBAL_CHARGE_SCALE is None
+        or not math.isfinite(float(GLOBAL_CHARGE_SCALE))
+        or float(GLOBAL_CHARGE_SCALE) <= 0.0
+    ):
+        raise ValueError(
+            "WCTE_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
+            "WCTE_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
+        )
     if EVENT_SOURCE == "file" and not USER_EVENT_FILE:
         raise ValueError("EVENT_SOURCE=file requires USER_EVENT_FILE")
 
@@ -18246,6 +18504,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     GOOD_WCTE_PMTS_SET = None
     ACTIVE_WCTE_PMT_IDS = None
     PMT_ID_TO_POSITION = None
+    WCTE_PLACEMENT_FALLBACK_PMT_IDS = set()
     MPMT_INFO = {}
     SLOT_REL_EFF_STACK = None
     REL_EFF_CALIBRATION_METADATA = {}
@@ -18276,68 +18535,111 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def load_good_wcte_pmts():
-        """Load the run good-channel mask through analysis_tools.DataLoader."""
+        """Resolve the authoritative user or selected-run real-WCTE mask."""
         global WCTE_GOOD_PMT_LOADER_METADATA
         try:
-            good, metadata = load_good_wcte_pmts_via_analysis_tools(
-                CONFIG_ROOT_FILE,
+            good, metadata = resolve_good_wcte_pmts(
+                source=GOOD_PMT_SOURCE,
+                run=int(RUN),
+                good_pmt_file=GOOD_PMT_FILE or None,
+                good_pmt_file_key=GOOD_PMT_FILE_KEY,
+                good_pmt_root_file=GOOD_PMT_ROOT_FILE or None,
+                selection_root_file=CONFIG_ROOT_FILE or None,
+                root_search_bases=GOOD_PMT_ROOT_SEARCH_BASES,
                 analysis_tools_path=ANALYSIS_TOOLS_PATH,
                 project_root=PROJECT_ROOT,
             )
             WCTE_GOOD_PMT_LOADER_METADATA = dict(metadata)
-            setup_print("Loaded good WCTE PMTs through analysis_tools.DataLoader:", CONFIG_ROOT_FILE)
+            setup_print(
+                "Loaded WCTE good-PMT mask:",
+                WCTE_GOOD_PMT_LOADER_METADATA.get("source_resolved"),
+                WCTE_GOOD_PMT_LOADER_METADATA.get(
+                    "file", WCTE_GOOD_PMT_LOADER_METADATA.get("root_file")
+                ),
+            )
             return set(int(value) for value in good)
         except Exception as exc:
-            if not ALLOW_MISSING_GOOD_PMTS:
-                raise RuntimeError(
-                    "Could not load the run good-PMT mask through "
-                    f"analysis_tools.DataLoader from {CONFIG_ROOT_FILE!r}"
-                ) from exc
-            print(
-                "WARNING: analysis_tools could not load the run good-PMT mask; "
-                "using all geometrically present PMTs outside INACTIVE_SLOTS. "
-                "Reason:", repr(exc), flush=True,
-            )
-            WCTE_GOOD_PMT_LOADER_METADATA = {
-                "fallback": True,
-                "reason": repr(exc),
-                "root_file": str(CONFIG_ROOT_FILE),
-            }
-            fallback = set()
-            for slot, module in enumerate(WCD.mpmts):
-                if slot in INACTIVE_SLOTS or module is None:
-                    continue
-                for pmt, sensor in enumerate(module.pmts):
-                    if sensor is not None:
-                        fallback.add(int(slot * 100 + pmt))
-            return fallback
+            raise RuntimeError(
+                "Could not resolve the authoritative real-WCTE good-PMT list. "
+                "Provide WCTE_GOOD_PMT_FILE or select a valid RUN so its "
+                "DQ/merged ROOT can be discovered."
+            ) from exc
 
 
     def _build_active_channel_maps():
-        active = set()
-        positions = {}
+        global WCTE_PLACEMENT_FALLBACK_PMT_IDS
+        geometry_sensors = {}
         for slot, module in enumerate(WCD.mpmts):
-            if slot in INACTIVE_SLOTS or module is None:
+            if module is None:
                 continue
             for pmt, sensor in enumerate(module.pmts):
                 if sensor is None:
                     continue
                 pmt_id = int(slot * 100 + pmt)
-                if pmt_id not in GOOD_WCTE_PMTS_SET:
-                    continue
-                active.add(pmt_id)
-                try:
-                    position = sensor.get_placement(WCTE_PLACEMENT_KEY, WCD)["location"]
-                except Exception:
-                    fallback_key = "design" if WCTE_PLACEMENT_KEY == "est" else "est"
-                    try:
-                        position = sensor.get_placement(fallback_key, WCD)["location"]
-                    except Exception:
-                        position = sensor.get_placement(WCTE_PLACEMENT_KEY)["location"]
-                positions[pmt_id] = np.asarray(position, dtype=np.float64)
-        if not active:
-            raise RuntimeError("No active WCTE PMTs remain after run and inactive-slot masks")
+                geometry_sensors[pmt_id] = sensor
+        active = authoritative_active_wcte_pmts(
+            GOOD_WCTE_PMTS_SET, geometry_sensors
+        )
+        positions = {}
+        for pmt_id in sorted(active):
+            sensor = geometry_sensors[pmt_id]
+            placement, used_key = _wcte_active_sensor_placement(pmt_id, sensor)
+            if used_key != WCTE_PLACEMENT_KEY:
+                WCTE_PLACEMENT_FALLBACK_PMT_IDS.add(int(pmt_id))
+            positions[pmt_id] = np.asarray(placement["location"], dtype=np.float64)
         return active, positions
+
+
+    def _wcte_active_sensor_placement(pmt_id, sensor):
+        """Return requested placement, falling back to design when unsurveyed."""
+        fallback_key = "design" if WCTE_PLACEMENT_KEY == "est" else "est"
+        attempts = []
+        for key, args in (
+            (WCTE_PLACEMENT_KEY, (WCTE_PLACEMENT_KEY, WCD)),
+            (fallback_key, (fallback_key, WCD)),
+            (WCTE_PLACEMENT_KEY, (WCTE_PLACEMENT_KEY,)),
+            (fallback_key, (fallback_key,)),
+        ):
+            try:
+                placement = sensor.get_placement(*args)
+                location = np.asarray(placement["location"], dtype=np.float64)
+                normal = np.asarray(placement["direction_z"], dtype=np.float64)
+                if (
+                    location.shape == (3,) and normal.shape == (3,)
+                    and np.all(np.isfinite(location))
+                    and np.all(np.isfinite(normal))
+                    and float(np.linalg.norm(normal)) > 0.0
+                ):
+                    return placement, key
+            except Exception as exc:
+                attempts.append(f"{key}: {exc!r}")
+        raise RuntimeError(
+            f"No usable detector placement exists for authoritative WCTE PMT "
+            f"{int(pmt_id)}; attempts: {attempts}"
+        )
+
+
+    def _active_wcte_pmt_placements():
+        """Return exact authoritative PMT geometry in stable global-ID order."""
+        locations = []
+        normals = []
+        slots = []
+        for pmt_id in sorted(ACTIVE_WCTE_PMT_IDS):
+            slot = int(pmt_id // 100)
+            pmt = int(pmt_id % 100)
+            sensor = WCD.mpmts[slot].pmts[pmt]
+            placement, used_key = _wcte_active_sensor_placement(pmt_id, sensor)
+            if used_key != WCTE_PLACEMENT_KEY:
+                WCTE_PLACEMENT_FALLBACK_PMT_IDS.add(int(pmt_id))
+            locations.append(np.asarray(placement["location"], dtype=np.float64))
+            normal = np.asarray(placement["direction_z"], dtype=np.float64)
+            normals.append(normal / float(np.linalg.norm(normal)))
+            slots.append(slot)
+        return (
+            np.ascontiguousarray(locations, dtype=np.float64),
+            np.ascontiguousarray(normals, dtype=np.float64),
+            np.ascontiguousarray(slots, dtype=np.int32),
+        )
 
 
     def _build_slot_rel_eff_stack(slot_dict, n_grid=201, n_slots=106, default_ratio=1.0):
@@ -18461,7 +18763,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         event = Event(0, 0, n_mpmt)
         for slot in range(n_mpmt):
             module = WCD.mpmts[slot]
-            module_ok = slot not in INACTIVE_SLOTS and module is not None
+            module_ok = module is not None
             slot_has_active = False
             event.mpmt_status[slot] = False
             for pmt in range(event.npmt_per_mpmt):
@@ -18503,6 +18805,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             candidates.append((float(hit_time), float(hit_time) - distance / speed))
         if not candidates:
             return 0.0
+        corrected = np.asarray([item[1] for item in candidates], dtype=np.float64)
+        if TIME_REFERENCE_MODE == "beam_all_median":
+            return float(np.median(corrected))
+        if TIME_REFERENCE_MODE in {
+            "beam_corrected_peak", "beam_corrected_local_median"
+        }:
+            width = float(TIME_REFERENCE_BIN_WIDTH_NS)
+            lo = math.floor(float(np.min(corrected)) / width) * width - width
+            hi = math.ceil(float(np.max(corrected)) / width) * width + width
+            edges = np.arange(lo, hi + 1.5 * width, width, dtype=np.float64)
+            if edges.size < 2:
+                return float(np.median(corrected))
+            counts, edges = np.histogram(corrected, bins=edges)
+            if counts.size == 0 or int(np.max(counts)) <= 0:
+                return float(np.median(corrected))
+            peak = int(np.argmax(counts))
+            center = float(0.5 * (edges[peak] + edges[peak + 1]))
+            if TIME_REFERENCE_MODE == "beam_corrected_peak":
+                return center
+            half_width = float(TIME_REFERENCE_LOCAL_HALF_WIDTH_NS)
+            local = corrected[np.abs(corrected - center) <= half_width]
+            return float(np.median(local)) if local.size else center
         candidates.sort(key=lambda item: item[0])
         use = candidates[: min(int(TIME_REFERENCE_N_EARLIEST), len(candidates))]
         return float(np.median([item[1] for item in use]))
@@ -19408,6 +19732,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "reflection_in_charge",
             "reflection_bsrff",
             "reflection_pmt_aperture_radius_mm",
+            "charge_normalization_mode",
+            "global_charge_scale",
         )
         configuration: dict[str, object] = {
             "proxy_enable_delta_e": proxy_delta,
@@ -20829,18 +21155,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         }
 
     def _coerce_event_array(event, *, event_label="event"):
-        array = np.asarray(event)
-        if array.ndim != 2 or array.shape[1] < 3:
-            raise ValueError(
-                f"{event_label} must be a 2D array with at least three columns: "
-                "[WCTE PMT ID, charge, calibrated time]."
-            )
-        # Three columns are the minimal user-file contract.  Four-column legacy
-        # files use column 3 as their event identity.  DataLoader-backed events
-        # use five columns: column 3 is the raw ROOT entry and column 4 is the
-        # production event_number.  Never truncate the latter here.
-        n_columns = 5 if array.shape[1] >= 5 else (4 if array.shape[1] >= 4 else 3)
-        return np.asarray(array[:, :n_columns], dtype=np.float64)
+        return coerce_user_event_array(
+            event,
+            event_label=event_label,
+            strict=bool(
+                STRICT_USER_EVENT_VALIDATION if EVENT_SOURCE == "file" else True
+            ),
+        )
 
 
     def _events_from_loaded_object(obj):
@@ -20929,28 +21250,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def load_user_event_file(path, *, max_events=None):
-        path = Path(path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(path)
-        suffix = path.suffix.lower()
-        if suffix == ".npz":
-            loaded = np.load(path, allow_pickle=True)
-        elif suffix == ".npy":
-            loaded = np.load(path, allow_pickle=True)
-        elif suffix in {".pkl", ".pickle"}:
-            with open(path, "rb") as stream:
-                loaded = pickle.load(stream)
-        else:
-            raise ValueError(
-                f"Unsupported USER_EVENT_FILE suffix {suffix!r}; use npy, npz, pkl, or pickle"
-            )
-        try:
-            events = _events_from_loaded_object(loaded)
-        finally:
-            if isinstance(loaded, np.lib.npyio.NpzFile):
-                loaded.close()
-        if max_events is not None:
-            events = events[: int(max_events)]
+        global WCTE_DATA_LOADER_METADATA
+        events, metadata = load_validated_user_event_file(
+            path,
+            user_event_key=USER_EVENT_KEY,
+            max_events=max_events,
+            strict=bool(STRICT_USER_EVENT_VALIDATION),
+            trusted_internal=bool(INTERNAL_PREPARED_EVENT_FILE),
+        )
+        WCTE_DATA_LOADER_METADATA = dict(metadata)
         print(f"Loaded {len(events)} already-selected WCTE events from: {path}")
         return events
 
@@ -21009,30 +21317,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def _source_event_id(event, fallback_index):
-        if event.shape[0] > 0:
-            if event.shape[1] >= 5:
-                values = event[:, 4]
-            elif event.shape[1] >= 4:
-                values = event[:, 3]
-            else:
-                values = np.empty(0, dtype=np.float64)
-            finite = values[np.isfinite(values)]
-            if finite.size:
-                return int(finite[0])
-        return int(fallback_index)
+        return validated_source_event_id(event, fallback_index)
 
 
     def _source_root_entry_index(event, fallback_index):
-        # DataLoader-backed events reserve column 3 for the raw
-        # WCTEReadoutWindows entry.  A legacy four-column user file has only one
-        # identity column, so expose it for both identities rather than inventing
-        # a selected-list counter.
-        if event.shape[1] >= 4 and event.shape[0] > 0:
-            values = event[:, 3]
-            finite = values[np.isfinite(values)]
-            if finite.size:
-                return int(finite[0])
-        return int(fallback_index)
+        return validated_source_root_entry_index(event, fallback_index)
 
 
     def prepare_event_observables(raw_event, event_index):
@@ -21318,6 +21607,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 else None
             ),
         )
+        if _UNIFIED_DATA_SOURCE == "wcte":
+            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+            emitter.global_charge_scale = (
+                None if GLOBAL_CHARGE_SCALE is None
+                else float(GLOBAL_CHARGE_SCALE)
+            )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -21365,11 +21660,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         )
         EMITTER_TEMPLATE = emitter.copy()
 
-        # Construct a status-only event to establish the immutable PMT ordering.
-        empty = event_from_wcte_hits([], [], [])
-        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(
-            empty, WCD, WCTE_PLACEMENT_KEY
-        )
+        # Establish the immutable authoritative PMT ordering. Some active modules
+        # lack surveyed placements; those channels use their design geometry.
+        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = _active_wcte_pmt_placements()
         P_LOCATIONS = np.ascontiguousarray(P_LOCATIONS, dtype=np.float64)
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
         PMT_SLOTS = np.ascontiguousarray(PMT_SLOTS, dtype=np.int32)
@@ -21463,8 +21756,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             )
         setup_print("Fixed parameters:", FIXED_PARAMS)
         setup_print("Fixed direction:", None if FIXED_DIRECTION is None else FIXED_DIRECTION.tolist())
-        setup_print("Inactive slots:", sorted(INACTIVE_SLOTS))
+        setup_print("Real-WCTE active-PMT policy: authoritative user/run list")
         setup_print("Good PMTs / active PMTs:", len(GOOD_WCTE_PMTS_SET), len(ACTIVE_WCTE_PMT_IDS))
+        setup_print(
+            "Active PMTs using design-placement fallback:",
+            len(WCTE_PLACEMENT_FALLBACK_PMT_IDS),
+        )
         setup_print("Relative-efficiency calibration:", REL_EFF_CALIBRATION_METADATA)
         setup_print("Photon-scatter receiver:", PHOTON_SCATTER_RECEIVER_STATUS)
         setup_print(
@@ -21869,30 +22166,78 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "n_events_skipped_during_preparation": int(len(SKIPPED_EVENT_RECORDS)),
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
-                    "particle_label": str(PARTICLE_SELECTION_LABEL),
-                    "canonical_particle": str(SELECTION_PARTICLE),
+                    "applied": bool(EVENT_SOURCE == "selection"),
+                    "bypassed_reason": (
+                        None if EVENT_SOURCE == "selection" else
+                        "EVENT_SOURCE=file; input events are assumed preselected"
+                    ),
+                    "particle_label": (
+                        str(PARTICLE_SELECTION_LABEL)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_particle_label": str(PARTICLE_SELECTION_LABEL),
+                    "canonical_particle": (
+                        str(SELECTION_PARTICLE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_canonical_particle": str(SELECTION_PARTICLE),
                     "fit_particle_hypothesis": str(FIT_PARTICLE),
-                    "selection_matches_fit_hypothesis": bool(
+                    "selection_matches_fit_hypothesis": (
+                        bool(SELECTION_MATCHES_FIT_HYPOTHESIS)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_selection_matches_fit_hypothesis": bool(
                         SELECTION_MATCHES_FIT_HYPOTHESIS
                     ),
-                    "loader": "analysis_tools.DataLoader",
-                    "beam_selection": "analysis_tools.BeamSelection",
+                    "loader": (
+                        "analysis_tools.DataLoader"
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "beam_selection": (
+                        "analysis_tools.BeamSelection"
+                        if EVENT_SOURCE == "selection" else None
+                    ),
                     "analysis_tools_path_requested": (
                         str(ANALYSIS_TOOLS_PATH) if ANALYSIS_TOOLS_PATH else None
                     ),
                     "apply_mpmt_data_quality_cuts": bool(
                         APPLY_MPMT_DATA_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_apply_mpmt_data_quality_cuts": bool(
+                        APPLY_MPMT_DATA_QUALITY_CUTS
                     ),
                     "apply_vme_event_quality_cuts": bool(
+                        APPLY_VME_EVENT_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_apply_vme_event_quality_cuts": bool(
                         APPLY_VME_EVENT_QUALITY_CUTS
                     ),
                     "apply_t5_event_quality_cuts": bool(
                         APPLY_T5_EVENT_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
                     ),
-                    "selection_mode": str(SELECTION_MODE),
-                    "use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
-                    "use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
-                    "tof_cut_mode": str(TOF_CUT_MODE),
+                    "requested_apply_t5_event_quality_cuts": bool(
+                        APPLY_T5_EVENT_QUALITY_CUTS
+                    ),
+                    "selection_mode": (
+                        str(SELECTION_MODE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_selection_mode": str(SELECTION_MODE),
+                    "use_act_eveto_cut": bool(
+                        USE_ACT_EVETO_CUT if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
+                    "use_act_tagger_cut": bool(
+                        USE_ACT_TAGGER_CUT if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
+                    "tof_cut_mode": (
+                        str(TOF_CUT_MODE) if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_tof_cut_mode": str(TOF_CUT_MODE),
                     "proton_tof_window_ns": float(PROTON_TOF_WINDOW_NS),
                     "require_muon_tagger": bool(REQUIRE_MUON_TAGGER),
                     "act_eveto_cut_override_pe": ACT_EVETO_CUT_OVERRIDE_PE,
@@ -21935,6 +22280,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     ),
                 },
                 "wcte_data_loader": dict(WCTE_DATA_LOADER_METADATA),
+                "source_identity": (
+                    dict(WCTE_DATA_LOADER_METADATA.get("identity", {}))
+                    if EVENT_SOURCE == "file" else {
+                        "schema": "five_column_distinct_root_entry_and_event_number",
+                        "source_event_id_column": 4,
+                        "source_root_entry_index_column": 3,
+                        "legacy_identity_aliased": False,
+                    }
+                ),
                 "wcte_good_pmt_loader": dict(WCTE_GOOD_PMT_LOADER_METADATA),
                 "real_data_preparation": {
                     "charge_adc_per_pe": float(CHARGE_ADC_PER_PE),
@@ -21956,13 +22310,23 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS
                     ),
                     "time_reference_n_earliest": int(TIME_REFERENCE_N_EARLIEST),
+                    "time_reference_bin_width_ns": float(TIME_REFERENCE_BIN_WIDTH_NS),
+                    "time_reference_local_half_width_ns": float(
+                        TIME_REFERENCE_LOCAL_HALF_WIDTH_NS
+                    ),
+                    "charge_normalization_mode": str(CHARGE_NORMALIZATION_MODE),
+                    "global_charge_scale": (
+                        None if GLOBAL_CHARGE_SCALE is None
+                        else float(GLOBAL_CHARGE_SCALE)
+                    ),
                     "user_event_apply_prompt_window": (
                         bool(USER_EVENT_APPLY_PROMPT_WINDOW)
                         if EVENT_SOURCE == "file" else None
                     ),
                 },
                 "relative_efficiency": dict(REL_EFF_CALIBRATION_METADATA),
-                "inactive_slots": sorted(int(slot) for slot in INACTIVE_SLOTS),
+                "inactive_slots": [],
+                "active_pmt_policy": "authoritative_user_or_run_good_pmt_list",
                 "good_pmt_count": int(len(GOOD_WCTE_PMTS_SET)),
                 "active_pmt_count": int(len(ACTIVE_WCTE_PMT_IDS)),
                 "active_wcte_pmt_ids": sorted(int(value) for value in ACTIVE_WCTE_PMT_IDS),
@@ -21971,6 +22335,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 ),
                 "geometry_file": str(GEOMETRY_FILE),
                 "geometry_placement_key": str(WCTE_PLACEMENT_KEY),
+                "geometry_placement_fallback_key": (
+                    "design" if WCTE_PLACEMENT_KEY == "est" else "est"
+                ),
+                "geometry_placement_fallback_pmt_ids": sorted(
+                    int(value) for value in WCTE_PLACEMENT_FALLBACK_PMT_IDS
+                ),
                 "table_dir": str(TABLE_DIR),
                 "n_events_requested": int(n_events_requested),
                 "n_events_completed": int(n_completed),
@@ -22279,6 +22649,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         )
         print("  geometry placement:", WCTE_PLACEMENT_KEY)
         print("  relative mPMT efficiency:", REL_EFF_MODE)
+        print("  charge normalization:", CHARGE_NORMALIZATION_MODE, GLOBAL_CHARGE_SCALE)
         print("  prompt window / time reference:", PROMPT_WINDOW_MODE, TIME_REFERENCE_MODE)
         print("  output:", OUTPUT_FILE)
         print(
@@ -22393,8 +22764,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
     * selected events are loaded from WCTE production ROOT files (or an already-
       selected user event file);
-    * run Configuration good-PMT masks and real inactive slots define the active
-      channel ordering;
+    * the user or run/DQ good-PMT list authoritatively defines the real-data
+      active-channel ordering; WCSim inactive-slot masks are not applied;
     * observed charge is converted from calibrated ADC to PE;
     * per-slot or per-mPMT-type data/MC relative-efficiency curves are applied to
       every proxy, exact objective, and optional MCS continuation;
@@ -22415,7 +22786,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-06-wcte-cosmic-v18-analysis-tools-full-pid-controls"
+    DRIVER_RELEASE = "2026-08-10-wcte-cosmic-v20-authoritative-pmt"
 
     import hashlib
     import json
@@ -22540,6 +22911,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     USER_EVENT_FILE = os.environ.get("USER_EVENT_FILE", "").strip()
     USER_EVENT_KEY = os.environ.get("USER_EVENT_KEY", "").strip() or None
     USER_EVENT_APPLY_PROMPT_WINDOW = _env_bool("USER_EVENT_APPLY_PROMPT_WINDOW", True)
+    STRICT_USER_EVENT_VALIDATION = _env_bool(
+        "WCTE_STRICT_USER_EVENT_VALIDATION",
+        DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION,
+    )
+    INTERNAL_PREPARED_EVENT_FILE = _env_bool(
+        "LF_WCTE_INTERNAL_PREPARED_EVENT_FILE", False
+    )
 
     # Event-level multiprocessing. NPROC is the number of concurrent event workers,
     # not the intrinsic single-event latency.
@@ -22588,6 +22966,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # real-data driver. This affects mPMT locations at the O(10 mm) level in the
     # supplied geometry and therefore must be part of the proxy-cache identity.
     WCTE_PLACEMENT_KEY = os.environ.get("WCTE_PLACEMENT_KEY", "est").strip().lower()
+    # Historical environment name retained for compatibility.  This is the
+    # complete merged production ROOT used for both event iteration and run
+    # metadata; it is not the standalone dq_flags intermediate file.
     CONFIG_ROOT_FILE = os.environ.get(
         "CONFIG_ROOT_FILE",
         f"/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/"
@@ -22727,10 +23108,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     PROMPT_BIN_WIDTH_NS = _env_float("WCTE_PROMPT_BIN_WIDTH_NS", 1.0)
     PROMPT_PRE_PEAK_NS = _env_float("WCTE_PROMPT_PRE_PEAK_NS", 20.0)
     PROMPT_POST_PEAK_NS = _env_float("WCTE_PROMPT_POST_PEAK_NS", 5.0)
-    TIME_REFERENCE_MODE = os.environ.get("WCTE_TIME_REFERENCE_MODE", "beam_earliest").strip().lower().replace("-", "_")
+    TIME_REFERENCE_MODE = os.environ.get(
+        "WCTE_TIME_REFERENCE_MODE", DEFAULT_WCTE_TIME_REFERENCE_MODE
+    ).strip().lower().replace("-", "_")
     TIME_REFERENCE_POINT_MM = _env_vector3("WCTE_TIME_REFERENCE_POINT_MM", (0.0, 0.0, -1350.0))
     TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS = _env_float("WCTE_TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS", 223.0598645833333)
     TIME_REFERENCE_N_EARLIEST = max(1, _env_int("WCTE_TIME_REFERENCE_N_EARLIEST", 10))
+    TIME_REFERENCE_BIN_WIDTH_NS = _env_float(
+        "WCTE_TIME_REFERENCE_BIN_WIDTH_NS",
+        DEFAULT_WCTE_TIME_REFERENCE_BIN_WIDTH_NS,
+    )
+    TIME_REFERENCE_LOCAL_HALF_WIDTH_NS = _env_float(
+        "WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS",
+        DEFAULT_WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS,
+    )
+    CHARGE_NORMALIZATION_MODE = os.environ.get(
+        "WCTE_CHARGE_NORMALIZATION_MODE",
+        DEFAULT_WCTE_CHARGE_NORMALIZATION_MODE,
+    ).strip().lower().replace("-", "_")
+    GLOBAL_CHARGE_SCALE = _env_optional_float(
+        "WCTE_GLOBAL_CHARGE_SCALE", DEFAULT_WCTE_GLOBAL_CHARGE_SCALE
+    )
 
     # Run-channel and data/MC relative-efficiency calibration.
     REL_EFF_MODE = os.environ.get("REL_EFF_MODE", "slot").strip().lower().replace("-", "_")
@@ -22743,7 +23141,22 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     SLOT_REL_MPMT_EFF_PATH = Path(
         os.environ.get("SLOT_REL_MPMT_EFF_PATH", TABLE_DIR / "single_data_MC_ratio.dict")
     ).expanduser()
-    ALLOW_MISSING_GOOD_PMTS = _env_bool("ALLOW_MISSING_GOOD_PMTS", EVENT_SOURCE == "file")
+    GOOD_PMT_SOURCE = os.environ.get(
+        "WCTE_GOOD_PMT_SOURCE", DEFAULT_WCTE_GOOD_PMT_SOURCE
+    ).strip().lower().replace("-", "_")
+    GOOD_PMT_FILE = os.environ.get("WCTE_GOOD_PMT_FILE", "").strip()
+    GOOD_PMT_FILE_KEY = os.environ.get("WCTE_GOOD_PMT_FILE_KEY", "").strip() or None
+    GOOD_PMT_ROOT_FILE = os.environ.get("WCTE_GOOD_PMT_ROOT_FILE", "").strip()
+    GOOD_PMT_ROOT_SEARCH_BASES = tuple(
+        value for value in os.environ.get(
+            "WCTE_GOOD_PMT_ROOT_SEARCH_BASES", ""
+        ).split(os.pathsep) if value.strip()
+    )
+    if _env_bool("ALLOW_MISSING_GOOD_PMTS", False):
+        raise ValueError(
+            "ALLOW_MISSING_GOOD_PMTS is not supported for real-WCTE fits; "
+            "provide an authoritative user or run/DQ good-PMT list"
+        )
 
     # =============================================================================
     # END ROUTINE USER CONFIGURATION
@@ -23133,15 +23546,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     EXACT_STEPS = None
     TIMING_STEPS = None
 
-    # Real WCTE channel mask. Slots 9 and 67 are retained from the historical
-    # real-data driver in addition to the geometry-level WCTE inactive list.
-    REAL_WCTE_DEFAULT_INACTIVE_SLOTS = (27, 32, 45, 74, 77, 79, 85, 91, 99, 9, 67)
-    _inactive_slots_env = os.environ.get("INACTIVE_SLOTS")
-    INACTIVE_SLOTS = (
-        set(REAL_WCTE_DEFAULT_INACTIVE_SLOTS)
-        if _inactive_slots_env is None
-        else set(_env_int_list("INACTIVE_SLOTS", ()))
-    )
+    # Kept as an empty compatibility value for shared emitter/cache interfaces.
+    # The authoritative real-WCTE user/run mask is the sole channel-status mask.
+    INACTIVE_SLOTS = set()
     RING_MASK_MODE = os.environ.get("RING_MASK_MODE", "none").strip().lower()
 
     # Detector-specific optical policies. WCTE keeps its exact prism/reflection
@@ -23757,8 +24164,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     from particle_range_lookup import ParticleRangeLookup
     from wcte_data_loader_adapter import (
         WCTESelectionConfig,
-        load_good_wcte_pmts as load_good_wcte_pmts_via_analysis_tools,
+        authoritative_active_wcte_pmts,
         load_selected_events as load_selected_wcte_events,
+        resolve_good_wcte_pmts,
+    )
+    from wcte_user_event_file import (
+        coerce_event_array as coerce_user_event_array,
+        load_user_event_file as load_validated_user_event_file,
+        source_event_id as validated_source_event_id,
+        source_root_entry_index as validated_source_root_entry_index,
     )
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
@@ -23821,8 +24235,35 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         raise ValueError("invalid WCTE prompt histogram range or bin width")
     if CHARGE_ADC_PER_PE <= 0.0:
         raise ValueError("CHARGE_ADC_PER_PE must be positive")
-    if TIME_REFERENCE_MODE not in {"beam_earliest", "none"}:
-        raise ValueError("WCTE_TIME_REFERENCE_MODE must be beam_earliest or none")
+    if TIME_REFERENCE_MODE == "beam_corrected_mode":
+        TIME_REFERENCE_MODE = "beam_corrected_peak"
+    if TIME_REFERENCE_MODE not in {
+        "beam_earliest", "beam_corrected_peak",
+        "beam_corrected_local_median", "beam_all_median", "none",
+    }:
+        raise ValueError(
+            "WCTE_TIME_REFERENCE_MODE must be beam_corrected_peak, "
+            "beam_corrected_local_median, beam_all_median, beam_earliest, or none"
+        )
+    if TIME_REFERENCE_BIN_WIDTH_NS <= 0.0:
+        raise ValueError("WCTE_TIME_REFERENCE_BIN_WIDTH_NS must be positive")
+    if TIME_REFERENCE_LOCAL_HALF_WIDTH_NS < 0.0:
+        raise ValueError(
+            "WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS must be non-negative"
+        )
+    if CHARGE_NORMALIZATION_MODE not in {"event_mean", "global_scale"}:
+        raise ValueError(
+            "WCTE_CHARGE_NORMALIZATION_MODE must be event_mean or global_scale"
+        )
+    if CHARGE_NORMALIZATION_MODE == "global_scale" and (
+        GLOBAL_CHARGE_SCALE is None
+        or not math.isfinite(float(GLOBAL_CHARGE_SCALE))
+        or float(GLOBAL_CHARGE_SCALE) <= 0.0
+    ):
+        raise ValueError(
+            "WCTE_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
+            "WCTE_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
+        )
     if EVENT_SOURCE == "file" and not USER_EVENT_FILE:
         raise ValueError("EVENT_SOURCE=file requires USER_EVENT_FILE")
 
@@ -23961,6 +24402,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     GOOD_WCTE_PMTS_SET = None
     ACTIVE_WCTE_PMT_IDS = None
     PMT_ID_TO_POSITION = None
+    WCTE_PLACEMENT_FALLBACK_PMT_IDS = set()
     MPMT_INFO = {}
     SLOT_REL_EFF_STACK = None
     REL_EFF_CALIBRATION_METADATA = {}
@@ -23996,68 +24438,111 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
 
     def load_good_wcte_pmts():
-        """Load the run good-channel mask through analysis_tools.DataLoader."""
+        """Resolve the authoritative user or selected-run real-WCTE mask."""
         global WCTE_GOOD_PMT_LOADER_METADATA
         try:
-            good, metadata = load_good_wcte_pmts_via_analysis_tools(
-                CONFIG_ROOT_FILE,
+            good, metadata = resolve_good_wcte_pmts(
+                source=GOOD_PMT_SOURCE,
+                run=int(RUN),
+                good_pmt_file=GOOD_PMT_FILE or None,
+                good_pmt_file_key=GOOD_PMT_FILE_KEY,
+                good_pmt_root_file=GOOD_PMT_ROOT_FILE or None,
+                selection_root_file=CONFIG_ROOT_FILE or None,
+                root_search_bases=GOOD_PMT_ROOT_SEARCH_BASES,
                 analysis_tools_path=ANALYSIS_TOOLS_PATH,
                 project_root=PROJECT_ROOT,
             )
             WCTE_GOOD_PMT_LOADER_METADATA = dict(metadata)
-            setup_print("Loaded good WCTE PMTs through analysis_tools.DataLoader:", CONFIG_ROOT_FILE)
+            setup_print(
+                "Loaded WCTE good-PMT mask:",
+                WCTE_GOOD_PMT_LOADER_METADATA.get("source_resolved"),
+                WCTE_GOOD_PMT_LOADER_METADATA.get(
+                    "file", WCTE_GOOD_PMT_LOADER_METADATA.get("root_file")
+                ),
+            )
             return set(int(value) for value in good)
         except Exception as exc:
-            if not ALLOW_MISSING_GOOD_PMTS:
-                raise RuntimeError(
-                    "Could not load the run good-PMT mask through "
-                    f"analysis_tools.DataLoader from {CONFIG_ROOT_FILE!r}"
-                ) from exc
-            print(
-                "WARNING: analysis_tools could not load the run good-PMT mask; "
-                "using all geometrically present PMTs outside INACTIVE_SLOTS. "
-                "Reason:", repr(exc), flush=True,
-            )
-            WCTE_GOOD_PMT_LOADER_METADATA = {
-                "fallback": True,
-                "reason": repr(exc),
-                "root_file": str(CONFIG_ROOT_FILE),
-            }
-            fallback = set()
-            for slot, module in enumerate(WCD.mpmts):
-                if slot in INACTIVE_SLOTS or module is None:
-                    continue
-                for pmt, sensor in enumerate(module.pmts):
-                    if sensor is not None:
-                        fallback.add(int(slot * 100 + pmt))
-            return fallback
+            raise RuntimeError(
+                "Could not resolve the authoritative real-WCTE good-PMT list. "
+                "Provide WCTE_GOOD_PMT_FILE or select a valid RUN so its "
+                "DQ/merged ROOT can be discovered."
+            ) from exc
 
 
     def _build_active_channel_maps():
-        active = set()
-        positions = {}
+        global WCTE_PLACEMENT_FALLBACK_PMT_IDS
+        geometry_sensors = {}
         for slot, module in enumerate(WCD.mpmts):
-            if slot in INACTIVE_SLOTS or module is None:
+            if module is None:
                 continue
             for pmt, sensor in enumerate(module.pmts):
                 if sensor is None:
                     continue
                 pmt_id = int(slot * 100 + pmt)
-                if pmt_id not in GOOD_WCTE_PMTS_SET:
-                    continue
-                active.add(pmt_id)
-                try:
-                    position = sensor.get_placement(WCTE_PLACEMENT_KEY, WCD)["location"]
-                except Exception:
-                    fallback_key = "design" if WCTE_PLACEMENT_KEY == "est" else "est"
-                    try:
-                        position = sensor.get_placement(fallback_key, WCD)["location"]
-                    except Exception:
-                        position = sensor.get_placement(WCTE_PLACEMENT_KEY)["location"]
-                positions[pmt_id] = np.asarray(position, dtype=np.float64)
-        if not active:
-            raise RuntimeError("No active WCTE PMTs remain after run and inactive-slot masks")
+                geometry_sensors[pmt_id] = sensor
+        active = authoritative_active_wcte_pmts(
+            GOOD_WCTE_PMTS_SET, geometry_sensors
+        )
+        positions = {}
+        for pmt_id in sorted(active):
+            sensor = geometry_sensors[pmt_id]
+            placement, used_key = _wcte_active_sensor_placement(pmt_id, sensor)
+            if used_key != WCTE_PLACEMENT_KEY:
+                WCTE_PLACEMENT_FALLBACK_PMT_IDS.add(int(pmt_id))
+            positions[pmt_id] = np.asarray(placement["location"], dtype=np.float64)
         return active, positions
+
+
+    def _wcte_active_sensor_placement(pmt_id, sensor):
+        """Return requested placement, falling back to design when unsurveyed."""
+        fallback_key = "design" if WCTE_PLACEMENT_KEY == "est" else "est"
+        attempts = []
+        for key, args in (
+            (WCTE_PLACEMENT_KEY, (WCTE_PLACEMENT_KEY, WCD)),
+            (fallback_key, (fallback_key, WCD)),
+            (WCTE_PLACEMENT_KEY, (WCTE_PLACEMENT_KEY,)),
+            (fallback_key, (fallback_key,)),
+        ):
+            try:
+                placement = sensor.get_placement(*args)
+                location = np.asarray(placement["location"], dtype=np.float64)
+                normal = np.asarray(placement["direction_z"], dtype=np.float64)
+                if (
+                    location.shape == (3,) and normal.shape == (3,)
+                    and np.all(np.isfinite(location))
+                    and np.all(np.isfinite(normal))
+                    and float(np.linalg.norm(normal)) > 0.0
+                ):
+                    return placement, key
+            except Exception as exc:
+                attempts.append(f"{key}: {exc!r}")
+        raise RuntimeError(
+            f"No usable detector placement exists for authoritative WCTE PMT "
+            f"{int(pmt_id)}; attempts: {attempts}"
+        )
+
+
+    def _active_wcte_pmt_placements():
+        """Return exact authoritative PMT geometry in stable global-ID order."""
+        locations = []
+        normals = []
+        slots = []
+        for pmt_id in sorted(ACTIVE_WCTE_PMT_IDS):
+            slot = int(pmt_id // 100)
+            pmt = int(pmt_id % 100)
+            sensor = WCD.mpmts[slot].pmts[pmt]
+            placement, used_key = _wcte_active_sensor_placement(pmt_id, sensor)
+            if used_key != WCTE_PLACEMENT_KEY:
+                WCTE_PLACEMENT_FALLBACK_PMT_IDS.add(int(pmt_id))
+            locations.append(np.asarray(placement["location"], dtype=np.float64))
+            normal = np.asarray(placement["direction_z"], dtype=np.float64)
+            normals.append(normal / float(np.linalg.norm(normal)))
+            slots.append(slot)
+        return (
+            np.ascontiguousarray(locations, dtype=np.float64),
+            np.ascontiguousarray(normals, dtype=np.float64),
+            np.ascontiguousarray(slots, dtype=np.int32),
+        )
 
 
     def _build_slot_rel_eff_stack(slot_dict, n_grid=201, n_slots=106, default_ratio=1.0):
@@ -24181,7 +24666,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         event = Event(0, 0, n_mpmt)
         for slot in range(n_mpmt):
             module = WCD.mpmts[slot]
-            module_ok = slot not in INACTIVE_SLOTS and module is not None
+            module_ok = module is not None
             slot_has_active = False
             event.mpmt_status[slot] = False
             for pmt in range(event.npmt_per_mpmt):
@@ -24223,6 +24708,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             candidates.append((float(hit_time), float(hit_time) - distance / speed))
         if not candidates:
             return 0.0
+        corrected = np.asarray([item[1] for item in candidates], dtype=np.float64)
+        if TIME_REFERENCE_MODE == "beam_all_median":
+            return float(np.median(corrected))
+        if TIME_REFERENCE_MODE in {
+            "beam_corrected_peak", "beam_corrected_local_median"
+        }:
+            width = float(TIME_REFERENCE_BIN_WIDTH_NS)
+            lo = math.floor(float(np.min(corrected)) / width) * width - width
+            hi = math.ceil(float(np.max(corrected)) / width) * width + width
+            edges = np.arange(lo, hi + 1.5 * width, width, dtype=np.float64)
+            if edges.size < 2:
+                return float(np.median(corrected))
+            counts, edges = np.histogram(corrected, bins=edges)
+            if counts.size == 0 or int(np.max(counts)) <= 0:
+                return float(np.median(corrected))
+            peak = int(np.argmax(counts))
+            center = float(0.5 * (edges[peak] + edges[peak + 1]))
+            if TIME_REFERENCE_MODE == "beam_corrected_peak":
+                return center
+            half_width = float(TIME_REFERENCE_LOCAL_HALF_WIDTH_NS)
+            local = corrected[np.abs(corrected - center) <= half_width]
+            return float(np.median(local)) if local.size else center
         candidates.sort(key=lambda item: item[0])
         use = candidates[: min(int(TIME_REFERENCE_N_EARLIEST), len(candidates))]
         return float(np.median([item[1] for item in use]))
@@ -26664,6 +27171,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "reflection_in_charge",
             "reflection_bsrff",
             "reflection_pmt_aperture_radius_mm",
+            "charge_normalization_mode",
+            "global_charge_scale",
         )
         configuration: dict[str, object] = {
             "proxy_enable_delta_e": proxy_delta,
@@ -32089,18 +32598,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         }
 
     def _coerce_event_array(event, *, event_label="event"):
-        array = np.asarray(event)
-        if array.ndim != 2 or array.shape[1] < 3:
-            raise ValueError(
-                f"{event_label} must be a 2D array with at least three columns: "
-                "[WCTE PMT ID, charge, calibrated time]."
-            )
-        # Three columns are the minimal user-file contract.  Four-column legacy
-        # files use column 3 as their event identity.  DataLoader-backed events
-        # use five columns: column 3 is the raw ROOT entry and column 4 is the
-        # production event_number.  Never truncate the latter here.
-        n_columns = 5 if array.shape[1] >= 5 else (4 if array.shape[1] >= 4 else 3)
-        return np.asarray(array[:, :n_columns], dtype=np.float64)
+        return coerce_user_event_array(
+            event,
+            event_label=event_label,
+            strict=bool(
+                STRICT_USER_EVENT_VALIDATION if EVENT_SOURCE == "file" else True
+            ),
+        )
 
 
     def _events_from_loaded_object(obj):
@@ -32189,28 +32693,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
 
     def load_user_event_file(path, *, max_events=None):
-        path = Path(path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(path)
-        suffix = path.suffix.lower()
-        if suffix == ".npz":
-            loaded = np.load(path, allow_pickle=True)
-        elif suffix == ".npy":
-            loaded = np.load(path, allow_pickle=True)
-        elif suffix in {".pkl", ".pickle"}:
-            with open(path, "rb") as stream:
-                loaded = pickle.load(stream)
-        else:
-            raise ValueError(
-                f"Unsupported USER_EVENT_FILE suffix {suffix!r}; use npy, npz, pkl, or pickle"
-            )
-        try:
-            events = _events_from_loaded_object(loaded)
-        finally:
-            if isinstance(loaded, np.lib.npyio.NpzFile):
-                loaded.close()
-        if max_events is not None:
-            events = events[: int(max_events)]
+        global WCTE_DATA_LOADER_METADATA
+        events, metadata = load_validated_user_event_file(
+            path,
+            user_event_key=USER_EVENT_KEY,
+            max_events=max_events,
+            strict=bool(STRICT_USER_EVENT_VALIDATION),
+            trusted_internal=bool(INTERNAL_PREPARED_EVENT_FILE),
+        )
+        WCTE_DATA_LOADER_METADATA = dict(metadata)
         print(f"Loaded {len(events)} already-selected WCTE events from: {path}")
         return events
 
@@ -32296,30 +32787,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
 
     def _source_event_id(event, fallback_index):
-        if event.shape[0] > 0:
-            if event.shape[1] >= 5:
-                values = event[:, 4]
-            elif event.shape[1] >= 4:
-                values = event[:, 3]
-            else:
-                values = np.empty(0, dtype=np.float64)
-            finite = values[np.isfinite(values)]
-            if finite.size:
-                return int(finite[0])
-        return int(fallback_index)
+        return validated_source_event_id(event, fallback_index)
 
 
     def _source_root_entry_index(event, fallback_index):
-        # DataLoader-backed events reserve column 3 for the raw
-        # WCTEReadoutWindows entry.  A legacy four-column user file has only one
-        # identity column, so expose it for both identities rather than inventing
-        # a selected-list counter.
-        if event.shape[1] >= 4 and event.shape[0] > 0:
-            values = event[:, 3]
-            finite = values[np.isfinite(values)]
-            if finite.size:
-                return int(finite[0])
-        return int(fallback_index)
+        return validated_source_root_entry_index(event, fallback_index)
 
 
     def prepare_event_observables(raw_event, event_index):
@@ -32641,6 +33113,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 if (FIT_MODE == "absorption" or AUTO_CLIPPED_TRACK) else None
             ),
         )
+        if _UNIFIED_DATA_SOURCE == "wcte":
+            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+            emitter.global_charge_scale = (
+                None if GLOBAL_CHARGE_SCALE is None
+                else float(GLOBAL_CHARGE_SCALE)
+            )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -32688,11 +33166,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         )
         EMITTER_TEMPLATE = emitter.copy()
 
-        # Construct a status-only event to establish the immutable PMT ordering.
-        empty = event_from_wcte_hits([], [], [])
-        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(
-            empty, WCD, WCTE_PLACEMENT_KEY
-        )
+        # Establish the immutable authoritative PMT ordering. Some active modules
+        # lack surveyed placements; those channels use their design geometry.
+        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = _active_wcte_pmt_placements()
         P_LOCATIONS = np.ascontiguousarray(P_LOCATIONS, dtype=np.float64)
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
         PMT_SLOTS = np.ascontiguousarray(PMT_SLOTS, dtype=np.int32)
@@ -32800,8 +33276,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             )
         setup_print("Fixed parameters:", FIXED_PARAMS)
         setup_print("Fixed direction:", None if FIXED_DIRECTION is None else FIXED_DIRECTION.tolist())
-        setup_print("Inactive slots:", sorted(INACTIVE_SLOTS))
+        setup_print("Real-WCTE active-PMT policy: authoritative user/run list")
         setup_print("Good PMTs / active PMTs:", len(GOOD_WCTE_PMTS_SET), len(ACTIVE_WCTE_PMT_IDS))
+        setup_print(
+            "Active PMTs using design-placement fallback:",
+            len(WCTE_PLACEMENT_FALLBACK_PMT_IDS),
+        )
         setup_print("Relative-efficiency calibration:", REL_EFF_CALIBRATION_METADATA)
         setup_print("Photon-scatter receiver:", PHOTON_SCATTER_RECEIVER_STATUS)
         setup_print(
@@ -33718,30 +34198,78 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "n_events_skipped_during_preparation": int(len(SKIPPED_EVENT_RECORDS)),
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
-                    "particle_label": str(PARTICLE_SELECTION_LABEL),
-                    "canonical_particle": str(SELECTION_PARTICLE),
+                    "applied": bool(EVENT_SOURCE == "selection"),
+                    "bypassed_reason": (
+                        None if EVENT_SOURCE == "selection" else
+                        "EVENT_SOURCE=file; input events are assumed preselected"
+                    ),
+                    "particle_label": (
+                        str(PARTICLE_SELECTION_LABEL)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_particle_label": str(PARTICLE_SELECTION_LABEL),
+                    "canonical_particle": (
+                        str(SELECTION_PARTICLE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_canonical_particle": str(SELECTION_PARTICLE),
                     "fit_particle_hypothesis": str(FIT_PARTICLE),
-                    "selection_matches_fit_hypothesis": bool(
+                    "selection_matches_fit_hypothesis": (
+                        bool(SELECTION_MATCHES_FIT_HYPOTHESIS)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_selection_matches_fit_hypothesis": bool(
                         SELECTION_MATCHES_FIT_HYPOTHESIS
                     ),
-                    "loader": "analysis_tools.DataLoader",
-                    "beam_selection": "analysis_tools.BeamSelection",
+                    "loader": (
+                        "analysis_tools.DataLoader"
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "beam_selection": (
+                        "analysis_tools.BeamSelection"
+                        if EVENT_SOURCE == "selection" else None
+                    ),
                     "analysis_tools_path_requested": (
                         str(ANALYSIS_TOOLS_PATH) if ANALYSIS_TOOLS_PATH else None
                     ),
                     "apply_mpmt_data_quality_cuts": bool(
                         APPLY_MPMT_DATA_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_apply_mpmt_data_quality_cuts": bool(
+                        APPLY_MPMT_DATA_QUALITY_CUTS
                     ),
                     "apply_vme_event_quality_cuts": bool(
+                        APPLY_VME_EVENT_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_apply_vme_event_quality_cuts": bool(
                         APPLY_VME_EVENT_QUALITY_CUTS
                     ),
                     "apply_t5_event_quality_cuts": bool(
                         APPLY_T5_EVENT_QUALITY_CUTS
+                        if EVENT_SOURCE == "selection" else False
                     ),
-                    "selection_mode": str(SELECTION_MODE),
-                    "use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
-                    "use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
-                    "tof_cut_mode": str(TOF_CUT_MODE),
+                    "requested_apply_t5_event_quality_cuts": bool(
+                        APPLY_T5_EVENT_QUALITY_CUTS
+                    ),
+                    "selection_mode": (
+                        str(SELECTION_MODE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_selection_mode": str(SELECTION_MODE),
+                    "use_act_eveto_cut": bool(
+                        USE_ACT_EVETO_CUT if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_use_act_eveto_cut": bool(USE_ACT_EVETO_CUT),
+                    "use_act_tagger_cut": bool(
+                        USE_ACT_TAGGER_CUT if EVENT_SOURCE == "selection" else False
+                    ),
+                    "requested_use_act_tagger_cut": bool(USE_ACT_TAGGER_CUT),
+                    "tof_cut_mode": (
+                        str(TOF_CUT_MODE) if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_tof_cut_mode": str(TOF_CUT_MODE),
                     "proton_tof_window_ns": float(PROTON_TOF_WINDOW_NS),
                     "require_muon_tagger": bool(REQUIRE_MUON_TAGGER),
                     "act_eveto_cut_override_pe": ACT_EVETO_CUT_OVERRIDE_PE,
@@ -33784,6 +34312,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     ),
                 },
                 "wcte_data_loader": dict(WCTE_DATA_LOADER_METADATA),
+                "source_identity": (
+                    dict(WCTE_DATA_LOADER_METADATA.get("identity", {}))
+                    if EVENT_SOURCE == "file" else {
+                        "schema": "five_column_distinct_root_entry_and_event_number",
+                        "source_event_id_column": 4,
+                        "source_root_entry_index_column": 3,
+                        "legacy_identity_aliased": False,
+                    }
+                ),
                 "wcte_good_pmt_loader": dict(WCTE_GOOD_PMT_LOADER_METADATA),
                 "real_data_preparation": {
                     "charge_adc_per_pe": float(CHARGE_ADC_PER_PE),
@@ -33805,13 +34342,23 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         TIME_REFERENCE_LIGHT_SPEED_MM_PER_NS
                     ),
                     "time_reference_n_earliest": int(TIME_REFERENCE_N_EARLIEST),
+                    "time_reference_bin_width_ns": float(TIME_REFERENCE_BIN_WIDTH_NS),
+                    "time_reference_local_half_width_ns": float(
+                        TIME_REFERENCE_LOCAL_HALF_WIDTH_NS
+                    ),
+                    "charge_normalization_mode": str(CHARGE_NORMALIZATION_MODE),
+                    "global_charge_scale": (
+                        None if GLOBAL_CHARGE_SCALE is None
+                        else float(GLOBAL_CHARGE_SCALE)
+                    ),
                     "user_event_apply_prompt_window": (
                         bool(USER_EVENT_APPLY_PROMPT_WINDOW)
                         if EVENT_SOURCE == "file" else None
                     ),
                 },
                 "relative_efficiency": dict(REL_EFF_CALIBRATION_METADATA),
-                "inactive_slots": sorted(int(slot) for slot in INACTIVE_SLOTS),
+                "inactive_slots": [],
+                "active_pmt_policy": "authoritative_user_or_run_good_pmt_list",
                 "good_pmt_count": int(len(GOOD_WCTE_PMTS_SET)),
                 "active_pmt_count": int(len(ACTIVE_WCTE_PMT_IDS)),
                 "active_wcte_pmt_ids": sorted(int(value) for value in ACTIVE_WCTE_PMT_IDS),
@@ -33820,6 +34367,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 ),
                 "geometry_file": str(GEOMETRY_FILE),
                 "geometry_placement_key": str(WCTE_PLACEMENT_KEY),
+                "geometry_placement_fallback_key": (
+                    "design" if WCTE_PLACEMENT_KEY == "est" else "est"
+                ),
+                "geometry_placement_fallback_pmt_ids": sorted(
+                    int(value) for value in WCTE_PLACEMENT_FALLBACK_PMT_IDS
+                ),
                 "table_dir": str(TABLE_DIR),
                 "n_events_requested": int(n_events_requested),
                 "n_events_completed": int(n_completed),
@@ -34215,6 +34768,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 )
             input_events = load_input_events()
             _atomic_pickle_object(WCTE_PREPARED_EVENT_FILE, input_events)
+            _atomic_pickle(
+                Path(WCTE_PREPARED_EVENT_FILE).with_name(
+                    Path(WCTE_PREPARED_EVENT_FILE).name + ".metadata.pkl"
+                ),
+                {
+                    "event_source": str(EVENT_SOURCE),
+                    "input_file": (
+                        str(CONFIG_ROOT_FILE)
+                        if EVENT_SOURCE == "selection"
+                        else str(USER_EVENT_FILE)
+                    ),
+                    "config_root_file": str(CONFIG_ROOT_FILE),
+                    "user_event_file": (
+                        str(USER_EVENT_FILE) if EVENT_SOURCE == "file" else None
+                    ),
+                    "user_event_key": (
+                        USER_EVENT_KEY if EVENT_SOURCE == "file" else None
+                    ),
+                    "wcte_data_loader": dict(WCTE_DATA_LOADER_METADATA),
+                    "n_raw_events_materialized": int(len(input_events)),
+                },
+            )
             if not COSMIC_CHILD_QUIET:
                 print(
                     f"Prepared {len(input_events)} raw WCTE events for clean-process "
@@ -34376,6 +34951,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 )
                 print("  geometry placement:", WCTE_PLACEMENT_KEY)
                 print("  relative mPMT efficiency:", REL_EFF_MODE)
+                print(
+                    "  charge normalization:",
+                    CHARGE_NORMALIZATION_MODE, GLOBAL_CHARGE_SCALE,
+                )
                 print(
                     "  prompt window / time reference:",
                     PROMPT_WINDOW_MODE, TIME_REFERENCE_MODE,

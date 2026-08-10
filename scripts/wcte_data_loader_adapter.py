@@ -7,6 +7,8 @@ output.  This module owns only the production ROOT input layer:
   external checkout;
 * use :class:`analysis_tools.DataLoader` for ROOT access and data-quality cuts;
 * use :class:`analysis_tools.BeamSelection` for nominal or custom beam PID;
+* resolve good-PMT masks from a user list or a run DQ/merged ROOT without
+  treating a standalone DQ product as an event stream;
 * preserve both the raw ``WCTEReadoutWindows`` ROOT entry and production
   ``event_number``;
 * convert selected jagged hits to LicketyFit's compact ``N x 5`` table
@@ -33,6 +35,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import importlib
 import inspect
+import json
 import math
 import os
 from pathlib import Path
@@ -48,6 +51,17 @@ DEFAULT_ANALYSIS_TOOLS_PATH = (
 DEFAULT_PRODUCTION_TEMPLATE = (
     "/eos/experiment/wcte/data/2025_commissioning/processed_offline_data/"
     "production_v1_0/{run}/WCTE_merged_production_R{run}.root"
+)
+DEFAULT_GOOD_PMT_ROOT_SEARCH_BASES = (
+    "/eos/experiment/wcte/data/2025_commissioning/processed_offline_data",
+)
+
+_GOOD_PMT_FILE_KEYS = (
+    "good_pmt_ids",
+    "good_wcte_pmts",
+    "pmt_ids",
+    "ids",
+    "arr_0",
 )
 
 _PARTICLE_ALIASES = {
@@ -429,6 +443,233 @@ def production_root_file(run: int, override: str | None = None) -> str:
     return str(override).strip() if override and str(override).strip() else (
         DEFAULT_PRODUCTION_TEMPLATE.format(run=int(run))
     )
+
+
+def _integer_values(values: Any, *, label: str) -> np.ndarray:
+    try:
+        array = np.asarray(values, dtype=np.float64).ravel()
+    except Exception as exc:
+        raise ValueError(f"{label} is not numeric") from exc
+    if array.size == 0:
+        raise ValueError(f"{label} is empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} contains non-finite values")
+    rounded = np.rint(array)
+    if not np.all(array == rounded):
+        examples = array[array != rounded][:5].tolist()
+        raise ValueError(f"{label} must be integer-valued; examples: {examples}")
+    return rounded.astype(np.int64)
+
+
+def _good_pmt_ids_from_payload(payload: Any) -> tuple[set[int], str]:
+    """Normalize global IDs or ``[slot, position]`` pairs."""
+    if isinstance(payload, Mapping):
+        if "slots" in payload and "positions" in payload:
+            slots = _integer_values(payload["slots"], label="good-PMT slots")
+            positions = _integer_values(
+                payload["positions"], label="good-PMT positions"
+            )
+            if slots.size != positions.size:
+                raise ValueError("good-PMT slots and positions have different lengths")
+            array = np.column_stack((slots, positions))
+        else:
+            selected = next((key for key in _GOOD_PMT_FILE_KEYS if key in payload), None)
+            if selected is None:
+                raise KeyError(
+                    "Could not choose a good-PMT array; expected one of "
+                    f"{list(_GOOD_PMT_FILE_KEYS)} or slots+positions, found "
+                    f"{list(payload.keys())}"
+                )
+            payload = payload[selected]
+            array = np.asarray(payload)
+    else:
+        array = np.asarray(payload)
+
+    if array.ndim == 0:
+        array = array.reshape(1)
+    if array.ndim == 1:
+        ids = _integer_values(array, label="good-PMT global IDs")
+        layout = "global_pmt_id"
+    elif array.ndim == 2 and array.shape[1] == 1:
+        ids = _integer_values(array[:, 0], label="good-PMT global IDs")
+        layout = "global_pmt_id"
+    elif array.ndim == 2 and array.shape[1] == 2:
+        slots = _integer_values(array[:, 0], label="good-PMT slots")
+        positions = _integer_values(array[:, 1], label="good-PMT positions")
+        if np.any(slots < 0):
+            raise ValueError("good-PMT slots must be non-negative")
+        if np.any((positions < 0) | (positions > 18)):
+            raise ValueError("good-PMT positions must be in the inclusive range 0..18")
+        ids = slots * 100 + positions
+        layout = "slot_position"
+    else:
+        raise ValueError(
+            "A good-PMT payload must be a one-column global-ID list or a "
+            "two-column [mPMT slot, PMT position] table"
+        )
+
+    if np.any(ids < 0):
+        raise ValueError("good-PMT global IDs must be non-negative")
+    positions = np.mod(ids, 100)
+    if np.any(positions > 18):
+        examples = ids[positions > 18][:5].tolist()
+        raise ValueError(
+            "Global WCTE PMT IDs must use slot*100+position with position 0..18; "
+            f"examples: {examples}"
+        )
+    good = set(int(value) for value in ids)
+    if not good:
+        raise ValueError("The good-PMT list is empty")
+    return good, layout
+
+
+def _text_good_pmt_payload(path: Path) -> np.ndarray:
+    rows: list[list[float]] = []
+    width: int | None = None
+    for line_number, raw in enumerate(path.read_text().splitlines(), start=1):
+        text = raw.split("#", 1)[0].strip()
+        if not text:
+            continue
+        fields = text.replace(",", " ").split()
+        try:
+            values = [float(field) for field in fields]
+        except ValueError:
+            # Permit exactly one ordinary header before any numeric rows.
+            if not rows:
+                continue
+            raise ValueError(
+                f"Non-numeric good-PMT row at {path}:{line_number}: {raw!r}"
+            )
+        if len(values) not in {1, 2}:
+            raise ValueError(
+                f"Good-PMT row {line_number} must contain one global ID or "
+                "two slot/position values"
+            )
+        if width is None:
+            width = len(values)
+        elif width != len(values):
+            raise ValueError("Good-PMT text rows must all have the same column count")
+        rows.append(values)
+    if not rows:
+        raise ValueError(f"Good-PMT text file has no numeric rows: {path}")
+    return np.asarray(rows, dtype=np.float64)
+
+
+def load_good_wcte_pmts_file(
+    path: str | os.PathLike[str], *, key: str | None = None
+) -> tuple[set[int], dict[str, Any]]:
+    """Load a validated user good-PMT list from a small, safe data file."""
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    suffix = source.suffix.lower()
+    selected_key: str | None = None
+    if suffix == ".npy":
+        payload: Any = np.load(source, allow_pickle=False)
+    elif suffix == ".npz":
+        archive = np.load(source, allow_pickle=False)
+        try:
+            files = list(archive.files)
+            if key:
+                selected_key = str(key)
+                if selected_key not in files:
+                    raise KeyError(
+                        f"WCTE_GOOD_PMT_FILE_KEY={selected_key!r} is absent; "
+                        f"available keys are {files}"
+                    )
+            else:
+                selected_key = next(
+                    (name for name in _GOOD_PMT_FILE_KEYS if name in files), None
+                )
+                if selected_key is None and len(files) == 1:
+                    selected_key = files[0]
+                if selected_key is None:
+                    raise KeyError(
+                        "Could not choose a good-PMT NPZ array; available keys "
+                        f"are {files}. Set WCTE_GOOD_PMT_FILE_KEY."
+                    )
+            payload = np.asarray(archive[selected_key])
+        finally:
+            archive.close()
+    elif suffix == ".json":
+        payload = json.loads(source.read_text())
+        if key:
+            if not isinstance(payload, Mapping) or key not in payload:
+                raise KeyError(f"WCTE_GOOD_PMT_FILE_KEY={key!r} is absent")
+            payload = payload[key]
+            selected_key = str(key)
+    elif suffix in {".txt", ".csv"}:
+        payload = _text_good_pmt_payload(source)
+    else:
+        raise ValueError(
+            f"Unsupported WCTE_GOOD_PMT_FILE suffix {suffix!r}; use npy, npz, "
+            "txt, csv, or json"
+        )
+
+    good, layout = _good_pmt_ids_from_payload(payload)
+    stat = source.stat()
+    return good, {
+        "source_requested": "file",
+        "source_resolved": "user_file",
+        "file": str(source),
+        "file_key": selected_key,
+        "file_layout": layout,
+        "file_size_bytes": int(stat.st_size),
+        "file_sha256": _sha256_file(source),
+        "good_pmt_count": int(len(good)),
+    }
+
+
+def _good_pmt_root_candidates(
+    run: int,
+    *,
+    explicit_root_file: str | os.PathLike[str] | None = None,
+    selection_root_file: str | os.PathLike[str] | None = None,
+    search_bases: Sequence[str | os.PathLike[str]] = (),
+) -> list[Path]:
+    """Return bounded EOS candidates, preferring standalone DQ products."""
+    candidates: list[Path] = []
+
+    def add(value: str | os.PathLike[str] | None) -> None:
+        if value is None or not str(value).strip():
+            return
+        path = Path(value).expanduser()
+        if path not in candidates:
+            candidates.append(path)
+
+    if explicit_root_file and str(explicit_root_file).strip():
+        add(explicit_root_file)
+        return candidates
+
+    bases = [Path(value).expanduser() for value in search_bases if str(value).strip()]
+    for default in DEFAULT_GOOD_PMT_ROOT_SEARCH_BASES:
+        path = Path(default)
+        if path not in bases:
+            bases.append(path)
+    patterns = (
+        f"dq_flags/{int(run)}/*.root",
+        f"dq_flags/R{int(run)}/*.root",
+        f"dq_flags/*{int(run)}*.root",
+        f"dq_flags/**/*{int(run)}*.root",
+        f"dq_flags/**/{int(run)}/*.root",
+        f"production_v1_0/{int(run)}/*dq*.root",
+        f"production_v1_0/{int(run)}/*quality*.root",
+        f"*/{int(run)}/*dq*.root",
+        f"*/R{int(run)}/*dq*.root",
+    )
+    for base in bases:
+        if not base.exists():
+            continue
+        for pattern in patterns:
+            try:
+                for match in sorted(base.glob(pattern)):
+                    if match.is_file():
+                        add(match)
+            except OSError:
+                continue
+    add(selection_root_file)
+    add(production_root_file(int(run)))
+    return candidates
 
 
 def _scalar(value: Any, label: str) -> float:
@@ -1108,44 +1349,314 @@ def load_selected_events(
     return (events, metadata) if return_metadata else events
 
 
+def _unwrap_single_configuration_entry(value: Any) -> Any:
+    while isinstance(value, list) and len(value) == 1 and isinstance(
+        value[0], (list, tuple, Mapping)
+    ):
+        value = value[0]
+    return value
+
+
+def _mapping_good_pmt_payload(value: Mapping[str, Any]) -> Any:
+    simplified = {
+        str(key).split("/")[-1].split(".")[-1].lower(): payload
+        for key, payload in value.items()
+    }
+    slot_key = next(
+        (key for key in simplified if "slot" in key or key in {"first", "ffirst"}),
+        None,
+    )
+    position_key = next(
+        (
+            key for key in simplified
+            if "position" in key or key in {"second", "fsecond", "pmt"}
+        ),
+        None,
+    )
+    if slot_key is not None and position_key is not None:
+        return {
+            "slots": simplified[slot_key],
+            "positions": simplified[position_key],
+        }
+    if len(value) == 1:
+        return next(iter(value.values()))
+    return value
+
+
+def _load_good_wcte_pmts_direct_uproot(
+    root_file: str | os.PathLike[str],
+) -> tuple[set[int], dict[str, Any]]:
+    """Read the Configuration mask without requiring an event TTree.
+
+    This path is needed for standalone ``dq_flags`` products, which contain the
+    Configuration tree but deliberately do not contain WCTEReadoutWindows.
+    """
+    try:
+        import awkward as ak
+        import uproot
+    except Exception as exc:
+        raise RuntimeError(
+            "Direct standalone-DQ good-PMT loading requires uproot and awkward"
+        ) from exc
+
+    with uproot.open(str(root_file)) as root:
+        try:
+            configuration = root["Configuration"]
+        except Exception as exc:
+            raise RuntimeError(
+                f"ROOT file {root_file!r} has no Configuration object"
+            ) from exc
+        keys = [str(key).split(";")[0] for key in configuration.keys()]
+        relevant = [key for key in keys if "good_wcte_pmts" in key.lower()]
+        if not relevant:
+            raise RuntimeError(
+                "Configuration contains no branch matching good_wcte_pmts; "
+                f"available branches are {keys}"
+            )
+
+        errors: list[str] = []
+        # A single unsplit vector branch commonly becomes a list of global IDs,
+        # slot/position pairs, or first/second records after ``ak.to_list``.
+        unsplit = [
+            key for key in relevant
+            if key.split("/")[-1].split(".")[-1].lower() == "good_wcte_pmts"
+        ]
+        for key in unsplit:
+            try:
+                payload = ak.to_list(configuration[key].array(entry_stop=1))
+                payload = _unwrap_single_configuration_entry(payload)
+                if isinstance(payload, Mapping):
+                    payload = _mapping_good_pmt_payload(payload)
+                elif isinstance(payload, list) and payload and isinstance(
+                    payload[0], Mapping
+                ):
+                    rows = [_mapping_good_pmt_payload(row) for row in payload]
+                    if all(
+                        isinstance(row, Mapping)
+                        and "slots" in row and "positions" in row
+                        for row in rows
+                    ):
+                        payload = [
+                            [row["slots"], row["positions"]] for row in rows
+                        ]
+                good, layout = _good_pmt_ids_from_payload(payload)
+                return good, {
+                    "source_resolved": "run_root",
+                    "root_file": str(root_file),
+                    "root_loader": "direct_uproot_configuration",
+                    "configuration_branch": key,
+                    "configuration_layout": layout,
+                    "good_pmt_count": int(len(good)),
+                }
+            except Exception as exc:
+                errors.append(f"{key}: {exc!r}")
+
+        # Split C++ record branches are easier to interpret together.
+        try:
+            arrays = configuration.arrays(relevant, entry_stop=1, library="ak")
+            payload = ak.to_list(arrays)
+            payload = _unwrap_single_configuration_entry(payload)
+            if isinstance(payload, Mapping):
+                payload = _mapping_good_pmt_payload(payload)
+            good, layout = _good_pmt_ids_from_payload(payload)
+            return good, {
+                "source_resolved": "run_root",
+                "root_file": str(root_file),
+                "root_loader": "direct_uproot_configuration",
+                "configuration_branches": relevant,
+                "configuration_layout": layout,
+                "good_pmt_count": int(len(good)),
+            }
+        except Exception as exc:
+            errors.append(f"combined branches: {exc!r}")
+    raise RuntimeError(
+        "Could not decode Configuration/good_wcte_pmts with direct Uproot:\n  - "
+        + "\n  - ".join(errors)
+    )
+
+
 def load_good_wcte_pmts(
     root_file: str,
     *,
     analysis_tools_path: str | os.PathLike[str] | None = None,
     project_root: str | os.PathLike[str] | None = None,
 ) -> tuple[set[int], dict[str, Any]]:
-    """Read ``Configuration/good_wcte_pmts`` through ``DataLoader``."""
-    DataLoader, _, import_metadata = import_analysis_tools(
-        explicit_path=analysis_tools_path,
-        project_root=project_root,
-    )
-    loader = DataLoader(str(root_file), branches_to_load=[])
+    """Read ``Configuration/good_wcte_pmts`` from merged or DQ ROOT."""
     try:
-        slots, positions = loader.get_good_wcte_pmts()
-        slots = _to_numpy_1d(slots, np.int64)
-        positions = _to_numpy_1d(positions, np.int64)
-        if slots.size != positions.size:
-            raise RuntimeError("DataLoader returned misaligned good-PMT slot/position arrays")
-        ids = slots * 100 + positions
-        good = set(int(value) for value in ids)
-        if not good:
-            raise RuntimeError("DataLoader Configuration/good_wcte_pmts is empty")
-    finally:
-        loader.file.close()
-    return good, {
-        "root_file": str(root_file),
-        "good_pmt_count": int(len(good)),
-        "analysis_tools": import_metadata,
+        DataLoader, _, import_metadata = import_analysis_tools(
+            explicit_path=analysis_tools_path,
+            project_root=project_root,
+        )
+        loader = DataLoader(str(root_file), branches_to_load=[])
+        try:
+            slots, positions = loader.get_good_wcte_pmts()
+            slots = _to_numpy_1d(slots, np.int64)
+            positions = _to_numpy_1d(positions, np.int64)
+            if slots.size != positions.size:
+                raise RuntimeError(
+                    "DataLoader returned misaligned good-PMT slot/position arrays"
+                )
+            ids = slots * 100 + positions
+            good = set(int(value) for value in ids)
+            if not good:
+                raise RuntimeError("DataLoader Configuration/good_wcte_pmts is empty")
+        finally:
+            loader.file.close()
+        return good, {
+            "source_resolved": "run_root",
+            "root_file": str(root_file),
+            "root_loader": "analysis_tools.DataLoader.get_good_wcte_pmts",
+            "good_pmt_count": int(len(good)),
+            "analysis_tools": import_metadata,
+        }
+    except Exception as data_loader_error:
+        good, metadata = _load_good_wcte_pmts_direct_uproot(root_file)
+        metadata["analysis_tools_loader_error"] = (
+            f"{type(data_loader_error).__name__}: "
+            + str(data_loader_error).splitlines()[0]
+        )
+        return good, metadata
+
+
+def resolve_good_wcte_pmts(
+    *,
+    source: str,
+    run: int,
+    good_pmt_file: str | os.PathLike[str] | None = None,
+    good_pmt_file_key: str | None = None,
+    good_pmt_root_file: str | os.PathLike[str] | None = None,
+    selection_root_file: str | os.PathLike[str] | None = None,
+    root_search_bases: Sequence[str | os.PathLike[str]] = (),
+    analysis_tools_path: str | os.PathLike[str] | None = None,
+    project_root: str | os.PathLike[str] | None = None,
+) -> tuple[set[int], dict[str, Any]]:
+    """Resolve a user mask or a run-derived ROOT mask with full provenance.
+
+    ``source='auto'`` selects the user file when one is supplied and otherwise
+    performs run-root discovery. Geometry-only and missing-mask fallbacks are
+    deliberately rejected: real-WCTE fitting requires an authoritative user or
+    run/DQ list.
+    """
+    requested = str(source).strip().lower().replace("-", "_") or "auto"
+    aliases = {
+        "user": "file",
+        "user_file": "file",
+        "mask": "file",
+        "root": "run",
+        "run_root": "run",
+        "dq": "run",
+        "dq_root": "run",
     }
+    requested = aliases.get(requested, requested)
+    if requested not in {"auto", "file", "run"}:
+        raise ValueError(
+            "WCTE_GOOD_PMT_SOURCE must be auto, file, or run; real-WCTE fits "
+            "require an authoritative user or run/DQ good-PMT list"
+        )
+    resolved_request = requested
+    if requested == "auto":
+        resolved_request = "file" if good_pmt_file and str(good_pmt_file).strip() else "run"
+    if resolved_request == "file":
+        if not good_pmt_file or not str(good_pmt_file).strip():
+            raise ValueError(
+                "WCTE_GOOD_PMT_SOURCE=file requires WCTE_GOOD_PMT_FILE"
+            )
+        good, metadata = load_good_wcte_pmts_file(
+            good_pmt_file, key=good_pmt_file_key
+        )
+        metadata.update({
+            "source_requested": requested,
+            "run": int(run),
+        })
+        return good, metadata
+
+    candidates = _good_pmt_root_candidates(
+        int(run),
+        explicit_root_file=good_pmt_root_file,
+        selection_root_file=selection_root_file,
+        search_bases=root_search_bases,
+    )
+    attempts: list[dict[str, str]] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            attempts.append({"path": str(candidate), "status": "not_found"})
+            continue
+        try:
+            good, metadata = load_good_wcte_pmts(
+                str(candidate),
+                analysis_tools_path=analysis_tools_path,
+                project_root=project_root,
+            )
+        except Exception as exc:
+            attempts.append({
+                "path": str(candidate),
+                "status": "rejected",
+                "reason": repr(exc),
+            })
+            continue
+        attempts.append({"path": str(candidate), "status": "selected"})
+        metadata.update({
+            "source_requested": requested,
+            "source_resolved": "run_root",
+            "run": int(run),
+            "root_discovery_candidates": attempts,
+            "explicit_root_requested": (
+                str(good_pmt_root_file)
+                if good_pmt_root_file and str(good_pmt_root_file).strip()
+                else None
+            ),
+        })
+        return good, metadata
+    detail = "\n  - ".join(
+        f"{row['path']}: {row['status']}"
+        + (f" ({row['reason']})" if "reason" in row else "")
+        for row in attempts
+    )
+    raise RuntimeError(
+        f"Could not resolve Configuration/good_wcte_pmts for WCTE run {int(run)}. "
+        "Set WCTE_GOOD_PMT_ROOT_FILE explicitly or provide "
+        "WCTE_GOOD_PMT_FILE. Candidates:\n  - " + (detail or "none")
+    )
+
+
+def authoritative_active_wcte_pmts(
+    good_pmt_ids: Iterable[int],
+    geometry_pmt_ids: Iterable[int],
+) -> set[int]:
+    """Validate and return the authoritative real-WCTE active-channel set.
+
+    The run/DQ or user mask is the complete active set.  In particular, no
+    WCSim inactive-slot policy is intersected with it.  Geometry is only a
+    consistency requirement: a requested channel must exist in the detector
+    model because the likelihood needs its position and orientation.
+    """
+    requested = {int(value) for value in good_pmt_ids}
+    geometry = {int(value) for value in geometry_pmt_ids}
+    if not requested:
+        raise ValueError("The authoritative real-WCTE good-PMT list is empty")
+    absent = sorted(requested - geometry)
+    if absent:
+        preview = absent[:20]
+        suffix = "" if len(absent) <= len(preview) else " ..."
+        raise ValueError(
+            f"The authoritative real-WCTE good-PMT list contains {len(absent)} "
+            "channel(s) absent from the loaded detector geometry: "
+            f"{preview}{suffix}"
+        )
+    return requested
 
 
 __all__ = [
     "AnalysisToolsImportError",
     "DEFAULT_ANALYSIS_TOOLS_PATH",
+    "DEFAULT_GOOD_PMT_ROOT_SEARCH_BASES",
     "DEFAULT_PRODUCTION_TEMPLATE",
     "WCTESelectionConfig",
+    "authoritative_active_wcte_pmts",
     "import_analysis_tools",
     "load_good_wcte_pmts",
+    "load_good_wcte_pmts_file",
     "load_selected_events",
     "production_root_file",
+    "resolve_good_wcte_pmts",
 ]
