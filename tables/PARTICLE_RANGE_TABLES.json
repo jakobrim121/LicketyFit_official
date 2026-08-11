@@ -1,0 +1,169 @@
+{
+  "files": {
+    "E_vs_dist_cm_kaon.npy": {
+      "bytes": 44208,
+      "sha256": "becccf53dcccf8777706fbbfc4e42a995dc4ecbab690145e2d96dda152f437e4"
+    },
+    "E_vs_dist_cm_pion.npy": {
+      "bytes": 47024,
+      "sha256": "460433fc1a0283e10deb0d77faab3bb97c824582eb197a5b7352421c86afe64c"
+    },
+    "E_vs_dist_cm_proton.npy": {
+      "bytes": 40672,
+      "sha256": "1c2ca4a9270b7fb388e60d8bc8cf1237e2482ef2386eed831639ce9cf49a9bab"
+    },
+    "overall_distances_cm_kaon.npy": {
+      "bytes": 22168,
+      "sha256": "b1b4077646c4ee4d664b27e989c37e88b7343ebde3b799faf4a303f80f2e00dc"
+    },
+    "overall_distances_cm_pion.npy": {
+      "bytes": 23576,
+      "sha256": "7098465f58893fd5d254caace7fea25d56ce5bf0717a7cf9fa6709d7e171de3c"
+    },
+    "overall_distances_cm_proton.npy": {
+      "bytes": 20400,
+      "sha256": "a1782bd1d9c0b0a218b4962e5d6a2b8cd9093fe17149b455f8fa0b9e2fcfcf8d"
+    }
+  },
+  "generated_utc": "2026-08-11T19:05:28.867718+00:00",
+  "particles": {
+    "kaon": {
+      "approximate_subthreshold_csda_range_mm": 560.7,
+      "cherenkov_threshold_kinetic_energy_mev": 245.2203993993279,
+      "energy_step_mev": 1.0,
+      "first_initial_kinetic_energy_mev": 246.0,
+      "last_initial_kinetic_energy_mev": 3000.0,
+      "mass_mev_c2": 493.677,
+      "maximum_above_threshold_range_cm": 1342.814173141486,
+      "method": "PDG Bethe + finite-mass Tmax + Sternheimer density effect; ICRU-90/Geant4 liquid-water I=78 eV",
+      "rows": 2755,
+      "spin": 0.0,
+      "subthreshold_range_use": "Secondary-electron tail only; not part of the fitted range coordinate"
+    },
+    "pion": {
+      "approximate_subthreshold_csda_range_mm": 158.5,
+      "cherenkov_threshold_kinetic_energy_mev": 69.32773205986902,
+      "energy_step_mev": 1.0,
+      "first_initial_kinetic_energy_mev": 70.0,
+      "last_initial_kinetic_energy_mev": 3000.0,
+      "mass_mev_c2": 139.57039,
+      "maximum_above_threshold_range_cm": 1379.8892183857758,
+      "method": "PDG Bethe + finite-mass Tmax + Sternheimer density effect; ICRU-90/Geant4 liquid-water I=78 eV",
+      "rows": 2931,
+      "spin": 0.0,
+      "subthreshold_range_use": "Secondary-electron tail only; not part of the fitted range coordinate"
+    },
+    "proton": {
+      "approximate_subthreshold_csda_range_mm": 1048.2,
+      "cherenkov_threshold_kinetic_energy_mev": 466.0607162250552,
+      "energy_step_mev": 1.0,
+      "first_initial_kinetic_energy_mev": 467.0,
+      "last_initial_kinetic_energy_mev": 3000.0,
+      "mass_mev_c2": 938.27208816,
+      "maximum_above_threshold_range_cm": 1207.4334450230006,
+      "method": "PDG Bethe + finite-mass Tmax + Sternheimer density effect; ICRU-90/Geant4 liquid-water I=78 eV",
+      "rows": 2534,
+      "spin": 0.5,
+      "subthreshold_range_use": "Secondary-electron tail only; not part of the fitted range coordinate"
+    }
+  },
+  "proton_reference_comparison": {
+    "checkpoint_energy_mev": [
+      500.0,
+      1000.0,
+      2000.0,
+      3000.0
+    ],
+    "nominal78_stopping_mev_cm2_g": [
+      2.7315479381942707,
+      2.2006934689052504,
+      2.0040640665474463,
+      1.986872700106571
+    ],
+    "nominal78_visible_range_cm": [
+      12.244298272668138,
+      221.50216049934104,
+      705.051119719214,
+      1207.4334450230006
+    ],
+    "pdg79p7_stopping_mev_cm2_g": [
+      2.7251500282864285,
+      2.19589358926926,
+      1.999971637133386,
+      1.9829764221738144
+    ],
+    "pdg79p7_visible_range_cm": [
+      12.273143463365962,
+      222.00267389631867,
+      706.5705688920231,
+      1209.9589758840889
+    ],
+    "pstar75_stopping_mev_cm2_g": [
+      2.743,
+      2.211,
+      2.021,
+      2.001
+    ],
+    "pstar75_visible_range_cm": [
+      12.191307945375502,
+      220.57914672758906,
+      700.5362023436363,
+      1198.9893039641581
+    ],
+    "stopping_relative_difference_nominal78_minus_pdg79p7": [
+      0.0023477275898329784,
+      0.0021858434577368443,
+      0.002046243725699073,
+      0.0019648634694734487
+    ],
+    "stopping_relative_difference_nominal78_minus_pstar75": [
+      -0.004175013418056588,
+      -0.0046614794639300945,
+      -0.008379976968111639,
+      -0.007060119886771105
+    ],
+    "visible_range_relative_difference_nominal78_minus_pdg79p7": [
+      -0.0023502691697464516,
+      -0.0022545376962953938,
+      -0.0021504563587919803,
+      -0.002087286355508856
+    ],
+    "visible_range_relative_difference_nominal78_minus_pstar75": [
+      0.004346566219971154,
+      0.00418450150635448,
+      0.006444945115574352,
+      0.007042715919920214
+    ]
+  },
+  "pstar_reference": {
+    "note": "Independent evaluated proton comparison. PSTAR material 276 uses the historical I=75 eV convention, versus the nominal modern ICRU-90/Geant4 value I=78 eV.",
+    "path": "tables/reference/pstar_water_liquid_450_3000.npz",
+    "sha256": "00c1bdf90b360e18c302b219aac95ed58e31a740471101d77d090af3cca8dd67"
+  },
+  "semantics": "Electromagnetic CSDA path length in liquid water from initial kinetic energy to the n=1.344 Cherenkov threshold. Hadronic interactions, decays, energy-loss straggling, and multiple scattering are not folded into this deterministic range.",
+  "sources": {
+    "akagi_water_mean_excitation_energy_measurement": "https://doi.org/10.1016/j.radmeas.2007.10.019",
+    "geant4_g4_water_material_source": "https://github.com/Geant4/geant4/blob/master/source/materials/src/G4NistMaterialBuilder.cc",
+    "icru_report_49": "https://www.icru.org/report/stopping-power-and-ranges-for-protons-and-alpha-particles-report-49/",
+    "icru_report_90": "https://www.icru.org/report/icru-report-90-key-data-for-ionizing-radiation-dosimetry-measurement-standards-and-applications/",
+    "nist_pstar": "https://physics.nist.gov/PhysRefData/Star/Text/PSTAR.html",
+    "nist_pstar_water_composition": "https://physics.nist.gov/cgi-bin/Star/compos.pl?matno=276&mode=text&refer=ap",
+    "pdg_liquid_water_properties": "https://pdg.lbl.gov/2023/AtomicNuclearProperties/HTML/water_liquid.html",
+    "pdg_passage_of_particles_through_matter": "https://pdg.lbl.gov/2024/reviews/rpp2024-rev-passage-particles-matter.pdf"
+  },
+  "table_format": "licketyfit_compact_range_v1",
+  "water": {
+    "density_g_cm3": 1.0,
+    "mean_excitation_energy_ev": 78.0,
+    "refractive_index_used_by_licketyfit": 1.344,
+    "sternheimer": {
+      "Cbar": 3.5017,
+      "a": 0.0912,
+      "delta0": 0.0,
+      "m": 3.4773,
+      "x0": 0.24,
+      "x1": 2.8004
+    },
+    "z_over_a_mol_g": 0.55509
+  }
+}

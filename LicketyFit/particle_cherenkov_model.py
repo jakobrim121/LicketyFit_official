@@ -58,6 +58,22 @@ PARTICLE_MASS_MEV = {
     "proton": 938.27208816,
 }
 
+# Approximate electromagnetic CSDA distance after the primary falls below its
+# own Cherenkov threshold.  This tail is used only by the secondary-electron
+# light model; it is not part of the fitted above-threshold range table.
+#
+# The historical 120 mm muon value is preserved exactly.  Pion and kaon values
+# use the heavy-particle velocity scaling R ~ mass at fixed beta; the proton
+# value is the NIST PSTAR liquid-water CSDA range at the n=1.344 threshold.
+# Hadronic interactions and pi/K decay are deliberately not folded into these
+# electromagnetic tail distances.
+PARTICLE_SUBTHRESHOLD_RANGE_MM = {
+    "muon": 120.0,
+    "pion": 158.5,
+    "kaon": 560.7,
+    "proton": 1048.2,
+}
+
 _ACTIVE_PARTICLE = "muon"
 _TABLES_BY_PARTICLE = {}
 _REL_MPMT_EFF_CACHE = None
@@ -102,6 +118,10 @@ def get_active_particle() -> str:
 
 def particle_mass_mev(particle: str | None = None) -> float:
     return float(PARTICLE_MASS_MEV[canonical_particle_name(particle)])
+
+
+def particle_subthreshold_range_mm(particle: str | None = None) -> float:
+    return float(PARTICLE_SUBTHRESHOLD_RANGE_MM[canonical_particle_name(particle)])
 
 
 def cherenkov_threshold_kinetic_mev(particle_or_mass, n: float = 1.344) -> float:
@@ -174,6 +194,106 @@ def _candidate_paths(filename):
     return [os.path.join(d, filename) for d in _table_dirs()]
 
 
+class _CompactTrajectoryTable:
+    """Lazily reconstruct K(s) rows from one monotone range-energy curve.
+
+    Historical LicketyFit tables pickle one complete trajectory for every
+    integer initial energy.  Those rows are all slices of the same CSDA master
+    curve, so storing them explicitly is quadratic in the number of energies.
+    New particle tables instead store a numeric ``(N, 2)`` array containing
+
+        above-threshold range [cm], initial kinetic energy [MeV].
+
+    The two row views below preserve the old ``energy_rows[i]`` and
+    ``distance_rows[i]`` interface.  Only rows actually requested by a fit are
+    materialized, and a small shared cache avoids rebuilding the same row when
+    the distance and energy views are fetched consecutively.
+    """
+
+    def __init__(self, ranges_mm, initial_energies_mev, threshold_mev, max_cache=32):
+        self.ranges_mm = np.ascontiguousarray(ranges_mm, dtype=np.float64)
+        self.initial_energies_mev = np.ascontiguousarray(
+            initial_energies_mev, dtype=np.float64
+        )
+        self.threshold_mev = float(threshold_mev)
+        self.max_cache = max(1, int(max_cache))
+        self._cache = OrderedDict()
+        self.energy_rows = _CompactTrajectoryRowView(self, "energy")
+        self.distance_rows = _CompactTrajectoryRowView(self, "distance")
+
+    def __len__(self):
+        return int(self.initial_energies_mev.size)
+
+    def _normalize_index(self, index):
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return index
+
+    def row(self, index):
+        index = self._normalize_index(index)
+        cached = self._cache.pop(index, None)
+        if cached is not None:
+            self._cache[index] = cached
+            return cached
+
+        # Remaining-range samples run from the selected initial energy down to
+        # the first tabulated energy, followed by the exact physical R=0
+        # Cherenkov-threshold endpoint.
+        remaining_ranges = self.ranges_mm[index::-1]
+        energy = np.empty(index + 2, dtype=np.float64)
+        distance = np.empty(index + 2, dtype=np.float64)
+        energy[:-1] = self.initial_energies_mev[index::-1]
+        energy[-1] = self.threshold_mev
+        distance[:-1] = self.ranges_mm[index] - remaining_ranges
+        distance[-1] = self.ranges_mm[index]
+
+        cached = (
+            np.ascontiguousarray(energy, dtype=np.float64),
+            np.ascontiguousarray(distance, dtype=np.float64),
+        )
+        while len(self._cache) >= self.max_cache:
+            self._cache.popitem(last=False)
+        self._cache[index] = cached
+        return cached
+
+
+class _CompactTrajectoryRowView:
+    """Sequence-like energy or distance view of a compact trajectory table."""
+
+    def __init__(self, table, kind):
+        self._table = table
+        self._kind = str(kind)
+        # Consumers that only need K0 can use this array directly instead of
+        # iterating over every lazily reconstructed trajectory.
+        self.initial_energies_mev = table.initial_energies_mev
+
+    def __len__(self):
+        return len(self._table)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        energy, distance = self._table.row(index)
+        return energy if self._kind == "energy" else distance
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
+def _initial_energies_from_rows(energy_rows):
+    direct = getattr(energy_rows, "initial_energies_mev", None)
+    if direct is not None:
+        return np.asarray(direct, dtype=np.float64)
+    return np.asarray(
+        [np.asarray(energy_rows[i], dtype=np.float64)[0] for i in range(len(energy_rows))],
+        dtype=np.float64,
+    )
+
+
 def _load_rel_mpmt_eff_tables():
     global _REL_MPMT_EFF_CACHE
     if _REL_MPMT_EFF_CACHE is not None:
@@ -217,12 +337,65 @@ def _load_energy_distance_arrays(particle: str):
         overall_paths += _candidate_paths("overall_distances_cm.npy")
 
     E_vs_dist = _load_first_existing(evsd_paths, allow_pickle=True)
-    overall_distances = _load_first_existing(overall_paths, allow_pickle=False) * 10.0
+    overall_distances = np.asarray(
+        _load_first_existing(overall_paths, allow_pickle=False), dtype=np.float64
+    ) * 10.0
+
+    # Compact v1 format: one numeric master curve rather than thousands of
+    # redundant object-array trajectories.  The legacy object format remains
+    # fully supported for the existing muon table and user-supplied tables.
+    if (
+        isinstance(E_vs_dist, np.ndarray)
+        and E_vs_dist.dtype != object
+        and E_vs_dist.ndim == 2
+        and E_vs_dist.shape[1] == 2
+    ):
+        compact_ranges = np.asarray(E_vs_dist[:, 0], dtype=np.float64) * 10.0
+        compact_energies = np.asarray(E_vs_dist[:, 1], dtype=np.float64)
+        if compact_ranges.size != overall_distances.size:
+            raise ValueError(
+                f"Compact range table for {pname} has {compact_ranges.size} rows "
+                f"but overall_distances has {overall_distances.size}."
+            )
+        if not np.allclose(compact_ranges, overall_distances, rtol=0.0, atol=1.0e-8):
+            raise ValueError(
+                f"Compact range columns disagree for {pname}; regenerate both table files together."
+            )
+        if not (
+            np.all(np.isfinite(compact_ranges))
+            and np.all(np.isfinite(compact_energies))
+            and np.all(np.diff(compact_ranges) > 0.0)
+            and np.all(np.diff(compact_energies) > 0.0)
+        ):
+            raise ValueError(f"Compact range table for {pname} is not finite and strictly monotone.")
+
+        threshold = cherenkov_threshold_kinetic_mev(pname)
+        if compact_energies[0] <= threshold or compact_ranges[0] <= 0.0:
+            raise ValueError(
+                f"Compact range table for {pname} must begin above its Cherenkov threshold."
+            )
+        compact = _CompactTrajectoryTable(
+            overall_distances,
+            compact_energies,
+            threshold,
+        )
+        return overall_distances, compact.energy_rows, compact.distance_rows
+
+    if E_vs_dist.dtype != object or E_vs_dist.ndim != 1:
+        raise ValueError(
+            f"Unrecognized E_vs_dist format for {pname}: shape={E_vs_dist.shape}, "
+            f"dtype={E_vs_dist.dtype}."
+        )
+    if len(E_vs_dist) != overall_distances.size:
+        raise ValueError(
+            f"Legacy range table for {pname} has {len(E_vs_dist)} trajectories "
+            f"but {overall_distances.size} overall distances."
+        )
 
     energy_rows = [np.asarray(row[:, 1], dtype=np.float64) for row in E_vs_dist]
     distance_rows = [np.asarray(row[:, 0], dtype=np.float64) * 10.0 for row in E_vs_dist]
 
-    return np.asarray(overall_distances, dtype=np.float64), energy_rows, distance_rows
+    return overall_distances, energy_rows, distance_rows
 
 
 def _analytic_cerenkov_angle_table(particle: str, n: float = 1.344):
@@ -297,9 +470,8 @@ def _ensure_tables_loaded(particle: str | None = None):
         # as interp(r, master_range, master_ke) instead of snapping to the
         # nearest row.  This removes the ~1 MeV / ~5 mm staircase in L.
         "master_range": np.asarray(overall_distances, dtype=np.float64),
-        "master_ke": np.asarray(
-            [np.asarray(energy_rows[i], dtype=np.float64)[0] for i in range(len(overall_distances))],
-            dtype=np.float64,
+        "master_ke": np.ascontiguousarray(
+            _initial_energies_from_rows(energy_rows), dtype=np.float64
         ),
     }
     _TABLES_BY_PARTICLE[pname] = cached

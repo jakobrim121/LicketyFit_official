@@ -290,6 +290,7 @@ try:
         set_active_particle,
         canonical_particle_name,
         particle_mass_mev,
+        particle_subthreshold_range_mm,
         cherenkov_threshold_kinetic_mev,
     )
     from .n_model_wrapper import *
@@ -321,6 +322,7 @@ except ImportError:
         set_active_particle,
         canonical_particle_name,
         particle_mass_mev,
+        particle_subthreshold_range_mm,
         cherenkov_threshold_kinetic_mev,
     )
     from n_model_wrapper import *
@@ -390,6 +392,14 @@ _PMT_RADIUS_CACHE = {}
 _RANGE_FROM_ENERGY_CACHE = {}
 
 
+def _initial_energies_from_table_rows(energy_rows):
+    """Return K0 without expanding compact lazy trajectory rows."""
+    direct = getattr(energy_rows, "initial_energies_mev", None)
+    if direct is not None:
+        return np.asarray(direct, dtype=np.float64)
+    return np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
+
+
 def _get_range_from_energy_arrays(particle):
     """Return cached, ascending (initial_energies, overall_distances) arrays.
 
@@ -402,9 +412,7 @@ def _get_range_from_energy_arrays(particle):
         tables = _get_tables(pname)
         overall_distances = np.asarray(tables[2], dtype=np.float64)
         energy_rows = tables[3]
-        initial_energies = np.asarray(
-            [float(row[0]) for row in energy_rows], dtype=np.float64
-        )
+        initial_energies = _initial_energies_from_table_rows(energy_rows)
         order = np.argsort(initial_energies)
         initial_energies = np.ascontiguousarray(initial_energies[order])
         overall_distances = np.ascontiguousarray(overall_distances[order])
@@ -917,7 +925,7 @@ def _get_particle_tof_antiderivative(emitter):
     tables = _get_tables(pname)
     rr = np.asarray(tables[2], dtype=np.float64)
     energy_rows = tables[3]
-    kk = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
+    kk = _initial_energies_from_table_rows(energy_rows)
     order = np.argsort(rr)
     rr = rr[order]
     kk = kk[order]
@@ -4071,7 +4079,7 @@ def _get_particle_stopping_power_table(particle="muon"):
     energy_rows = _get_tables(pname)[3]
 
     # Initial kinetic energy for each stopping range.
-    E0 = np.asarray([float(row[0]) for row in energy_rows], dtype=np.float64)
+    E0 = _initial_energies_from_table_rows(energy_rows)
 
     order = np.argsort(E0)
     E0 = E0[order]
@@ -5180,7 +5188,12 @@ class Emitter:
             DEFAULT_WCTE_CDS_SPECULAR_TIMING_BINS,
         )
 
-        self.muon_subthreshold_range_mm = 120  # Backward-compatible name: subthreshold tail distance after primary Cherenkov threshold (mm)
+        self.primary_subthreshold_range_mm = particle_subthreshold_range_mm(
+            self.particle_name
+        )
+        # Backward-compatible attribute name used by the secondary-electron
+        # implementation.  Its value is now particle-aware.
+        self.muon_subthreshold_range_mm = self.primary_subthreshold_range_mm
 
         # ---- resolved top-level physics switches (see USER-FACING DEFAULTS above) ----
         self.enable_delta_e = _env_bool_switch("EMITTER_ENABLE_DELTA_E", DEFAULT_ENABLE_DELTA_E, "ENABLE_DELTA_E")
@@ -5699,6 +5712,10 @@ class Emitter:
         set_active_particle(self.particle_name)
         self.particle_mass = particle_mass_mev(self.particle_name)
         self.mu_mass = self.particle_mass  # compatibility alias
+        self.primary_subthreshold_range_mm = particle_subthreshold_range_mm(
+            self.particle_name
+        )
+        self.muon_subthreshold_range_mm = self.primary_subthreshold_range_mm
         self.interp_E_init = None
         self._energy_main_idx = None
         self._energy_dist_row = None
@@ -8292,8 +8309,6 @@ class Emitter:
 
         # Convert to list of tuples
         return [tuple(row) for row in pts_closed]
-
-
 
 
 

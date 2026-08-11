@@ -7,7 +7,7 @@ with charge-only, timing-only, and joint charge-time likelihoods.
 The current public driver release is:
 
 ```text
-2026-08-10-three-mode-nonmcs-universal-v1.21-separate-run-configs
+2026-08-10-three-mode-nonmcs-universal-v1.23-portable-runtime-submodules
 ```
 
 ## Start here
@@ -45,17 +45,57 @@ will retain access to an external service.
 
 ## Installation
 
-Create or activate a Python environment, then install the Python dependencies:
+Clone the repository with its two direct runtime submodules, or initialize them
+in an existing clone:
+
+```bash
+git clone <your-LicketyFit-repository-URL>
+cd LicketyFit_official
+git submodule update --init analysis_tools Geometry
+```
+
+Do not use `--recursive` for normal setup. LicketyFit does not use the nested
+submodules declared by `analysis_tools`, and those repositories may require
+separate credentials. Then create or activate a Python environment and install
+the Python dependencies:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-The release archive includes its detector geometry repository beside this
-directory. The WCTE collaboration-selection workflow additionally needs the
-collaboration `analysis_tools` checkout or installed package. Set
-`ANALYSIS_TOOLS_PATH` near the end of `scripts/run_wcte.py` when it is not in the
-standard CERN location.
+Geometry classes/files are loaded only from the pinned top-level `Geometry`
+submodule. WCTE collaboration loading, beam selection, and run-mask discovery
+are loaded only from the pinned top-level `analysis_tools` submodule. Personal
+checkout paths and globally installed copies are intentionally not used. See
+`SUBMODULE_SETUP.md` for the pinned revisions and verification commands.
+
+## Interactive single-event notebook
+
+`examples/fit_single_event_tutorial.ipynb` is the recommended starting point
+for event-by-event studies. Start Jupyter from the repository root or
+`examples/`, then open the notebook. If the environment does not already supply
+Jupyter, install it separately (for example, `python3 -m pip install jupyterlab`).
+
+The notebook-facing API is `scripts/single_event_fit.py`. It exposes
+`WCTEConfig` and `WCSimConfig`, each of which accepts every public option in the
+matching run launcher. `SingleEventFitter` calls the selected embedded engine in
+`batch_fit_driver.py`; it does not maintain a simplified second fitter. It uses
+the production loaders, active-PMT policy, prompt preparation, seed bank,
+likelihood, optimizer, and final prediction path.
+
+The tutorial demonstrates how to:
+
+- load a small collection with the production WCTE or WCSim loader;
+- select and plot one event with `scripts/plot_event.py`;
+- fit that event while reusing initialized fitter state for later events;
+- inspect the accepted/finite status, FCN, objective evaluations, fit attempts,
+  optimizer sweeps, selected seed, topology, and wall time; and
+- compare PMT-aligned post-cut observed PE/time with expected PE and the model's
+  first-arrival time summary at the final track estimate.
+
+The current optimizer is the track-aligned block/quadratic optimizer, not
+Minuit. The batch field `minuit_valid` is retained only as a historical output
+compatibility alias, so the notebook reports the optimizer's actual diagnostics.
 
 ## Fit modes
 
@@ -71,6 +111,21 @@ Supported fit hypotheses are `muon`, `pion`, `kaon`, and `proton`. The WCTE
 selection adapter can select electron events, but LicketyFit does not currently
 have an electron track hypothesis; an electron-selected sample must be tested
 under an explicitly chosen supported hypothesis.
+
+## Particle range tables
+
+The package now includes working liquid-water range tables for all four fit
+hypotheses. The pion, kaon, and proton tables span every integer initial kinetic
+energy above the species' Cherenkov threshold through 3 GeV. They use the PDG
+Bethe stopping-power treatment with finite-mass and density-effect corrections
+and the modern ICRU-90/Geant4 liquid-water mean excitation energy of 78 eV.
+
+These are electromagnetic CSDA distances from the initial energy down to the
+particle's Cherenkov threshold. They are not hadronic interaction/decay survival
+lengths and are not full ranges to rest. See
+[`docs/PARTICLE_RANGE_TABLES.md`](docs/PARTICLE_RANGE_TABLES.md) for the exact
+definition, checkpoint values, comparison with PDG water constants and NIST
+PSTAR, limitations, reproduction instructions, and source links.
 
 ## Real WCTE data
 
@@ -154,10 +209,11 @@ The package includes contract checks for real-data selection and user files:
 ```bash
 python3 scripts/validate_wcte_selection_controls.py
 python3 scripts/validate_wcte_user_file_controls.py /path/to/events.npy
+python3 scripts/validate_particle_range_tables.py
 ```
 
 Release-level validation and integrity information are supplied in the outer
-archive as `VALIDATION_2026-08-10.txt`, `RELEASE_MANIFEST.txt`, and
+archive as `VALIDATION_2026-08-11.txt`, `RELEASE_MANIFEST.txt`, and
 `SHA256SUMS.txt`.
 
 ## Repository layout
@@ -167,9 +223,12 @@ LicketyFit/                 likelihood, detector, optical, and optimizer modules
 scripts/run_wcte.py         real-WCTE user configuration and launcher
 scripts/run_wcsim.py        WCSim user configuration and launcher
 scripts/batch_fit_driver.py unified implementation used by both launchers
+scripts/single_event_fit.py notebook API for production single-event fits
+scripts/plot_event.py       portable raw/observed/expected event display helper
+examples/fit_single_event_tutorial.ipynb interactive WCTE and WCSim tutorial
 scripts/                    input adapters and validation utilities
 tables/                     range, response, receiver, mapping, and proxy tables
-docs/                       run-2079 investigation sources and supporting material
+docs/                       physics definitions, sources, and supporting material
 ```
 
 ## Important qualification boundary

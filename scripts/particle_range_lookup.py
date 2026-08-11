@@ -161,10 +161,42 @@ class ParticleRangeLookup:
         self.e_vs_dist = np.load(self.e_vs_dist_path, allow_pickle=True)
         self.overall_distances_mm = np.load(self.overall_distances_path) * 10.0
 
-        self.initial_energies_mev = np.asarray(
-            [float(np.asarray(traj)[0, 1]) for traj in self.e_vs_dist],
-            dtype=np.float64,
-        )
+        if (
+            self.e_vs_dist.dtype != object
+            and self.e_vs_dist.ndim == 2
+            and self.e_vs_dist.shape[1] == 2
+        ):
+            compact_ranges_mm = np.asarray(self.e_vs_dist[:, 0], dtype=np.float64) * 10.0
+            self.initial_energies_mev = np.asarray(
+                self.e_vs_dist[:, 1], dtype=np.float64
+            )
+            if compact_ranges_mm.size != self.overall_distances_mm.size or not np.allclose(
+                compact_ranges_mm,
+                self.overall_distances_mm,
+                rtol=0.0,
+                atol=1.0e-8,
+            ):
+                raise ValueError(
+                    f"Compact range columns disagree for {self.particle}; "
+                    "regenerate both table files together."
+                )
+        elif self.e_vs_dist.dtype == object and self.e_vs_dist.ndim == 1:
+            self.initial_energies_mev = np.asarray(
+                [float(np.asarray(traj)[0, 1]) for traj in self.e_vs_dist],
+                dtype=np.float64,
+            )
+        else:
+            raise ValueError(
+                f"Unrecognized E_vs_dist format for {self.particle}: "
+                f"shape={self.e_vs_dist.shape}, dtype={self.e_vs_dist.dtype}."
+            )
+
+        if self.initial_energies_mev.size != self.overall_distances_mm.size:
+            raise ValueError(
+                f"Range table row-count mismatch for {self.particle}: "
+                f"{self.initial_energies_mev.size} energies versus "
+                f"{self.overall_distances_mm.size} distances."
+            )
 
         order = np.argsort(self.initial_energies_mev)
         self.initial_energies_mev = self.initial_energies_mev[order]
