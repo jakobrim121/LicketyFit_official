@@ -60,7 +60,7 @@ USER_EVENT_FILE = ""
 USER_EVENT_KEY = ""
 
 # Selection mode: maximum raw ROOT entries inspected before event selection.
-N_ROOT_ENTRIES = 50_000
+N_ROOT_ENTRIES = 500
 
 # Maximum selected events actually fitted. None means all selected events.
 MAX_EVENTS_TO_FIT = None
