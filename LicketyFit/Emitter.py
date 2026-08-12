@@ -6767,6 +6767,37 @@ class Emitter:
         times = np.where(nodes > 0.0, times, np.inf)
         return np.asarray(nodes, dtype=np.float32), np.asarray(times, dtype=np.float32)
 
+    @staticmethod
+    def _empty_delta_result(
+        n_pmts,
+        *,
+        return_times,
+        return_source_nodes,
+        source_node_active_indices,
+        return_source_node_times,
+    ):
+        """Return zero predictions with the requested delta-result tuple shape."""
+        zeros = np.zeros(int(n_pmts), dtype=np.float64)
+        times = np.full(int(n_pmts), np.nan, dtype=np.float64)
+        if source_node_active_indices is None:
+            n_active = int(n_pmts)
+        else:
+            n_active = int(np.asarray(source_node_active_indices).size)
+        source_mu = np.zeros((0, n_active), dtype=np.float64)
+        source_times = np.zeros((0, n_active), dtype=np.float64)
+        source_s = np.zeros(0, dtype=np.float64)
+        if return_source_nodes:
+            if return_times and return_source_node_times:
+                return zeros, times, source_mu, source_times, source_s
+            if return_times:
+                return zeros, times, source_mu, source_s
+            if return_source_node_times:
+                return zeros, source_mu, source_times, source_s
+            return zeros, source_mu, source_s
+        if return_times:
+            return zeros, times
+        return zeros
+
     def get_delta_e_expected_pes(
         self,
         p_locations,
@@ -6825,10 +6856,13 @@ class Emitter:
         if _src_cached is not None:
             s_centers, ds_cm, K_mu, _any_valid = _src_cached
             if not _any_valid:
-                zeros = np.zeros(n_pmts, dtype=np.float64)
-                if return_times:
-                    return zeros, np.full(n_pmts, np.nan, dtype=np.float64)
-                return zeros
+                return self._empty_delta_result(
+                    n_pmts,
+                    return_times=return_times,
+                    return_source_nodes=return_source_nodes,
+                    source_node_active_indices=source_node_active_indices,
+                    return_source_node_times=return_source_node_times,
+                )
         else:
             s_centers, ds_cm, K_mu, _any_valid = self._build_delta_source_grid()
             if self._delta_src_grid_cache is None:
@@ -6844,10 +6878,13 @@ class Emitter:
                 self._delta_src_grid_cache.pop(next(iter(self._delta_src_grid_cache)))
             self._delta_src_grid_cache[_src_key] = (s_centers, ds_cm, K_mu, _any_valid)
             if not _any_valid:
-                zeros = np.zeros(n_pmts, dtype=np.float64)
-                if return_times:
-                    return zeros, np.full(n_pmts, np.nan, dtype=np.float64)
-                return zeros
+                return self._empty_delta_result(
+                    n_pmts,
+                    return_times=return_times,
+                    return_source_nodes=return_source_nodes,
+                    source_node_active_indices=source_node_active_indices,
+                    return_source_node_times=return_source_node_times,
+                )
 
         # ------------------------------------------------------------
         # DIAGNOSTIC ONLY:
@@ -8309,6 +8346,3 @@ class Emitter:
 
         # Convert to list of tuples
         return [tuple(row) for row in pts_closed]
-
-
-

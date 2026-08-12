@@ -43,7 +43,7 @@ import signal
 import sys
 import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-10-three-mode-nonmcs-universal-v1.23-portable-runtime-submodules"
+UNIFIED_DRIVER_RELEASE = "2026-08-11-three-mode-nonmcs-universal-v1.24-absorption-navigation"
 
 # =============================================================================
 # BACKWARD-COMPATIBILITY FALLBACK DEFAULTS
@@ -1917,7 +1917,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-07-31-standard-autoclip-energy-independent-v1"
+    DRIVER_RELEASE = "2026-08-11-standard-absorption-navigation-v2"
 
     import hashlib
     import json
@@ -2164,6 +2164,31 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     WCTE_GLOBAL_LENGTH_FACTORS = _env_float_list(
         "WCTE_GLOBAL_SEED_LENGTH_FACTORS", (0.25, 0.50, 0.75, 1.00, 1.25, 1.50)
     )
+    # Abrupt endpoints need genuinely short visible-track hypotheses even when
+    # the incident-particle energy (and hence its full CSDA range) is large.  A
+    # nominal-energy-scaled visible-length bank omitted those hypotheses for the
+    # 300 MeV pion sample and made the result depend on the energy-label seed.
+    # Fractions of the configured physical length interval keep this navigation
+    # energy independent and scale it to other detector/analysis geometries.
+    ABSORPTION_VISIBLE_LENGTH_FRACTIONS = _env_float_list(
+        "ABSORPTION_VISIBLE_LENGTH_FRACTIONS",
+        (0.018, 0.036, 0.064, 0.10, 0.143, 0.214, 0.321, 0.429),
+    )
+    ABSORPTION_LENGTH_CHALLENGE_CANDIDATES = max(
+        0, _env_int("ABSORPTION_LENGTH_CHALLENGE_CANDIDATES", 4)
+    )
+    ABSORPTION_EXACT_CHALLENGE_BASINS = max(
+        0, _env_int("ABSORPTION_EXACT_CHALLENGE_BASINS", 2)
+    )
+    ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW = _env_float(
+        "ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW", 250.0
+    )
+    ABSORPTION_EXACT_MIN_LOG_SEPARATION = _env_float(
+        "ABSORPTION_EXACT_MIN_LOG_SEPARATION", 0.18
+    )
+    ABSORPTION_PRIMARY_ENDPOINT_MODEL = os.environ.get(
+        "ABSORPTION_PRIMARY_ENDPOINT_MODEL", "none"
+    ).strip().lower().replace("-", "_")
     WCTE_GLOBAL_PROXY_CANDIDATES = _env_int("WCTE_GLOBAL_PROXY_CANDIDATES", 8)
     WCTE_GLOBAL_CHALLENGE_CANDIDATES = _env_int("WCTE_GLOBAL_CHALLENGE_CANDIDATES", 2)
     WCTE_GLOBAL_PROXY_SWEEPS = _env_int("WCTE_GLOBAL_PROXY_SWEEPS", 1)
@@ -2860,6 +2885,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
         if WCTE_EXPLICIT_LENGTHS_MM:
             raw = [float(value) for value in WCTE_EXPLICIT_LENGTHS_MM]
+        elif FIT_MODE == "absorption":
+            raw = [
+                maximum * float(factor)
+                for factor in ABSORPTION_VISIBLE_LENGTH_FRACTIONS
+            ]
         else:
             raw = [expected_range * float(factor) for factor in WCTE_LENGTH_FACTORS]
             raw.append(expected_range)
@@ -2881,7 +2911,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 maximum, fractions=(0.20, 0.35, 0.50, 0.70, 0.90, 1.0), minimum_mm=1.0
             )
         else:
-            raw = [expected_range_mm * float(factor) for factor in WCTE_LENGTH_FACTORS]
+            raw = [
+                expected_range_mm * float(factor)
+                for factor in WCTE_LENGTH_FACTORS
+            ]
             raw.extend(float(value) for value in visible_lengths)
             raw.append(expected_range_mm)
         cleaned = sorted({
@@ -2992,12 +3025,17 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             global_lengths: list[float] = []
             global_full_ranges: list[float] | None = None
             if WCTE_INCLUDE_DETECTOR_GLOBAL:
+                maximum = float(track_length_limits()[1])
                 if FIT_MODE == "full_length" and "length" in FIXED_PARAMS:
                     global_lengths = [float(FIXED_PARAMS["length"])]
                 elif FIT_MODE == "absorption" and "visible_length" in FIXED_PARAMS:
                     global_lengths = [float(FIXED_PARAMS["visible_length"])]
+                elif FIT_MODE == "absorption":
+                    # Use the same energy-independent abrupt-endpoint support in
+                    # the detector-global family.  The budgeted builder adjusts
+                    # vertex spacing to retain its fixed memory ceiling.
+                    global_lengths = list(lengths)
                 else:
-                    maximum = float(track_length_limits()[1])
                     if FIT_MODE == "full_length" and FULL_LENGTH_CLIP_TO_DETECTOR:
                         global_lengths = list(lengths)
                     else:
@@ -4135,6 +4173,65 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         return [int(row[1]) for row in selected]
 
 
+    def _select_absorption_length_challenges(scores, indices, *, n_keep):
+        """Retain proxy candidates from disconnected abrupt-endpoint basins.
+
+        The usual diversity selector operates mainly in vertex/direction space.
+        In absorption mode that can discard every short visible-length seed even
+        though visible length and initial range move together during the exact
+        fit.  Keep the best geometric seed at each visible-length anchor, then
+        choose logarithmically separated anchors without consulting event truth.
+        """
+        if FIT_MODE != "absorption" or int(n_keep) <= 0:
+            return []
+        best_by_length = {}
+        for index in indices:
+            try:
+                seed = SEEDS[int(index)]
+                visible = float(seed["visible_length"])
+                full_range = float(seed["full_range"])
+                score = float(scores[int(index)])
+            except Exception:
+                continue
+            if not (
+                math.isfinite(visible) and visible > 0.0
+                and math.isfinite(full_range) and full_range >= visible
+                and math.isfinite(score)
+            ):
+                continue
+            key = round(visible, 5)
+            previous = best_by_length.get(key)
+            if previous is None or score < previous[0]:
+                best_by_length[key] = (score, int(index), visible, full_range)
+        rows = sorted(best_by_length.values())
+        if not rows:
+            return []
+        selected = [rows[0]]
+        remaining = rows[1:]
+        while remaining and len(selected) < int(n_keep):
+            base = float(rows[0][0])
+            viable = [row for row in remaining if float(row[0]) <= base + 2500.0]
+            pool = viable if viable else remaining
+
+            def merit(row):
+                separation = min(
+                    math.hypot(
+                        math.log(float(row[2]) / float(keep[2])),
+                        0.35 * math.log(float(row[3]) / float(keep[3])),
+                    )
+                    for keep in selected
+                )
+                return (
+                    separation - 2.0e-4 * max(float(row[0]) - base, 0.0),
+                    -float(row[0]),
+                )
+
+            chosen = max(pool, key=merit)
+            selected.append(chosen)
+            remaining.remove(chosen)
+        return [int(row[1]) for row in selected]
+
+
     def _select_family_diverse(scores, indices, *, n_keep, raw_top):
         if not indices or int(n_keep) <= 0:
             return []
@@ -4158,32 +4255,40 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         best_index = min(local_indices, key=lambda i: float(scores[i]))
         best_family = str(SEEDS[best_index].get("seed_family", ""))
         if best_family == "wcte_orientation_guard":
-            return _select_family_diverse(
+            selected = _select_family_diverse(
                 scores,
                 local_indices,
                 n_keep=max(1, int(PROXY_CANDIDATES)),
                 raw_top=min(4, max(1, int(PROXY_CANDIDATES))),
             )
-
-        selected = _select_family_diverse(
-            scores,
-            beam_indices,
-            n_keep=max(1, int(WCTE_BEAM_PROXY_CANDIDATES)),
-            raw_top=min(4, max(1, int(WCTE_BEAM_PROXY_CANDIDATES))),
-        )
-        used = set(selected)
-        for index in _select_family_diverse(
-            scores,
-            guard_indices,
-            n_keep=max(0, int(WCTE_GUARD_CHALLENGE_CANDIDATES)),
-            raw_top=min(2, max(1, int(WCTE_GUARD_CHALLENGE_CANDIDATES))),
+            used = set(selected)
+        else:
+            selected = _select_family_diverse(
+                scores,
+                beam_indices,
+                n_keep=max(1, int(WCTE_BEAM_PROXY_CANDIDATES)),
+                raw_top=min(4, max(1, int(WCTE_BEAM_PROXY_CANDIDATES))),
+            )
+            used = set(selected)
+            for index in _select_family_diverse(
+                scores,
+                guard_indices,
+                n_keep=max(0, int(WCTE_GUARD_CHALLENGE_CANDIDATES)),
+                raw_top=min(2, max(1, int(WCTE_GUARD_CHALLENGE_CANDIDATES))),
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
+        for index in _select_full_length_range_challenges(
+            scores, beam_indices + guard_indices,
+            n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
         ):
             if index not in used:
                 used.add(index)
                 selected.append(index)
-        for index in _select_full_length_range_challenges(
+        for index in _select_absorption_length_challenges(
             scores, beam_indices + guard_indices,
-            n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
+            n_keep=ABSORPTION_LENGTH_CHALLENGE_CANDIDATES,
         ):
             if index not in used:
                 used.add(index)
@@ -4213,12 +4318,21 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             if best_global <= best_local
             else int(WCTE_GLOBAL_CHALLENGE_CANDIDATES)
         )
-        return _select_family_diverse(
+        selected = _select_family_diverse(
             scores,
             global_indices,
             n_keep=max(1, n_keep),
             raw_top=min(4, max(1, n_keep)),
         )
+        used = set(selected)
+        for index in _select_absorption_length_challenges(
+            scores, global_indices,
+            n_keep=ABSORPTION_LENGTH_CHALLENGE_CANDIDATES,
+        ):
+            if index not in used:
+                used.add(index)
+                selected.append(index)
+        return selected
 
 
     def _select_wcte_quality_candidates(scores):
@@ -4676,6 +4790,74 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             chosen_fit = optimize_candidate_row(candidate_rows[0])
             optimized_basins.append(chosen_fit)
 
+        # In absorption mode, an unoptimized exact seed score is not a reliable
+        # ordering of endpoint basins: visible length and full range are coupled
+        # in the first exact block.  Challenge the provisional solution with a
+        # small number of exact fits from separated length/range anchors.  This
+        # uses only the same reconstructed-event likelihood used for the final
+        # fit; neither the nominal beam energy nor simulation truth participates
+        # in the arbitration.
+        absorption_challenge_diagnostics = []
+        if FIT_MODE == "absorption" and ABSORPTION_EXACT_CHALLENGE_BASINS > 0:
+            already_optimized = {
+                int(item["seed_index"]) for item in optimized_basins
+            }
+            reference_pairs = []
+            for item in optimized_basins:
+                seed = SEEDS[int(item["seed_index"])]
+                reference_pairs.append((
+                    float(seed["visible_length"]), float(seed["full_range"])
+                ))
+            n_challenged = 0
+            for challenge_row in candidate_rows:
+                if n_challenged >= int(ABSORPTION_EXACT_CHALLENGE_BASINS):
+                    break
+                start_fval, challenge_index = (
+                    float(challenge_row[0]), int(challenge_row[1])
+                )
+                if challenge_index in already_optimized:
+                    continue
+                seed = SEEDS[challenge_index]
+                pair = (
+                    float(seed["visible_length"]), float(seed["full_range"])
+                )
+                separation = min(
+                    math.hypot(
+                        math.log(pair[0] / keep[0]),
+                        0.35 * math.log(pair[1] / keep[1]),
+                    )
+                    for keep in reference_pairs
+                )
+                if separation < float(ABSORPTION_EXACT_MIN_LOG_SEPARATION):
+                    continue
+                provisional_fval = float(chosen_fit["result"].fval)
+                if start_fval > (
+                    provisional_fval
+                    + float(ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW)
+                ):
+                    continue
+                challenge_fit = optimize_candidate_row(challenge_row)
+                optimized_basins.append(challenge_fit)
+                already_optimized.add(challenge_index)
+                reference_pairs.append(pair)
+                n_challenged += 1
+                accepted = bool(
+                    float(challenge_fit["result"].fval)
+                    < float(chosen_fit["result"].fval) - 1.0e-9
+                )
+                absorption_challenge_diagnostics.append({
+                    "seed_index": int(challenge_index),
+                    "seed_family": str(challenge_fit["seed_family"]),
+                    "visible_length_seed_mm": float(pair[0]),
+                    "full_range_seed_mm": float(pair[1]),
+                    "log_separation": float(separation),
+                    "exact_start_fval": float(start_fval),
+                    "final_fval": float(challenge_fit["result"].fval),
+                    "accepted": bool(accepted),
+                })
+                if accepted:
+                    chosen_fit = challenge_fit
+
         chosen_row = chosen_fit["row"]
         _, chosen_index, chosen_proxy, start_values, exact_chart, initial_t0_profile = chosen_row
         exact_objective = chosen_fit["objective"]
@@ -4852,6 +5034,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "beam_basin_diagnostics": dict(beam_basin_diagnostics),
                 "optimized_basins": basin_payload,
                 "chosen_family": str(chosen_fit["seed_family"]),
+                "absorption_exact_challenges": absorption_challenge_diagnostics,
             },
             "exact_charge_rerank_nfcn": int(exact_rerank_nfcn),
             "post_stage_validation_nfcn": (
@@ -5126,6 +5309,15 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 else None
             ),
         )
+        if FIT_MODE == "absorption":
+            # The finite-aperture root-overlap gate was developed for the
+            # historical entrance treatment.  Applying that start-scoped gate
+            # to a freely truncated track distorts the abrupt endpoint support,
+            # particularly for high-energy pions.  The ordinary finite-PMT cone
+            # response remains active; only this extra endpoint gate is disabled.
+            emitter.primary_endpoint_model = str(
+                ABSORPTION_PRIMARY_ENDPOINT_MODEL
+            )
         if _UNIFIED_DATA_SOURCE == "wcte":
             emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
             emitter.global_charge_scale = (
@@ -5708,6 +5900,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "proxy_sweeps": int(PROXY_SWEEPS),
                 "proxy_optimizes_length": bool(PROXY_OPTIMIZE_LENGTH),
                 "exact_charge_sweeps": int(EXACT_CHARGE_SWEEPS),
+                "absorption_primary_endpoint_model": (
+                    str(ABSORPTION_PRIMARY_ENDPOINT_MODEL)
+                    if FIT_MODE == "absorption" else None
+                ),
                 "adaptive_exact_polish": bool(ADAPTIVE_EXACT_POLISH),
                 "adaptive_exact_polish_min_last_improvement": float(
                     ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
