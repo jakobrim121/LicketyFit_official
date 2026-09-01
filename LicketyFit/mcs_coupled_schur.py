@@ -10,12 +10,18 @@ No event truth or WCSim-derived response enters this calculation.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 from typing import Sequence
 
 import numpy as np
 
 from .mcs_coherent_objective import FixedTrackCoherentMCSObjective
+from .mcs_curved_path import MCSPhysicalDomainError
+from .mcs_process import (
+    parallel_transport_transverse_basis,
+    stable_transverse_basis,
+)
 
 THETA_NAMES = ("x0", "y0", "z0", "dir_u", "dir_v", "length", "t0")
 DEFAULT_THETA_FD = np.asarray(
@@ -92,6 +98,10 @@ class CoupledCoherentEvaluator:
         sparse_receiver: bool = True,
         sparse_neighbor_radius_mm: float = 100.0,
         charge_only: bool = False,
+        max_cached_models: int = 32,
+        track_end_mode: str = "threshold",
+        full_range_mm: float | None = None,
+        initial_kinetic_energy_mev: float | None = None,
     ):
         n_modes = int(n_modes)
         if n_modes <= 0 or n_modes % 2 != 0:
@@ -121,10 +131,46 @@ class CoupledCoherentEvaluator:
         self.sparse_receiver = bool(sparse_receiver)
         self.sparse_neighbor_radius_mm = float(sparse_neighbor_radius_mm)
         self.charge_only = bool(charge_only)
+        self.max_cached_models = int(max_cached_models)
+        if self.max_cached_models <= 0:
+            raise ValueError("max_cached_models must be positive")
         self.require_contained_track = bool(require_contained_track)
+        end_mode = str(track_end_mode).strip().lower().replace("-", "_")
+        if end_mode in {"absorption", "abrupt", "truncated"}:
+            end_mode = "abrupt"
+        elif end_mode in {"threshold", "full_length", "range"}:
+            end_mode = "threshold"
+        else:
+            raise ValueError(
+                "coupled coherent track_end_mode must be threshold or abrupt"
+            )
+        self.track_end_mode = end_mode
+        self.full_range_mm = (
+            None if full_range_mm is None else float(full_range_mm)
+        )
+        self.initial_kinetic_energy_mev = (
+            None
+            if initial_kinetic_energy_mev is None
+            else float(initial_kinetic_energy_mev)
+        )
+        if self.track_end_mode == "abrupt":
+            if (
+                self.full_range_mm is None
+                or not math.isfinite(self.full_range_mm)
+                or self.full_range_mm <= 0.0
+                or self.initial_kinetic_energy_mev is None
+                or not math.isfinite(self.initial_kinetic_energy_mev)
+                or self.initial_kinetic_energy_mev <= 0.0
+            ):
+                raise ValueError(
+                    "abrupt coherent evaluation requires positive full range "
+                    "and initial kinetic energy"
+                )
         self.length_limits = length_limits
         self.t0_limits = t0_limits
-        self._models: dict[tuple[float, ...], FixedTrackCoherentMCSObjective] = {}
+        self._models: OrderedDict[
+            tuple[float, ...], FixedTrackCoherentMCSObjective
+        ] = OrderedDict()
         self._straight_predictions: dict[tuple[float, ...], tuple] = {}
         self._external_straight_predictions = (
             {} if straight_prediction_cache is None else straight_prediction_cache
@@ -140,6 +186,18 @@ class CoupledCoherentEvaluator:
         self.precomputed_base_context_uses = 0
         self.exact_evaluations = 0
         self.invalid_evaluations = 0
+        self.physical_domain_rejections = 0
+        self.model_build_failures = 0
+        self.model_build_count = 0
+        self.model_cache_evictions = 0
+        self.curved_path_rejections = 0
+        self._evicted_coherent_field_evaluations = 0
+        anchor_direction, anchor_e1, anchor_e2 = stable_transverse_basis(
+            self.chart.anchor
+        )
+        self._frame_anchor_direction = anchor_direction
+        self._frame_anchor_e1 = anchor_e1
+        self._frame_anchor_e2 = anchor_e2
 
     @staticmethod
     def _theta_array(theta: Sequence[float]) -> np.ndarray:
@@ -148,7 +206,10 @@ class CoupledCoherentEvaluator:
 
     @staticmethod
     def _geometry_key(theta: np.ndarray) -> tuple[float, ...]:
-        return tuple(np.round(theta[:6], 12))
+        # The FE grid is numerical quadrature on [0,L], not support for the
+        # fitted geometry.  Keep the native float64 hypothesis in the cache key
+        # so neither length nor any other fitted coordinate is quantized.
+        return tuple(map(float, theta[:6]))
 
     def _valid_theta(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float] | None:
         if np.any(~np.isfinite(theta)):
@@ -163,6 +224,12 @@ class CoupledCoherentEvaluator:
             lo, hi = map(float, self.length_limits)
             if length < lo or length > hi:
                 return None
+        if (
+            self.track_end_mode == "abrupt"
+            and self.full_range_mm is not None
+            and length > float(self.full_range_mm) + 1.0e-7
+        ):
+            return None
         if self.t0_limits is not None:
             lo, hi = map(float, self.t0_limits)
             if t0 < lo or t0 > hi:
@@ -182,13 +249,22 @@ class CoupledCoherentEvaluator:
         key = self._geometry_key(arr)
         cached = self._models.get(key)
         if cached is not None:
+            self._models.move_to_end(key)
             return cached
         vertex, direction, length, _t0 = valid
+        use_precomputed = (
+            self._precomputed_base_key is not None
+            and key == self._precomputed_base_key
+            and self._precomputed_base_emitter is not None
+        )
         try:
-            use_precomputed = (
-                self._precomputed_base_key is not None
-                and key == self._precomputed_base_key
-                and self._precomputed_base_emitter is not None
+            _transported_direction, transported_e1, transported_e2 = (
+                parallel_transport_transverse_basis(
+                    self._frame_anchor_direction,
+                    self._frame_anchor_e1,
+                    self._frame_anchor_e2,
+                    direction,
+                )
             )
             model = FixedTrackCoherentMCSObjective(
                 self.emitter_template,
@@ -201,6 +277,17 @@ class CoupledCoherentEvaluator:
                 vertex=vertex,
                 direction=direction,
                 length=length,
+                full_range_mm=(
+                    self.full_range_mm
+                    if self.track_end_mode == "abrupt"
+                    else None
+                ),
+                initial_kinetic_energy_mev=(
+                    self.initial_kinetic_energy_mev
+                    if self.track_end_mode == "abrupt"
+                    else None
+                ),
+                track_end_mode=self.track_end_mode,
                 t0=0.0,
                 mpmt_types=self.mpmt_types,
                 n_grid=self.n_grid,
@@ -219,14 +306,61 @@ class CoupledCoherentEvaluator:
                 sparse_receiver=self.sparse_receiver,
                 sparse_neighbor_radius_mm=self.sparse_neighbor_radius_mm,
                 charge_only=self.charge_only,
+                transverse_basis=(transported_e1, transported_e2),
+                path_validator=self._curved_path_contained,
             )
             if use_precomputed:
                 self.precomputed_base_context_uses += 1
-        except Exception:
+        except MCSPhysicalDomainError:
+            self.physical_domain_rejections += 1
             self.invalid_evaluations += 1
             return None
+        except (FloatingPointError, OverflowError):
+            # Numerical overflow at a legitimate finite-difference proposal is
+            # an invalid model point, but it is tracked separately from ordinary
+            # detector-boundary rejection.
+            self.model_build_failures += 1
+            self.invalid_evaluations += 1
+            return None
+        self.model_build_count += 1
+        if len(self._models) >= self.max_cached_models:
+            _old_key, old_model = self._models.popitem(last=False)
+            self._evicted_coherent_field_evaluations += int(
+                old_model.curved_evaluations
+            )
+            self.model_cache_evictions += 1
         self._models[key] = model
         return model
+
+    def _curved_path_contained(self, path) -> bool:
+        """Validate every node of the represented coherent polyline.
+
+        Detector volumes used by this evaluator are convex.  Consequently,
+        contained path nodes also certify every linear segment between adjacent
+        nodes, which is the same interpolation used by the FALI quadrature.
+        """
+        try:
+            positions = np.asarray(path["position"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError):
+            self.curved_path_rejections += 1
+            return False
+        contains_many = getattr(self.detector, "contains_many", None)
+        if contains_many is not None:
+            valid = bool(contains_many(positions, tolerance_mm=1.0e-6))
+        else:
+            valid = bool(
+                positions.ndim == 2
+                and positions.shape[1:] == (3,)
+                and positions.shape[0] > 0
+                and np.all(np.isfinite(positions))
+                and all(
+                    self.detector.contains(point, tolerance_mm=1.0e-6)
+                    for point in positions
+                )
+            )
+        if not valid:
+            self.curved_path_rejections += 1
+        return valid
 
     def straight_prediction(
         self, theta: Sequence[float], *, raise_on_model_error: bool = False
@@ -268,10 +402,42 @@ class CoupledCoherentEvaluator:
         try:
             em = self.emitter_template.copy()
             em.store_expected_component_diagnostics = False
+            # Full-length points use the proposed threshold range. Absorption
+            # points keep the separately fitted/fixed initial energy while the
+            # proposed coordinate changes only the abrupt visible support.
+            if hasattr(em, "configure_track_end"):
+                if self.track_end_mode == "abrupt":
+                    em.configure_track_end(
+                        "abrupt",
+                        fixed_initial_KE=self.initial_kinetic_energy_mev,
+                        refresh=False,
+                    )
+                else:
+                    em.configure_track_end(
+                        "threshold", fixed_initial_KE=None, refresh=False
+                    )
+            else:
+                em.track_end_mode = self.track_end_mode
+                em.fixed_initial_KE = (
+                    self.initial_kinetic_energy_mev
+                    if self.track_end_mode == "abrupt"
+                    else None
+                )
             em.start_coord = tuple(vertex)
             em.direction = tuple(direction)
             em.starting_time = 0.0
             kinetic_energy = em.refresh_kinematics_from_length(float(length))
+            if self.track_end_mode == "abrupt":
+                active_range = float(
+                    getattr(em, "range_to_threshold_mm", math.nan)
+                )
+                if abs(active_range - float(self.full_range_mm)) > max(
+                    1.0e-4, 2.0e-6 * float(self.full_range_mm)
+                ):
+                    raise ValueError(
+                        "abrupt coherent emitter range is inconsistent with "
+                        "the requested full range"
+                    )
             sources = em.get_emission_points(self.pmt_positions, kinetic_energy)
             exp_pes, timing = em.get_expected_pes_ts(
                 self.wcd,
@@ -287,7 +453,7 @@ class CoupledCoherentEvaluator:
                 np.asarray(em._last_expected_pes_for_timing, dtype=np.float64),
                 timing,
             )
-        except Exception:
+        except (MCSPhysicalDomainError, FloatingPointError, OverflowError):
             self.invalid_evaluations += 1
             if raise_on_model_error:
                 raise
@@ -310,13 +476,25 @@ class CoupledCoherentEvaluator:
         if np.any(~np.isfinite(u)):
             return float("inf")
         self.exact_evaluations += 1
-        value = float(model.data_nll(u, t0=float(arr[6])))
+        try:
+            value = float(
+                model.charge_data_nll(u)
+                if self.charge_only
+                else model.data_nll(u, t0=float(arr[6]))
+            )
+        except MCSPhysicalDomainError:
+            self.physical_domain_rejections += 1
+            return float("inf")
         if include_prior:
             value += 0.5 * float(u @ u)
         return value if math.isfinite(value) else float("inf")
 
     @property
     def optical_model_build_count(self) -> int:
+        return int(self.model_build_count)
+
+    @property
+    def resident_optical_model_count(self) -> int:
         return len(self._models)
 
     @property
@@ -325,4 +503,7 @@ class CoupledCoherentEvaluator:
 
     @property
     def coherent_field_evaluation_count(self) -> int:
-        return int(sum(model.curved_evaluations for model in self._models.values()))
+        return int(
+            self._evicted_coherent_field_evaluations
+            + sum(model.curved_evaluations for model in self._models.values())
+        )

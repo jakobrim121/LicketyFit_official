@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -48,6 +49,30 @@ extern "C" int lf_scatter_fused_selected(
         double acc = 0.0;
         double acc_ray = 0.0;
         double acc_ram = 0.0;
+        // Timing output is stored as [bin, PMT].  Updating that strided global
+        // array for every quadrature node needlessly bounces among cache lines.
+        // Accumulate the same node sequence in a tiny PMT-local buffer, then
+        // transpose once after the loop.  The arithmetic order within every
+        // bin is unchanged, so this is bitwise equivalent to the reference.
+        // Do not clear all 128 stack doubles for charge-only receiver calls
+        // (nbin == 0), which are the dominant coherent-MCS workload.  For
+        // timing calls initialize exactly the live prefix; the subsequent
+        // node accumulation order and every returned value are unchanged.
+        double local_mu_stack[64];
+        double local_mt_stack[64];
+        std::vector<double> local_mu_heap;
+        std::vector<double> local_mt_heap;
+        double* local_mu = local_mu_stack;
+        double* local_mt = local_mt_stack;
+        if (nbin > 64) {
+            local_mu_heap.assign(static_cast<std::size_t>(nbin), 0.0);
+            local_mt_heap.assign(static_cast<std::size_t>(nbin), 0.0);
+            local_mu = local_mu_heap.data();
+            local_mt = local_mt_heap.data();
+        } else if (nbin > 0) {
+            std::fill_n(local_mu_stack, nbin, 0.0);
+            std::fill_n(local_mt_stack, nbin, 0.0);
+        }
 
         for (int j = 0; j < nn; ++j) {
             const double dx = px - node_pos[3 * j];
@@ -129,14 +154,18 @@ extern "C" int lf_scatter_fused_selected(
                 int ib = static_cast<int>((tt - tmin) / dt);
                 if (ib < 0) ib = 0;
                 else if (ib >= nbin) ib = nbin - 1;
-                const int out_index = ib * nsel + jj;
-                node_mu[out_index] += amp;
-                node_mt[out_index] += amp * tt;
+                local_mu[ib] += amp;
+                local_mt[ib] += amp * tt;
             }
         }
         charge[jj] = acc;
         rayleigh[jj] = acc_ray;
         raman[jj] = acc_ram;
+        for (int ib = 0; ib < nbin; ++ib) {
+            const int out_index = ib * nsel + jj;
+            node_mu[out_index] = local_mu[ib];
+            node_mt[out_index] = local_mt[ib];
+        }
     };
 
 #ifdef _OPENMP

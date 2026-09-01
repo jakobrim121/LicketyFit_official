@@ -1,0 +1,1736 @@
+{
+  "calibration_id": "sha256:34742fd0799c682476edd63a19e2086b0300bd250e90030dcfe09ba630168f86",
+  "calibration_provenance_files_sha256": {
+    "analysis/calibrate_muon_absolute_light.py": "8ce4ea71dcddc472d2e13b9b52f70e930d31c2653ccb203f181df9417179542b",
+    "analysis/wcsim_pe_yield_truth.py": "93ebe5bd7bd95861aea5aac7d6aa5cd71ead8ea0c097efb8de6357514db13138"
+  },
+  "calibration_target": "accepted prompt integration-group photoelectrons before WCSim qpe smearing and SK-I threshold",
+  "charge_likelihood": "compound_spe_calibrated",
+  "charge_normalization": "global_scale",
+  "code_commit": "36cc35b890aecbe174576333f30c62bd133030ec",
+  "detector": "wcsim",
+  "detector_context": {
+    "charge_units": "WCSim digitized PE-equivalent charge",
+    "geometry_metadata": {
+      "axis_limits_mm": [
+        [
+          -1711.0830000000003,
+          1711.0830000000003
+        ],
+        [
+          -1105.4750000000004,
+          1955.0000000000005
+        ],
+        [
+          -1711.0830000000003,
+          1711.0830000000003
+        ]
+      ],
+      "center_mm": [
+        0.0,
+        290.0,
+        0.0
+      ],
+      "geometry_sha256": "87a8b5caad193f0f8d49781b4bdaecf825023b7328f1eefe12de4a3b3cb864f7",
+      "is_wcte_like": true,
+      "kind": "WCTE",
+      "n_active_mpmts": 106,
+      "n_slots": 106,
+      "name": "wcte",
+      "normal_flips": 0
+    },
+    "geometry_sha256": "87a8b5caad193f0f8d49781b4bdaecf825023b7328f1eefe12de4a3b3cb864f7",
+    "kind": "wcsim",
+    "relative_mpmt_efficiency_applied": false
+  },
+  "energy_dependent_scale_used": false,
+  "eventwise_reconstructed_lengths_used_in_calibration": false,
+  "global_charge_scale": 0.00538795978584722,
+  "model_contract": {
+    "analytic_reflection_in_charge": true,
+    "delta_electron_model_matches_each_dataset": true,
+    "digitizer_integration_window_ns": 144.0,
+    "fit_mode": "cosmic",
+    "molecular_transport_matches_each_dataset": true,
+    "prompt_charge_definition": "all accepted PEs in an SK-I integration group whose group start lies inside the fitted prompt digit window",
+    "prompt_window_ns_inclusive": [
+      0.0,
+      17.0
+    ],
+    "range_coordinate": "muon CSDA range to n=1.344 threshold",
+    "scale_scope": "one detector response constant at all energies",
+    "wcsim_reflection_present": true
+  },
+  "model_files_sha256": {
+    "LicketyFit/Emitter.py": "fac8005c33b805e5edd0e9c438474a02682cf7439385a66adfaefedc4a8472a3",
+    "LicketyFit/PMT.py": "8a3050550992751f7005b39922ac70dee3a6461e76b39b363445f6b7124918a5",
+    "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
+    "LicketyFit/wcsim_charge_response.py": "a8fe8de9689a8072d56c00b102bfba7e956fdce88b2be6b02045f7575c4abc6f",
+    "scripts/batch_fit_driver.py": "f556c2da7552cf1842eacfe13f60d0d5ec89593657471fb09cdcfbffce33b15a",
+    "scripts/particle_range_lookup.py": "488ffb4bfae9b66e94e76b022fdc1ee97d465bc1a7eb2ce15e161cda64d14953",
+    "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
+    "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
+  },
+  "operational_domain": {
+    "boundary_exiting_energy_mev_diagnostic_only": [
+      700.0,
+      1000.0
+    ],
+    "near_threshold_warning_mev": [
+      52.48287678503224,
+      75.0
+    ],
+    "stopping_track_energy_mev": [
+      60.0,
+      500.0
+    ]
+  },
+  "particle": "muon",
+  "pmt_charge_response": {
+    "digitizer_charge_factor": 0.985,
+    "digitizer_noise_sigma_pe": 0.03,
+    "implementation_version": 1,
+    "model": "wcsim_r14374_ski",
+    "qpe_cdf_entries": 193,
+    "qpe_excess_kurtosis": 6.646299216541303,
+    "qpe_mean": 1.064800481822164,
+    "qpe_skewness": 1.4439951804573625,
+    "qpe_std": 0.4817725018553043,
+    "wcsim_source_commit": "bc5ca65893ee10dc42259ec541690ec09b15facb"
+  },
+  "scale_freeze_order": "anchor training -> freeze -> anchor development/locked and external validation",
+  "schema": "licketyfit-absolute-light-calibration-v2",
+  "training": {
+    "anchor_partition_summaries": [
+      {
+        "calibrated_predicted_total_pe": 741.1917425656306,
+        "cernbox_path": "mu-/100mu-_200MeV_noE_noScat_noPhotonScat_bp.npz",
+        "diagnostic_implied_scale": 0.0053240497710099295,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.235521030068864,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 25328.025714795207,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.9881383645428895,
+        "excluded_event_ids": [
+          7,
+          36,
+          44,
+          62,
+          73,
+          90,
+          95,
+          98
+        ],
+        "frozen_scale_nll": 25330.90494258224,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/200MeV/bare.npz",
+        "input_sha256": "6acadca9d7a955bc280712dead41f4dd51c58b9973f87c03a0eba496be4979e6",
+        "kinetic_energy_mev": 200.0,
+        "label": "200MeV_clean_anchor:train",
+        "mean_total_true_pe_fractional_residual": -0.011861630480660926,
+        "n_events": 55,
+        "observed_charge_per_predigit_true_pe": 1.0438394897011793,
+        "observed_prompt_predigit_true_pe_mean": 732.4,
+        "observed_prompt_predigit_true_pe_sd": 43.25231742881488,
+        "observed_total_charge_mean": 764.5080422571436,
+        "observed_total_charge_median": 754.2762389183044,
+        "observed_total_charge_sd": 47.68044405870276,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            0.7629847412108575,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 669.8771224334855,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 8020.795992035967,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -6.098455074265985e-13,
+            "primary": 129543.65734938465,
+            "total": 137564.45334142062
+          },
+          "predicted_total_scale_one": 137564.45334142062,
+          "range_table_full_range_mm": 669.8771224334855,
+          "wcsim_position_cm": [
+            0.0,
+            -42.400001525878906,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_train",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing",
+          "selected_mean_visible_arc_mm": 662.6939080913402,
+          "selected_sd_visible_arc_mm": 23.195439252213365
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 741.1917425656306,
+        "cernbox_path": "mu-/100mu-_200MeV_noE_noScat_noPhotonScat_bp.npz",
+        "diagnostic_implied_scale": 0.005357084788448803,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.22933533460939,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 8254.90777098214,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.9942696310615535,
+        "excluded_event_ids": [
+          7,
+          36,
+          44,
+          62,
+          73,
+          90,
+          95,
+          98
+        ],
+        "frozen_scale_nll": 8255.127237651335,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/200MeV/bare.npz",
+        "input_sha256": "6acadca9d7a955bc280712dead41f4dd51c58b9973f87c03a0eba496be4979e6",
+        "kinetic_energy_mev": 200.0,
+        "label": "200MeV_clean_anchor:development",
+        "mean_total_true_pe_fractional_residual": -0.005730363517656301,
+        "n_events": 18,
+        "observed_charge_per_predigit_true_pe": 1.042965446891108,
+        "observed_prompt_predigit_true_pe_mean": 736.9444444444445,
+        "observed_prompt_predigit_true_pe_sd": 45.16306692839942,
+        "observed_total_charge_mean": 768.6075918339193,
+        "observed_total_charge_median": 756.3286617100239,
+        "observed_total_charge_sd": 51.69516563131831,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            0.7629847412108575,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 669.8771224334855,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 8020.795992035967,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -6.098455074265985e-13,
+            "primary": 129543.65734938465,
+            "total": 137564.45334142062
+          },
+          "predicted_total_scale_one": 137564.45334142062,
+          "range_table_full_range_mm": 669.8771224334855,
+          "wcsim_position_cm": [
+            0.0,
+            -42.400001525878906,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_development",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing",
+          "selected_mean_visible_arc_mm": 662.6939080913402,
+          "selected_sd_visible_arc_mm": 23.195439252213365
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 741.1917425656306,
+        "cernbox_path": "mu-/100mu-_200MeV_noE_noScat_noPhotonScat_bp.npz",
+        "diagnostic_implied_scale": 0.005419086555042843,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.217828010013661,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 8645.22281248512,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0057770975346523,
+        "excluded_event_ids": [
+          7,
+          36,
+          44,
+          62,
+          73,
+          90,
+          95,
+          98
+        ],
+        "frozen_scale_nll": 8645.457364844564,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/200MeV/bare.npz",
+        "input_sha256": "6acadca9d7a955bc280712dead41f4dd51c58b9973f87c03a0eba496be4979e6",
+        "kinetic_energy_mev": 200.0,
+        "label": "200MeV_clean_anchor:locked_validation",
+        "mean_total_true_pe_fractional_residual": 0.005777103816717919,
+        "n_events": 19,
+        "observed_charge_per_predigit_true_pe": 1.0437931499084412,
+        "observed_prompt_predigit_true_pe_mean": 745.4736842105264,
+        "observed_prompt_predigit_true_pe_sd": 40.266291969907634,
+        "observed_total_charge_mean": 778.1203250159558,
+        "observed_total_charge_median": 780.1249728500843,
+        "observed_total_charge_sd": 41.63375053957325,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            0.7629847412108575,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 669.8771224334855,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 8020.795992035967,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -6.098455074265985e-13,
+            "primary": 129543.65734938465,
+            "total": 137564.45334142062
+          },
+          "predicted_total_scale_one": 137564.45334142062,
+          "range_table_full_range_mm": 669.8771224334855,
+          "wcsim_position_cm": [
+            0.0,
+            -42.400001525878906,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_locked_validation",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing",
+          "selected_mean_visible_arc_mm": 662.6939080913402,
+          "selected_sd_visible_arc_mm": 23.195439252213365
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 1568.905989486142,
+        "cernbox_path": "mu-/100mu-_300MeV_bp_noE_noScat.npz",
+        "diagnostic_implied_scale": 0.005416105563073611,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.218378252595786,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 1123.784352364586,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.005223828377547,
+        "excluded_event_ids": [
+          34
+        ],
+        "frozen_scale_nll": 1125.0451426733343,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_300MeV_bp_noE_noScat.npz",
+        "input_sha256": "4463446586e5adf0154a2b7f11ae2f36b5a69f6dffafbc9e51eed21c46db2413",
+        "kinetic_energy_mev": 300.0,
+        "label": "300MeV_clean_anchor:train",
+        "mean_total_true_pe_fractional_residual": 0.0052238346236389245,
+        "n_events": 59,
+        "observed_charge_per_predigit_true_pe": 1.045209073560871,
+        "observed_prompt_predigit_true_pe_mean": 1577.1016949152543,
+        "observed_prompt_predigit_true_pe_sd": 77.38566536493879,
+        "observed_total_charge_mean": 1648.4010014536523,
+        "observed_total_charge_median": 1647.8213242590427,
+        "observed_total_charge_sd": 83.5585638169328,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 1171.4771222080642,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 17144.234027933737,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -1.6431300764452317e-13,
+            "primary": 274043.16377099813,
+            "total": 291187.3977989318
+          },
+          "predicted_total_scale_one": 291187.3977989318,
+          "range_table_full_range_mm": 1171.4771222080642,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_train",
+        "truth_reference": {
+          "all_event_mean_visible_arc_mm": 1152.4116027306816,
+          "all_event_sd_visible_arc_mm": 39.94384591666666,
+          "kind": "exact_AllSecondaries_threshold_crossing"
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 1568.905989486142,
+        "cernbox_path": "mu-/100mu-_300MeV_bp_noE_noScat.npz",
+        "diagnostic_implied_scale": 0.005445218264626917,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.213017438069678,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 260.56733483994685,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0106271169525243,
+        "excluded_event_ids": [
+          34
+        ],
+        "frozen_scale_nll": 262.2446666259675,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_300MeV_bp_noE_noScat.npz",
+        "input_sha256": "4463446586e5adf0154a2b7f11ae2f36b5a69f6dffafbc9e51eed21c46db2413",
+        "kinetic_energy_mev": 300.0,
+        "label": "300MeV_clean_anchor:development",
+        "mean_total_true_pe_fractional_residual": 0.01062712360970705,
+        "n_events": 19,
+        "observed_charge_per_predigit_true_pe": 1.0441511110678707,
+        "observed_prompt_predigit_true_pe_mean": 1585.578947368421,
+        "observed_prompt_predigit_true_pe_sd": 62.40042360030159,
+        "observed_total_charge_mean": 1655.584019580562,
+        "observed_total_charge_median": 1655.6356389820576,
+        "observed_total_charge_sd": 65.3526556422802,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 1171.4771222080642,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 17144.234027933737,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -1.6431300764452317e-13,
+            "primary": 274043.16377099813,
+            "total": 291187.3977989318
+          },
+          "predicted_total_scale_one": 291187.3977989318,
+          "range_table_full_range_mm": 1171.4771222080642,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_development",
+        "truth_reference": {
+          "all_event_mean_visible_arc_mm": 1152.4116027306816,
+          "all_event_sd_visible_arc_mm": 39.94384591666666,
+          "kind": "exact_AllSecondaries_threshold_crossing"
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 1568.905989486142,
+        "cernbox_path": "mu-/100mu-_300MeV_bp_noE_noScat.npz",
+        "diagnostic_implied_scale": 0.005444047705364297,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.213232431306202,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 472.080811279302,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.010409862312708,
+        "excluded_event_ids": [
+          34
+        ],
+        "frozen_scale_nll": 473.8598072459281,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_300MeV_bp_noE_noScat.npz",
+        "input_sha256": "4463446586e5adf0154a2b7f11ae2f36b5a69f6dffafbc9e51eed21c46db2413",
+        "kinetic_energy_mev": 300.0,
+        "label": "300MeV_clean_anchor:locked_validation",
+        "mean_total_true_pe_fractional_residual": 0.010409868954163605,
+        "n_events": 21,
+        "observed_charge_per_predigit_true_pe": 1.0498341522636392,
+        "observed_prompt_predigit_true_pe_mean": 1585.2380952380952,
+        "observed_prompt_predigit_true_pe_sd": 69.07669995150664,
+        "observed_total_charge_mean": 1664.237091850312,
+        "observed_total_charge_median": 1660.2273670732975,
+        "observed_total_charge_sd": 78.97792792759205,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 1171.4771222080642,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 17144.234027933737,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": -1.6431300764452317e-13,
+            "primary": 274043.16377099813,
+            "total": 291187.3977989318
+          },
+          "predicted_total_scale_one": 291187.3977989318,
+          "range_table_full_range_mm": 1171.4771222080642,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "anchor_locked_validation",
+        "truth_reference": {
+          "all_event_mean_visible_arc_mm": 1152.4116027306816,
+          "all_event_sd_visible_arc_mm": 39.94384591666666,
+          "kind": "exact_AllSecondaries_threshold_crossing"
+        }
+      }
+    ],
+    "bootstrap": {
+      "replicates": 200,
+      "scale_interval_95": [
+        0.005341856567524783,
+        0.005437222087301293
+      ],
+      "scale_mean": 0.005387231388303941,
+      "scale_sd": 2.638245424491951e-05,
+      "seed": 20260820
+    },
+    "optimization": {
+      "log_scale": -5.223588484113094,
+      "message": "Solution found.",
+      "nfev": 13,
+      "objective_nll": 26455.95008525558,
+      "scale_bounds": [
+        0.0001,
+        0.05
+      ],
+      "success": true,
+      "xatol_log_scale": 1e-09
+    },
+    "plan_file": "/workspace/scratch/d92e6c52f13e/results/calibration/wcsim_muon_multienergy_plan_v2.json",
+    "plan_sha256": "7bf05a31454b22acefe5347ce16426b01493f87c7bcc1bbcac7dd6084ff6bfb7",
+    "split_event_ids": {
+      "200MeV_clean_anchor": {
+        "development": [
+          4,
+          5,
+          8,
+          11,
+          23,
+          24,
+          29,
+          38,
+          39,
+          40,
+          41,
+          64,
+          69,
+          75,
+          79,
+          87,
+          94,
+          96
+        ],
+        "locked_validation": [
+          0,
+          9,
+          12,
+          14,
+          17,
+          27,
+          32,
+          33,
+          49,
+          50,
+          55,
+          63,
+          68,
+          70,
+          76,
+          78,
+          82,
+          89,
+          91
+        ],
+        "train": [
+          1,
+          2,
+          3,
+          6,
+          10,
+          13,
+          15,
+          16,
+          18,
+          19,
+          20,
+          21,
+          22,
+          25,
+          26,
+          28,
+          30,
+          31,
+          34,
+          35,
+          37,
+          42,
+          43,
+          45,
+          46,
+          47,
+          48,
+          51,
+          52,
+          53,
+          54,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          65,
+          66,
+          67,
+          71,
+          72,
+          74,
+          77,
+          80,
+          81,
+          83,
+          84,
+          85,
+          86,
+          88,
+          92,
+          93,
+          97,
+          99
+        ]
+      },
+      "300MeV_clean_anchor": {
+        "development": [
+          0,
+          7,
+          15,
+          20,
+          23,
+          27,
+          39,
+          40,
+          52,
+          56,
+          64,
+          66,
+          69,
+          77,
+          79,
+          83,
+          85,
+          87,
+          94
+        ],
+        "locked_validation": [
+          4,
+          8,
+          14,
+          16,
+          17,
+          21,
+          22,
+          25,
+          28,
+          32,
+          33,
+          47,
+          49,
+          58,
+          63,
+          65,
+          75,
+          76,
+          89,
+          95,
+          97
+        ],
+        "train": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          9,
+          10,
+          11,
+          12,
+          13,
+          18,
+          19,
+          24,
+          26,
+          29,
+          30,
+          31,
+          35,
+          36,
+          37,
+          38,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          48,
+          50,
+          51,
+          53,
+          54,
+          55,
+          57,
+          59,
+          60,
+          61,
+          62,
+          67,
+          68,
+          70,
+          71,
+          72,
+          73,
+          74,
+          78,
+          80,
+          81,
+          82,
+          84,
+          86,
+          88,
+          90,
+          91,
+          92,
+          93,
+          96,
+          98,
+          99
+        ]
+      }
+    },
+    "split_seed": "licketyfit-muon-multienergy-20260820-v2"
+  },
+  "truth_used_in_event_reconstruction": false,
+  "validation": {
+    "external_dataset_summaries": [
+      {
+        "calibrated_predicted_total_pe": 6.753598781234593,
+        "cernbox_path": "mu-/1kmu-_60MeV_x0y0zn1330.npz",
+        "diagnostic_implied_scale": 0.0062178075844757765,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.080337912746255,
+          "message": "Solution found.",
+          "nfev": 12,
+          "objective_nll": 40275.129076570745,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.1540189295414476,
+        "excluded_event_ids": [
+          64,
+          118,
+          187,
+          244,
+          255,
+          358,
+          429,
+          458,
+          593,
+          718,
+          842,
+          912
+        ],
+        "frozen_scale_nll": 40350.48407992967,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/1kmu-_60MeV_x0y0zn1330.npz",
+        "input_sha256": "23a7f52863deb1d8c858f621661c69e9341008b41c77efcf6480578dc3580e8a",
+        "kinetic_energy_mev": 60.0,
+        "label": "60MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": 0.1542803786871371,
+        "n_events": 988,
+        "observed_charge_per_predigit_true_pe": 1.026454093797126,
+        "observed_prompt_predigit_true_pe_mean": 7.795546558704453,
+        "observed_prompt_predigit_true_pe_sd": 3.4776315766387844,
+        "observed_total_charge_mean": 8.001770678568285,
+        "observed_total_charge_median": 7.580623470246792,
+        "observed_total_charge_sd": 3.793254356949002,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1330.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 27.806957913868374,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 61.23990774454815,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 207.4943842988789,
+            "molecular_and_other": 16.99671152395779,
+            "primary": 967.6565512121144,
+            "total": 1253.3875547794992
+          },
+          "predicted_total_scale_one": 1253.3875547794992,
+          "range_table_full_range_mm": 27.806957913868374,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -133.0
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "NPZ_endpoint_proxy_diagnostic",
+          "mean_visible_proxy_mm": 29.14049309255306,
+          "proxy_sd_mm": 3.78810258715215,
+          "range_table_mm": 27.806957913868374
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 36.34511155372722,
+        "cernbox_path": "mu-/1kmu-_75MeV_x0y0zn1330.npz",
+        "diagnostic_implied_scale": 0.005404237334746439,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.220571941501706,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 128981.19092568765,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0030210969543567,
+        "excluded_event_ids": [
+          0,
+          75,
+          296,
+          537,
+          662,
+          665,
+          723,
+          739,
+          790,
+          813,
+          839,
+          980,
+          995
+        ],
+        "frozen_scale_nll": 128981.35446694295,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/1kmu-_75MeV_x0y0zn1330.npz",
+        "input_sha256": "32c530a7abcedf99352db4b27aa9dca70f0387a962dfc6199c9079bd51a6f32b",
+        "kinetic_energy_mev": 75.0,
+        "label": "75MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": 0.0030211030321438664,
+        "n_events": 987,
+        "observed_charge_per_predigit_true_pe": 1.0242737230114434,
+        "observed_prompt_predigit_true_pe_mean": 36.454913880445794,
+        "observed_prompt_predigit_true_pe_sd": 7.23446392089967,
+        "observed_total_charge_mean": 37.33981036238576,
+        "observed_total_charge_median": 36.721287339925766,
+        "observed_total_charge_sd": 7.985939482986366,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1330.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 86.4759515696943,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 419.2346322394197,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 733.3686632615158,
+            "molecular_and_other": 120.13093439919976,
+            "primary": 5472.882478152595,
+            "total": 6745.61670805273
+          },
+          "predicted_total_scale_one": 6745.61670805273,
+          "range_table_full_range_mm": 86.4759515696943,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -133.0
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "NPZ_endpoint_proxy_diagnostic",
+          "mean_visible_proxy_mm": 87.19867562547263,
+          "proxy_sd_mm": 5.525914828737597,
+          "range_table_mm": 86.4759515696943
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 146.68318193798382,
+        "cernbox_path": "mu-/1kmu-_100MeV_x0y0zn1330.npz",
+        "diagnostic_implied_scale": 0.005064994307763738,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.2854022651194885,
+          "message": "Solution found.",
+          "nfev": 12,
+          "objective_nll": 307225.21067306004,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.9400579271337864,
+        "excluded_event_ids": [
+          33,
+          49,
+          97,
+          307,
+          333,
+          369,
+          564,
+          582,
+          698,
+          890,
+          898,
+          919
+        ],
+        "frozen_scale_nll": 307490.9324560878,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/1kmu-_100MeV_x0y0zn1330.npz",
+        "input_sha256": "bfc3613045db93f19a2192a65f9c8f04b3bb8558d36a73c8ac024cb6c0e76993",
+        "kinetic_energy_mev": 100.0,
+        "label": "100MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": -0.059942070813488936,
+        "n_events": 988,
+        "observed_charge_per_predigit_true_pe": 1.030077066443167,
+        "observed_prompt_predigit_true_pe_mean": 137.8906882591093,
+        "observed_prompt_predigit_true_pe_sd": 14.398869788894961,
+        "observed_total_charge_mean": 142.0380356517726,
+        "observed_total_charge_median": 142.51036919653416,
+        "observed_total_charge_sd": 16.013707533714204,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1330.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 192.87712371816585,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 1601.8102658800399,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 1935.2747205258506,
+            "molecular_and_other": 423.4010351852906,
+            "primary": 23263.767270588673,
+            "total": 27224.253292179856
+          },
+          "predicted_total_scale_one": 27224.253292179856,
+          "range_table_full_range_mm": 192.87712371816585,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -133.0
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "NPZ_endpoint_proxy_diagnostic",
+          "mean_visible_proxy_mm": 192.81506020308885,
+          "proxy_sd_mm": 8.139829975532992,
+          "range_table_mm": 192.87712371816585
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 136.25599956922383,
+        "cernbox_path": "mu-/1kmu-_100MeV_x0y0zn1330_noE.npz",
+        "diagnostic_implied_scale": 0.005040363965505112,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.290276984128266,
+          "message": "Solution found.",
+          "nfev": 12,
+          "objective_nll": 270332.8561403535,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.9354865600045581,
+        "excluded_event_ids": [
+          1,
+          130,
+          170,
+          293,
+          425,
+          647,
+          677,
+          879,
+          888,
+          978
+        ],
+        "frozen_scale_nll": 270619.8074546447,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/1kmu-_100MeV_x0y0zn1330_noE.npz",
+        "input_sha256": "a7605465c1f5e2ff145b959890bc9e030a9f57ca8346a838e2b04856874018a2",
+        "kinetic_energy_mev": 100.0,
+        "label": "100MeV_no_delta_electron",
+        "mean_total_true_pe_fractional_residual": -0.06451343817048882,
+        "n_events": 990,
+        "observed_charge_per_predigit_true_pe": 1.0288157991532187,
+        "observed_prompt_predigit_true_pe_mean": 127.46565656565656,
+        "observed_prompt_predigit_true_pe_sd": 14.616649520270196,
+        "observed_total_charge_mean": 131.13868132418568,
+        "observed_total_charge_median": 130.8002805709839,
+        "observed_total_charge_sd": 16.232184251640472,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1330.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 192.87712371816585,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 1601.8102658800399,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": 423.40103518529065,
+            "primary": 23263.767270588673,
+            "total": 25288.978571654003
+          },
+          "predicted_total_scale_one": 25288.978571654003,
+          "range_table_full_range_mm": 192.87712371816585,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -133.0
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "NPZ_endpoint_proxy_diagnostic",
+          "range_table_mm": 192.87712371816585
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 390.6822781751912,
+        "cernbox_path": "mu-/1kmu-_150MeV_x0y0zn1330.npz",
+        "diagnostic_implied_scale": 0.005267706732557879,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.246160166248685,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 570131.5649616477,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.9776811524085213,
+        "excluded_event_ids": [
+          262,
+          360,
+          476,
+          489,
+          566,
+          691,
+          871,
+          927
+        ],
+        "frozen_scale_nll": 570228.818196195,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/1kmu-_150MeV_x0y0zn1330.npz",
+        "input_sha256": "42f82f9b959eb81dcc980cf92a30ee5a487fc3c1e97cb24e90af3d18be918db1",
+        "kinetic_energy_mev": 150.0,
+        "label": "150MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": -0.022318843339952803,
+        "n_events": 992,
+        "observed_charge_per_predigit_true_pe": 1.03653477371951,
+        "observed_prompt_predigit_true_pe_mean": 381.96270161290323,
+        "observed_prompt_predigit_true_pe_sd": 29.723237671538854,
+        "observed_total_charge_mean": 395.9176224856234,
+        "observed_total_charge_median": 393.6737591177225,
+        "observed_total_charge_sd": 31.985474077310105,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1330.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 424.942928579601,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 5566.911066779205,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 5436.656383474784,
+            "molecular_and_other": 1280.4531328414023,
+            "primary": 60226.22331319588,
+            "total": 72510.24389629127
+          },
+          "predicted_total_scale_one": 72510.24389629127,
+          "range_table_full_range_mm": 424.942928579601,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -133.0
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "NPZ_endpoint_proxy_diagnostic",
+          "mean_visible_proxy_mm": 421.3132753055458,
+          "proxy_sd_mm": 13.398275009563022,
+          "range_table_mm": 424.942928579601
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 796.2832477538129,
+        "cernbox_path": "mu-/100mu-_200MeV_x0y0z-1348_cx0cy0cz1.npz",
+        "diagnostic_implied_scale": 0.005418986602856871,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.2178464546549765,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 63436.85496384202,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0057585465079286,
+        "excluded_event_ids": [
+          78
+        ],
+        "frozen_scale_nll": 63438.1595340065,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/200MeV/all_physics.npz",
+        "input_sha256": "219705e94de7039ebc8f604689033796ba6193246f92ce27ca4c205db9453193",
+        "kinetic_energy_mev": 200.0,
+        "label": "200MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": 0.005758552786095518,
+        "n_events": 99,
+        "observed_charge_per_predigit_true_pe": 1.0417450726940205,
+        "observed_prompt_predigit_true_pe_mean": 800.8686868686868,
+        "observed_prompt_predigit_true_pe_sd": 50.49381583970466,
+        "observed_total_charge_mean": 834.3010084203848,
+        "observed_total_charge_median": 830.338694319129,
+        "observed_total_charge_sd": 55.55095957831607,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            0.7629847412108575,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 669.8771224334855,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 8020.795992035967,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 10273.572750538386,
+            "molecular_and_other": 2280.1435203677734,
+            "primary": 127214.86987859567,
+            "total": 147789.3821415378
+          },
+          "predicted_total_scale_one": 147789.3821415378,
+          "range_table_full_range_mm": 669.8771224334855,
+          "wcsim_position_cm": [
+            0.0,
+            -42.400001525878906,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing"
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 1694.0904980127657,
+        "cernbox_path": "mu-/100mu-_300MeV_bp.npz",
+        "diagnostic_implied_scale": 0.005390025458821221,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.2232051707289315,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": 25489.900822659663,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0003833868581253,
+        "excluded_event_ids": [],
+        "frozen_scale_nll": 25489.913271785947,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/300MeV/all_physics.npz",
+        "input_sha256": "dd8f51945c22e88891d8c3c4c106ada9b70db8c65fe14eba704a2be0d442309d",
+        "kinetic_energy_mev": 300.0,
+        "label": "300MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": 0.00038339273373896355,
+        "n_events": 100,
+        "observed_charge_per_predigit_true_pe": 1.0449980524218967,
+        "observed_prompt_predigit_true_pe_mean": 1694.74,
+        "observed_prompt_predigit_true_pe_sd": 72.88216863575414,
+        "observed_total_charge_mean": 1770.9999993614852,
+        "observed_total_charge_median": 1771.9481466934085,
+        "observed_total_charge_sd": 78.75220075334565,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 1171.4771222080642,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 17144.234027933737,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 23385.91197821313,
+            "molecular_and_other": 4348.336576209879,
+            "primary": 269543.03601596394,
+            "total": 314421.51859832066
+          },
+          "predicted_total_scale_one": 314421.51859832066,
+          "range_table_full_range_mm": 1171.4771222080642,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing",
+          "mean_visible_arc_mm": 1157.2413220598469
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 2645.172440308582,
+        "cernbox_path": "mu-/100mu-_400MeV_bp.npz",
+        "diagnostic_implied_scale": 0.005359235893207384,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.228933871299104,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": -53014.137837201124,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 0.994668873974285,
+        "excluded_event_ids": [
+          94
+        ],
+        "frozen_scale_nll": -53010.40989359998,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/400MeV/all_physics.npz",
+        "input_sha256": "a259dec145bcba19faaaf4990259b248244096fbb56439209b95a78b966a524f",
+        "kinetic_energy_mev": 400.0,
+        "label": "400MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": -0.0053311205813975525,
+        "n_events": 99,
+        "observed_charge_per_predigit_true_pe": 1.046137515559652,
+        "observed_prompt_predigit_true_pe_mean": 2631.070707070707,
+        "observed_prompt_predigit_true_pe_sd": 79.71508608472395,
+        "observed_total_charge_mean": 2752.461772756726,
+        "observed_total_charge_median": 2753.823091879487,
+        "observed_total_charge_sd": 88.94987026478951,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 1676.4771217314717,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 25881.680780583796,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 40399.96656871864,
+            "molecular_and_other": 6257.63337309207,
+            "primary": 418402.10441131925,
+            "total": 490941.3851337137
+          },
+          "predicted_total_scale_one": 490941.3851337137,
+          "range_table_full_range_mm": 1676.4771217314717,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "exact_AllSecondaries_threshold_crossing",
+          "mean_visible_arc_mm": 1652.236244788483
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 3640.950534531767,
+        "cernbox_path": "mu-/100mu-_500MeV_bp.npz",
+        "diagnostic_implied_scale": 0.005410866610773446,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.2193460121180095,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": -182415.91228748095,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0042514840193122,
+        "excluded_event_ids": [],
+        "frozen_scale_nll": -182412.62640104926,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_500MeV_bp.npz",
+        "input_sha256": "2ce50a58f00e3797bd226163f26579bb67b0280b52f3db7504c121e8eb4a2c65",
+        "kinetic_energy_mev": 500.0,
+        "label": "500MeV_all_physics",
+        "mean_total_true_pe_fractional_residual": 0.0042514901868128405,
+        "n_events": 100,
+        "observed_charge_per_predigit_true_pe": 1.0472969913626533,
+        "observed_prompt_predigit_true_pe_mean": 3656.43,
+        "observed_prompt_predigit_true_pe_sd": 134.37233473983528,
+        "observed_total_charge_mean": 3829.3681381281467,
+        "observed_total_charge_median": 3829.063658885658,
+        "observed_total_charge_sd": 149.30432970368008,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": false,
+          "modeled_visible_length_mm": 2175.3865736014504,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 35735.05175421263,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 60444.36935977457,
+            "molecular_and_other": 7774.958192082029,
+            "primary": 571802.4338935401,
+            "total": 675756.8131996093
+          },
+          "predicted_total_scale_one": 675756.8131996093,
+          "range_table_full_range_mm": 2175.3865736014504,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "range_table_only"
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 5134.531831486238,
+        "cernbox_path": "mu-/100mu-_700MeV_bp.npz",
+        "diagnostic_implied_scale": 0.005816809260131724,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.147003404666463,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": -588314.0706750986,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.0795940376932622,
+        "excluded_event_ids": [],
+        "frozen_scale_nll": -586729.1648644191,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_700MeV_bp.npz",
+        "input_sha256": "c8249bf9e25833b78fc2281effba531e5628d8d7ebf9773c3403b380153575d3",
+        "kinetic_energy_mev": 700.0,
+        "label": "700MeV_all_physics_boundary_exit",
+        "mean_total_true_pe_fractional_residual": 0.07959404711596975,
+        "n_events": 100,
+        "observed_charge_per_predigit_true_pe": 1.0491709469088035,
+        "observed_prompt_predigit_true_pe_mean": 5543.21,
+        "observed_prompt_predigit_true_pe_sd": 166.86232727199467,
+        "observed_total_charge_mean": 5815.774884614349,
+        "observed_total_charge_median": 5794.748492836952,
+        "observed_total_charge_sd": 179.55277806775698,
+        "physics": {
+          "delta_electrons": true,
+          "molecular_scattering": true
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            7.141113201214466e-06,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": true,
+          "modeled_visible_length_mm": 2791.013030517578,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 47777.48384948205,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 103159.42236718185,
+            "molecular_and_other": 9154.390609485283,
+            "primary": 792872.7258403391,
+            "total": 952964.0226664883
+          },
+          "predicted_total_scale_one": 952964.0226664883,
+          "range_table_full_range_mm": 3163.1719220387886,
+          "wcsim_position_cm": [
+            0.0,
+            -42.47629928588867,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "boundary_exit_diagnostic"
+        }
+      },
+      {
+        "calibrated_predicted_total_pe": 4801.146746786717,
+        "cernbox_path": "mu-/100mu-_1000MeV_noE_noMCS_noPhotonScat_bp_with_exsitu.npz",
+        "diagnostic_implied_scale": 0.005985656889619375,
+        "diagnostic_implied_scale_optimization": {
+          "log_scale": -5.118389190001737,
+          "message": "Solution found.",
+          "nfev": 13,
+          "objective_nll": -432788.6184825022,
+          "scale_bounds": [
+            0.0001,
+            0.05
+          ],
+          "success": true,
+          "xatol_log_scale": 1e-09
+        },
+        "diagnostic_implied_scale_ratio_to_frozen": 1.1109319904989179,
+        "excluded_event_ids": [
+          22
+        ],
+        "frozen_scale_nll": -429966.5537851942,
+        "input_file": "/workspace/scratch/d92e6c52f13e/data/calibration/full/100mu-_1000MeV_noE_noMCS_noPhotonScat_bp_with_exsitu.npz",
+        "input_sha256": "074ffb6ba3b0cbfafdf17daa7cc533d99a834567283d33a7b933f10c585faaa8",
+        "kinetic_energy_mev": 1000.0,
+        "label": "1000MeV_clean_boundary_exit_with_exsitu",
+        "mean_total_true_pe_fractional_residual": 0.11093198272208891,
+        "n_events": 99,
+        "observed_charge_per_predigit_true_pe": 1.0489126120045753,
+        "observed_prompt_predigit_true_pe_mean": 5333.747474747474,
+        "observed_prompt_predigit_true_pe_sd": 71.52227331602879,
+        "observed_total_charge_mean": 5594.6349955101805,
+        "observed_total_charge_median": 5590.403083011508,
+        "observed_total_charge_sd": 79.83673103305281,
+        "physics": {
+          "delta_electrons": false,
+          "molecular_scattering": false
+        },
+        "prediction": {
+          "coordinate_offset_mm": [
+            0.0,
+            424.7629999999999,
+            0.0
+          ],
+          "detector_start_mm": [
+            0.0,
+            0.7629847412108575,
+            -1348.0000305175781
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "exits_detector": true,
+          "modeled_visible_length_mm": 2791.013869345271,
+          "predicted_components_scale_one": {
+            "blacksheet_reflection": 51311.59829582105,
+            "cds_specular_reflection": 0.0,
+            "delta_electron": 0.0,
+            "molecular_and_other": 1.580957587066223e-13,
+            "primary": 839776.4828361298,
+            "total": 891088.081131951
+          },
+          "predicted_total_scale_one": 891088.081131951,
+          "range_table_full_range_mm": 4612.47712190415,
+          "wcsim_position_cm": [
+            0.0,
+            -42.400001525878906,
+            -134.8000030517578
+          ]
+        },
+        "role": "external_validation",
+        "truth_reference": {
+          "kind": "boundary_exit_exsitu_diagnostic"
+        }
+      }
+    ],
+    "interpretation": "diagnostic implied optical scales use pre-digit PE truth only after the anchor scale is frozen and never alter it"
+  },
+  "wcte_transfer": {
+    "emission_model_transferable": true,
+    "required_wcte_recalibration": "fit a WCTE-specific global scale after ADC-to-PE conversion, active-PMT masking, and the selected mPMT relative-efficiency correction",
+    "wcsim_global_scale_transferable": false
+  }
+}

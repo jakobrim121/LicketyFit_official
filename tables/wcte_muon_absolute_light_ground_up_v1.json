@@ -1,0 +1,181 @@
+{
+  "calibration_basis": "ground_up_mathematical",
+  "calibration_id": "sha256:83af47207218529f9c9b2bb8da2a632254fddf16a967abb69366705c0f912be1",
+  "calibration_provenance_files_sha256": {
+    "analysis/build_ground_up_light_manifests.py": "b4f4639f85aa4fdab20d7f9688ed9e20fcc2eb7647fbb20ffc98d52530676e1f"
+  },
+  "calibration_target": "estimated accepted prompt beam-muon-equivalent photoelectrons before SPE smearing and threshold",
+  "charge_likelihood": "compound_spe_calibrated",
+  "charge_normalization": "global_scale",
+  "detector": "wcte",
+  "detector_context": {
+    "active_channels": "realized from the authoritative run/user mask",
+    "kind": "wcte",
+    "pmt_model": "R14374 nominal unboosted QE",
+    "qe_policy": "do not apply either WCSim QE multiplier"
+  },
+  "energy_dependent_scale_used": false,
+  "eventwise_reconstructed_lengths_used_in_calibration": false,
+  "global_charge_scale": 0.0029867614452669554,
+  "ground_up_light_model": {
+    "all_charged_detected_pe": 1177.3616892905302,
+    "all_charged_frank_tamm_photons": 85275.486,
+    "calibration_data_used": false,
+    "event_truth_used_in_reconstruction": false,
+    "gel_transmission": 0.9790935,
+    "geometric_acceptance": 0.1871995814,
+    "global_charge_scale": 0.0029867614452669554,
+    "include_wcsim_qe_boosts": false,
+    "licketyfit_accepted_reflection_scale_one_pe": 17144.234027933733,
+    "licketyfit_direct_scale_one_pe": 297277.2845703869,
+    "licketyfit_reflection_scale_one_pe": 17144.234027933733,
+    "licketyfit_scale_one_pe": 314421.51859832066,
+    "model_version": 2,
+    "pmt_object_qe_boost": 1.0,
+    "primary_frank_tamm_photons": 68018.5079,
+    "prompt_detected_pe": 939.1020693117512,
+    "prompt_primary_fraction": 0.7976326033486341,
+    "prompt_target_policy": "all-primary detected light is used as a data-independent proxy for total prompt-group light; late primary loss and prompt secondary gain are not fitted separately",
+    "prompt_target_proxy_is_exact": false,
+    "prompt_target_proxy_uncertainty_included_in_systematic": true,
+    "qe_times_collection_efficiency": 0.08348307375,
+    "reference_kinetic_energy_mev": 300.0,
+    "reference_response_file": "tables/ground_up_reference_response_v2.npz",
+    "reference_response_sha256": "b6743a1bf45b94ddb210dd95ba5be541a0d7cc4741dfee958d39e75302013df1",
+    "reflection_charge_policy": "unconditional",
+    "reflection_group_gate_assumption": "the selected prompt integration group is opened by at least one non-reflected prompt PE; reflection-only prompt group starts are neglected",
+    "relative_systematic_uncertainty": 0.05,
+    "sensitive_detector_qe_boost": 1.0,
+    "total_qe_boost": 1.0,
+    "unboosted_qe_times_collection_efficiency": 0.08348307375,
+    "water_transmission": 0.9023151,
+    "wcsim_source_commit": "bc5ca65893ee10dc42259ec541690ec09b15facb"
+  },
+  "model_contract": {
+    "analytic_reflection_charge_policy": "unconditional",
+    "analytic_reflection_in_charge": true,
+    "analytic_reflection_in_first_arrival_timing": true,
+    "digitizer_integration_window_ns": 144.0,
+    "fit_mode": "general",
+    "prompt_reflection_policy": "unconditional analytic reflected-charge component",
+    "prompt_secondary_policy": "all-primary detected light is a data-independent proxy for total prompt-group light; the declared engineering systematic covers incomplete cancellation of late primary and prompt secondary light",
+    "prompt_window_ns_inclusive": [
+      0.0,
+      17.0
+    ],
+    "range_coordinate": "muon CSDA range to n=1.344 threshold",
+    "scale_scope": "one nominal per-sensor optical response constant"
+  },
+  "model_files_sha256": {
+    "LicketyFit/Emitter.py": "309e225054d51f053215f9338ce27ea1a5e559e22bc33391af950de7603d748a",
+    "LicketyFit/PMT.py": "003e8d7f9d5839e64279f8556cd818af32d8bd0093ab2c527a59068c29c7bd20",
+    "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
+    "LicketyFit/ground_up_light_calibration.py": "433cf6fc895f3407e75d8e48fb00a826d618e79f3f4878eaae16ac87247c9a59",
+    "LicketyFit/wcsim_charge_response.py": "a8fe8de9689a8072d56c00b102bfba7e956fdce88b2be6b02045f7575c4abc6f",
+    "scripts/batch_fit_driver.py": "7efc56c8fd0652a7f939e2931522c22c949bf9ea59e91423cc20fc7570d5f1c3",
+    "scripts/particle_range_lookup.py": "488ffb4bfae9b66e94e76b022fdc1ee97d465bc1a7eb2ce15e161cda64d14953",
+    "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
+    "tables/ground_up_reference_response_v2.npz": "b6743a1bf45b94ddb210dd95ba5be541a0d7cc4741dfee958d39e75302013df1",
+    "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
+  },
+  "operational_domain": {
+    "precision_policy": "engineering estimate only; prefer measured calibration for precision energy reconstruction",
+    "recommended_stopping_muon_energy_mev": [
+      100.0,
+      500.0
+    ],
+    "reference_kinetic_energy_mev": 300.0
+  },
+  "particle": "muon",
+  "pmt_charge_response": {
+    "amp_threshold_pe": 0.2,
+    "model": "gaussian_censored",
+    "single_pe_amp_mean": 1.0,
+    "single_pe_amp_std": 0.3
+  },
+  "post_calibration_code_rebindings": [
+    {
+      "date": "2026-08-28",
+      "file": "LicketyFit/PMT.py",
+      "new_sha256": "003e8d7f9d5839e64279f8556cd818af32d8bd0093ab2c527a59068c29c7bd20",
+      "old_sha256": "8a3050550992751f7005b39922ac70dee3a6461e76b39b363445f6b7124918a5",
+      "reason": "Likelihood-evaluation-only rebind: v1.41 batches exact first-arrival response variants, rejects timing-ineligible PMTs before sorting, and reduces every variant in the historical non-reassociated PMT order. It preserves the bitwise scalar per-variant likelihood, WCTE charge prediction, detector response, and frozen mathematical scale.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-28",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "54a3d71d3d4ec85b2d5f53506c53b45f68ec034592088d4a620a12c04b64bd97",
+      "old_sha256": "f556c2da7552cf1842eacfe13f60d0d5ec89593657471fb09cdcfbffce33b15a",
+      "reason": "Release-provenance-only rebind: the public driver label identifies v1.41 coherent-runtime optimization. WCTE loading, active masks, per-mPMT efficiencies, timing selection, optical target, and frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-30",
+      "file": "LicketyFit/Emitter.py",
+      "new_sha256": "9161e8d738b259a2b94c6aba63b795a9b8968c77379b9f6a709fd84fd4716115",
+      "old_sha256": "fac8005c33b805e5edd0e9c438474a02682cf7439385a66adfaefedc4a8472a3",
+      "reason": "Absorption-only prediction-path rebind: the source adds the opt-in event-mean uniform contamination profile and finite-end bridge used for pion absorption. The calibrated cosmic-muon configuration keeps the contamination model off and the legacy endpoint path, so its photon prediction and frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-30",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "ae4097acfdaf857c7b77fd3e7fed6de0028bb2c9cab38adcb5930d86205a657a",
+      "old_sha256": "54a3d71d3d4ec85b2d5f53506c53b45f68ec034592088d4a620a12c04b64bd97",
+      "reason": "Absorption-only orchestration rebind: the driver adds pion-absorption fast12 state plumbing, contamination diagnostics, and output fields. The calibrated cosmic-muon engine, charge prediction, detector response, event selection, and frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-31",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "dd8c0630395d67d706f90485551686d607d1804b66ee2ffb9be87c8124f1d812",
+      "old_sha256": "ae4097acfdaf857c7b77fd3e7fed6de0028bb2c9cab38adcb5930d86205a657a",
+      "reason": "WCSim/WCTE parity-audit rebind: the driver removes dead standard-mode cosmic configuration, gives both cosmic engines certified hybrid-to-full-bank fallback, aligns real-data absorption orchestration, repairs deterministic energy value/error reporting, and retains a valid straight cosmic solution with an explicit typed status when optional MCS continuation fails. The calibrated cosmic-muon photon prediction, detector response, prompt-charge definition, and frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-31",
+      "file": "LicketyFit/Emitter.py",
+      "new_sha256": "309e225054d51f053215f9338ce27ea1a5e559e22bc33391af950de7603d748a",
+      "old_sha256": "9161e8d738b259a2b94c6aba63b795a9b8968c77379b9f6a709fd84fd4716115",
+      "reason": "Naming-only rebind: the public general-mode alias is recognized directly and comments use the canonical mode name. Photon production, detector response, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-08-31",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "7efc56c8fd0652a7f939e2931522c22c949bf9ea59e91423cc20fc7570d5f1c3",
+      "old_sha256": "dd8c0630395d67d706f90485551686d607d1804b66ee2ffb9be87c8124f1d812",
+      "reason": "Mode-label and navigation-only rebind: public cosmic/full_length names become general/beam, beam defaults to its compact beam-pipe seed bank, and the optional fast12 numerical budget is corrected. The calibrated general-muon photon prediction, detector response, prompt-charge definition, and frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    }
+  ],
+  "scale_freeze_order": "Frank-Tamm photons -> geometry -> water -> gel -> QE*CE -> all-primary prompt proxy -> scale-one analytic prediction",
+  "schema": "licketyfit-absolute-light-calibration-v2",
+  "source_audit": {
+    "collection_efficiency": "src/WCSimPMTObject.cc::PMT3inchR14374_WCTE::GetCollectionEfficiencyArray",
+    "commit": "bc5ca65893ee10dc42259ec541690ec09b15facb",
+    "qe_curve": "src/WCSimPMTObject.cc::PMT3inchR14374_WCTE::GetQE",
+    "repository": "jakobrim121/WCSim_changes",
+    "sensitive_detector_qe": "src/WCSimWCSD.cc::SensitiveDetector_Only",
+    "ski_digitizer_grouping": "src/WCSimWCDigitizer.cc::WCSimWCDigitizerSKI::DigitizeHits",
+    "wcsim_qe_multipliers": [
+      1.36986301369863,
+      1.3333333333333333
+    ]
+  },
+  "wcte_calibration_context": {
+    "charge_adc_per_pe_policy": "runtime_measured_conversion",
+    "geometry_placement_policy": "runtime_est_or_design",
+    "relative_efficiency": {
+      "allowed_runtime_modes": [
+        "slot",
+        "type",
+        "none"
+      ],
+      "policy": "runtime_per_sensor_correction"
+    },
+    "runtime_active_mask_policy": "per_sensor"
+  }
+}

@@ -209,6 +209,33 @@ def _bilinear_direct_lut(beta, path_length_mm, config):
     )
     return out_s.reshape(b.shape), out_g.reshape(b.shape)
 
+
+def direct_survival_lut(config=None):
+    """Return the physics-derived direct-survival interpolation table.
+
+    The coherent finite-aperture path integral consumes this table directly so
+    molecular zero-interaction survival is evaluated at each curved emission
+    quadrature node.  Returning copies is unnecessary: the cached arrays are
+    immutable model data loaded from the packaged spectral-moment table.
+    """
+    # ``PhotonScatteringTransportConfig`` is defined below the acceleration
+    # helpers in this module.  Construct the default at call time rather than
+    # in the function signature so importing the module does not depend on
+    # definition order.
+    if config is None:
+        config = PhotonScatteringTransportConfig()
+    lut = _load_spectral_moment_lut(config)
+    if lut is None:
+        raise RuntimeError(
+            "coherent molecular survival requires the packaged spectral-moment LUT"
+        )
+    return (
+        lut["direct_beta"],
+        lut["direct_path"],
+        lut["direct_survival"],
+        lut["direct_group"],
+    )
+
 @dataclass(frozen=True)
 class WCTEPrism:
     n_sides:int=16

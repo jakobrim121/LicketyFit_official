@@ -84,8 +84,8 @@ def run_fast12_coherent_update(
     process_grid_points: int = 41,
     coherent_grid_points: int = 41,
     latent_fd: float = 0.20,
-    latent_max_iterations: int = 4,
-    candidate_latent_max_iterations: int = 2,
+    latent_max_iterations: int = 60,
+    candidate_latent_max_iterations: int = 60,
     track_cycles: int = 2,
     longitudinal_step_mm: float = 10.0,
     length_step_mm: float = 15.0,
@@ -93,6 +93,11 @@ def run_fast12_coherent_update(
     track_trust_max_scaled_component: float = 1.0,
     sparse_neighbor_radius_mm: float = 100.0,
     numba_threads: int = 4,
+    track_end_mode: str = "threshold",
+    full_range_mm: float | None = None,
+    initial_kinetic_energy_mev: float | None = None,
+    profile_start_along: bool | None = None,
+    require_convergence: bool = False,
 ) -> Fast12CoherentResult:
     """Apply the validated high-rank nonlinear charge continuation.
 
@@ -111,10 +116,13 @@ def run_fast12_coherent_update(
         # and the nonlinear optical field.
         raise ValueError("process_grid_points and coherent_grid_points must match")
     fixed = {} if fixed_params is None else dict(fixed_params)
-    if any(name in fixed for name in ("x0", "y0", "z0")):
+    fixed_vertex_coordinate = any(name in fixed for name in ("x0", "y0", "z0"))
+    if profile_start_along is None:
+        profile_start_along = not fixed_vertex_coordinate
+    if fixed_vertex_coordinate and bool(profile_start_along):
         raise NotImplementedError(
             "a fixed Cartesian vertex coordinate is incompatible with a coupled "
-            "start-along-track update; disable the continuation for this diagnostic"
+            "start-along-track update"
         )
     if "length" in fixed or "visible_length" in fixed:
         raise NotImplementedError(
@@ -169,6 +177,9 @@ def run_fast12_coherent_update(
             require_contained_track=True,
             length_limits=length_limits,
             t0_limits=t0_limits,
+            track_end_mode=track_end_mode,
+            full_range_mm=full_range_mm,
+            initial_kinetic_energy_mev=initial_kinetic_energy_mev,
         )
         result = optimize_profiled_laplace_track_aligned(
             evaluator,
@@ -183,9 +194,18 @@ def run_fast12_coherent_update(
             track_trust_max_scaled_component=float(
                 track_trust_max_scaled_component
             ),
+            profile_start_along=bool(profile_start_along),
         )
     finally:
         restore_threads()
+
+    if bool(require_convergence) and not (
+        bool(result.latent.converged) and bool(result.converged)
+    ):
+        raise RuntimeError(
+            "coherent FE profile did not converge; refusing to apply a partial "
+            "trajectory update"
+        )
 
     theta1 = np.asarray(result.theta, dtype=np.float64)
     vertex_delta = theta1[:3] - theta0[:3]
@@ -227,6 +247,17 @@ def run_fast12_coherent_update(
             track_trust_max_scaled_component
         ),
         "sparse_neighbor_radius_mm": float(sparse_neighbor_radius_mm),
+        "track_end_mode": str(track_end_mode),
+        "full_range_mm": (
+            None if full_range_mm is None else float(full_range_mm)
+        ),
+        "initial_kinetic_energy_mev": (
+            None
+            if initial_kinetic_energy_mev is None
+            else float(initial_kinetic_energy_mev)
+        ),
+        "profile_start_along": bool(profile_start_along),
+        "require_convergence": bool(require_convergence),
         "coherent_support_size": support_size,
         "detector_pmt_count": int(np.asarray(p_locations).shape[0]),
         "numba_threads": int(active_threads),
@@ -241,12 +272,31 @@ def run_fast12_coherent_update(
                 "charge_nll": float(x.charge_nll),
                 "posterior_nll": float(x.posterior_nll),
                 "gradient_norm": float(x.gradient_norm),
+                "gradient_max_abs": float(x.gradient_max_abs),
+                "newton_decrement": float(x.newton_decrement),
                 "proposed_step_norm": float(x.proposed_step_norm),
                 "accepted_scale": float(x.accepted_scale),
                 "accepted": bool(x.accepted),
             }
             for x in result.latent.iterations
         ],
+        "final_latent_gradient": np.asarray(
+            result.latent.final_gradient, dtype=np.float64
+        ).tolist(),
+        "final_latent_gradient_norm": float(result.latent.final_gradient_norm),
+        "final_latent_gradient_max_abs": float(
+            result.latent.final_gradient_max_abs
+        ),
+        "final_latent_newton_decrement": float(
+            result.latent.final_newton_decrement
+        ),
+        "latent_termination_reason": str(result.latent.termination_reason),
+        "latent_objective_evaluations": int(
+            result.latent.objective_evaluations
+        ),
+        "latent_jacobian_evaluations": int(
+            result.latent.jacobian_evaluations
+        ),
         "profile_iterations": [
             {
                 "cycle": int(x.cycle),

@@ -1,0 +1,117 @@
+{
+  "calibration_basis": "ground_up_mathematical",
+  "calibration_id": "sha256:69a8969067a003219155b0ba6e079ff3aebee4c60d12e2598b47256221647297",
+  "calibration_provenance_files_sha256": {
+    "analysis/build_ground_up_light_manifests.py": "46fb2673937de6960169f4ef9dc9c5bb1ca4ed6f9a6fc5903e97fe05a6d9843f"
+  },
+  "calibration_target": "estimated accepted prompt beam-muon-equivalent photoelectrons before SPE smearing and threshold",
+  "charge_likelihood": "compound_spe_calibrated",
+  "charge_normalization": "global_scale",
+  "detector": "wcsim",
+  "detector_context": {
+    "kind": "wcsim",
+    "nominal_active_mpmts": 97,
+    "nominal_active_pmts": 1843,
+    "pmt_model": "PMT3inchR14374_WCTE",
+    "qe_policy": "retain both audited WCSim QE multipliers",
+    "relative_mpmt_efficiency_applied": false
+  },
+  "energy_dependent_scale_used": false,
+  "eventwise_reconstructed_lengths_used_in_calibration": false,
+  "global_charge_scale": 0.005455272046149691,
+  "ground_up_light_model": {
+    "all_charged_detected_pe": 2150.432309206448,
+    "all_charged_frank_tamm_photons": 85275.486,
+    "calibration_data_used": false,
+    "event_truth_used_in_reconstruction": false,
+    "gel_transmission": 0.9790935,
+    "geometric_acceptance": 0.1871995814,
+    "global_charge_scale": 0.005455272046149691,
+    "include_wcsim_qe_boosts": true,
+    "licketyfit_scale_one_pe": 314421.51859832066,
+    "model_version": 1,
+    "pmt_object_qe_boost": 1.36986301369863,
+    "primary_frank_tamm_photons": 68018.5079,
+    "prompt_detected_pe": 1715.254921117354,
+    "prompt_primary_fraction": 0.7976326033486341,
+    "prompt_target_policy": "primary/all Frank-Tamm fraction excludes delayed secondary light from the prompt charge target",
+    "qe_times_collection_efficiency": 0.1524805,
+    "reference_kinetic_energy_mev": 300.0,
+    "relative_systematic_uncertainty": 0.05,
+    "sensitive_detector_qe_boost": 1.3333333333333333,
+    "total_qe_boost": 1.82648401826484,
+    "unboosted_qe_times_collection_efficiency": 0.08348307375,
+    "water_transmission": 0.9023151,
+    "wcsim_source_commit": "bc5ca65893ee10dc42259ec541690ec09b15facb"
+  },
+  "model_contract": {
+    "analytic_reflection_in_charge": true,
+    "analytic_reflection_in_first_arrival_timing": true,
+    "digitizer_integration_window_ns": 144.0,
+    "fit_mode": "cosmic",
+    "prompt_secondary_policy": "primary/all wavelength-resolved Frank-Tamm fraction excludes delayed secondary light; prompt corrections in the analytic forward model retain their predicted spatial shapes",
+    "prompt_window_ns_inclusive": [
+      0.0,
+      17.0
+    ],
+    "range_coordinate": "muon CSDA range to n=1.344 threshold",
+    "scale_scope": "one nominal per-sensor optical response constant"
+  },
+  "model_files_sha256": {
+    "LicketyFit/Emitter.py": "fac8005c33b805e5edd0e9c438474a02682cf7439385a66adfaefedc4a8472a3",
+    "LicketyFit/PMT.py": "8a3050550992751f7005b39922ac70dee3a6461e76b39b363445f6b7124918a5",
+    "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
+    "LicketyFit/ground_up_light_calibration.py": "433cf6fc895f3407e75d8e48fb00a826d618e79f3f4878eaae16ac87247c9a59",
+    "LicketyFit/wcsim_charge_response.py": "a8fe8de9689a8072d56c00b102bfba7e956fdce88b2be6b02045f7575c4abc6f",
+    "scripts/batch_fit_driver.py": "f556c2da7552cf1842eacfe13f60d0d5ec89593657471fb09cdcfbffce33b15a",
+    "scripts/particle_range_lookup.py": "488ffb4bfae9b66e94e76b022fdc1ee97d465bc1a7eb2ce15e161cda64d14953",
+    "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
+    "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
+  },
+  "operational_domain": {
+    "precision_policy": "engineering estimate only; prefer measured calibration for precision energy reconstruction",
+    "recommended_stopping_muon_energy_mev": [
+      100.0,
+      500.0
+    ],
+    "reference_kinetic_energy_mev": 300.0
+  },
+  "particle": "muon",
+  "pmt_charge_response": {
+    "digitizer_charge_factor": 0.985,
+    "digitizer_noise_sigma_pe": 0.03,
+    "implementation_version": 1,
+    "model": "wcsim_r14374_ski",
+    "qpe_cdf_entries": 193,
+    "qpe_excess_kurtosis": 6.646299216541303,
+    "qpe_mean": 1.064800481822164,
+    "qpe_skewness": 1.4439951804573625,
+    "qpe_std": 0.4817725018553043,
+    "wcsim_source_commit": "bc5ca65893ee10dc42259ec541690ec09b15facb"
+  },
+  "scale_freeze_order": "Frank-Tamm photons -> geometry -> water -> gel -> QE*CE -> prompt-primary fraction -> scale-one analytic prediction",
+  "schema": "licketyfit-absolute-light-calibration-v2",
+  "source_audit": {
+    "collection_efficiency": "src/WCSimPMTObject.cc::PMT3inchR14374_WCTE::GetCollectionEfficiencyArray",
+    "commit": "bc5ca65893ee10dc42259ec541690ec09b15facb",
+    "qe_curve": "src/WCSimPMTObject.cc::PMT3inchR14374_WCTE::GetQE",
+    "repository": "jakobrim121/WCSim_changes",
+    "sensitive_detector_qe": "src/WCSimWCSD.cc::SensitiveDetector_Only",
+    "wcsim_qe_multipliers": [
+      1.36986301369863,
+      1.3333333333333333
+    ]
+  },
+  "validation_only": {
+    "analytic_all_charged_photons_per_event": 85275.486,
+    "calibration_data_used": false,
+    "literal_allsecondaryphotons_per_event": 85075.02,
+    "literal_prompt_predigit_pe_per_event": 1694.74,
+    "literal_signal_pe_per_event": 2111.86,
+    "n_events": 100,
+    "predicted_all_charged_detected_pe_per_event": 2150.432309206448,
+    "predicted_prompt_pe_per_event": 1715.254921117354,
+    "sample": "100mu-_300MeV_bp.npz",
+    "sample_sha256": "dd8f51945c22e88891d8c3c4c106ada9b70db8c65fe14eba704a2be0d442309d"
+  }
+}

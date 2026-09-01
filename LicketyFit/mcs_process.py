@@ -32,6 +32,84 @@ def stable_transverse_basis(direction):
     return np.ascontiguousarray(n), np.ascontiguousarray(e1), np.ascontiguousarray(e2)
 
 
+def parallel_transport_transverse_basis(
+    anchor_direction, anchor_e1, anchor_e2, target_direction
+):
+    """Transport one transverse frame by the minimal rotation on the sphere.
+
+    The coherent KL coefficients label physical deflections in two transverse
+    directions.  Recomputing those directions independently from the Cartesian
+    target direction makes a fixed coefficient vector change meaning at the
+    coordinate seam of :func:`stable_transverse_basis`.  This routine instead
+    applies the unique shortest-arc rotation carrying ``anchor_direction`` to
+    ``target_direction``.  The local track chart used by the coupled fitter is
+    restricted to the anchor's open hemisphere, so the antipodal singularity
+    is outside the optimization domain.
+
+    For a vector ``e`` perpendicular to the anchor ``a``, parallel transport to
+    ``d`` along the great circle is
+
+        e' = e - (e.d) (a + d) / (1 + a.d).
+
+    No fitted scale or event-dependent convention enters this construction.
+    """
+    a = np.asarray(anchor_direction, dtype=np.float64).reshape(3)
+    d = np.asarray(target_direction, dtype=np.float64).reshape(3)
+    a /= max(float(np.linalg.norm(a)), 1.0e-30)
+    d /= max(float(np.linalg.norm(d)), 1.0e-30)
+    denominator = 1.0 + float(a @ d)
+    if not math.isfinite(denominator) or denominator <= 1.0e-12:
+        raise ValueError(
+            "transverse-frame transport requires non-antipodal directions"
+        )
+
+    transported = []
+    for vector in (anchor_e1, anchor_e2):
+        e = np.asarray(vector, dtype=np.float64).reshape(3)
+        e = e - (float(e @ d) / denominator) * (a + d)
+        transported.append(e)
+
+    # The formula is orthogonal in exact arithmetic.  A deterministic
+    # Gram--Schmidt cleanup keeps repeated model construction bit-stable while
+    # preserving the orientation and initial coefficient semantics.
+    e1 = transported[0] - float(transported[0] @ d) * d
+    e1 /= max(float(np.linalg.norm(e1)), 1.0e-30)
+    e2 = transported[1] - float(transported[1] @ d) * d
+    e2 -= float(e2 @ e1) * e1
+    e2 /= max(float(np.linalg.norm(e2)), 1.0e-30)
+    if float(np.cross(e1, e2) @ d) < 0.0:
+        e2 *= -1.0
+    return (
+        np.ascontiguousarray(d),
+        np.ascontiguousarray(e1),
+        np.ascontiguousarray(e2),
+    )
+
+
+def configured_transverse_basis(emitter):
+    """Return an explicitly transported FE frame or the stable default frame."""
+    direction = np.asarray(emitter.direction, dtype=np.float64)
+    e1 = getattr(emitter, "primary_mcs_transverse_e1", None)
+    e2 = getattr(emitter, "primary_mcs_transverse_e2", None)
+    if e1 is None or e2 is None:
+        return stable_transverse_basis(direction)
+    d = direction / max(float(np.linalg.norm(direction)), 1.0e-30)
+    first = np.asarray(e1, dtype=np.float64).reshape(3)
+    second = np.asarray(e2, dtype=np.float64).reshape(3)
+    frame = np.column_stack((d, first, second))
+    if (
+        np.any(~np.isfinite(frame))
+        or not np.allclose(frame.T @ frame, np.eye(3), rtol=0.0, atol=2.0e-10)
+        or float(np.linalg.det(frame)) <= 0.0
+    ):
+        raise ValueError("configured primary-MCS transverse frame is not orthonormal")
+    return (
+        np.ascontiguousarray(d),
+        np.ascontiguousarray(first),
+        np.ascontiguousarray(second),
+    )
+
+
 def build_raw_fe_kl_basis(emitter, n_modes_per_plane=4, n_grid=41):
     """Return raw Fermi--Eyges KL displacement/slope/curvature modes.
 
@@ -47,7 +125,18 @@ def build_raw_fe_kl_basis(emitter, n_modes_per_plane=4, n_grid=41):
     R = max(float(getattr(emitter, "range_to_threshold_mm", L)), 0.0)
     X0 = max(float(getattr(emitter, "primary_mcs_radiation_length_mm", 360.8)), 1e-30)
     zq = abs(float(getattr(emitter, "primary_mcs_charge_number", 1.0)))
-    key = (pname, L, R, float(getattr(emitter, "n", 1.344)), X0, zq, n_modes, n_grid)
+    key = (
+        pname,
+        L,
+        R,
+        float(getattr(emitter, "realized_range_to_threshold_mm", L)),
+        float(getattr(emitter, "stopping_range_coordinate_scale", 1.0)),
+        float(getattr(emitter, "n", 1.344)),
+        X0,
+        zq,
+        n_modes,
+        n_grid,
+    )
     cached = _KL_CACHE.get(key)
     if cached is not None:
         return cached
@@ -739,4 +828,3 @@ def fermi_eyges_process_update(
         "process_posterior_covariance": np.asarray(process_posterior_covariance, dtype=np.float64),
         "process_mode_count": int(Ju.shape[1]),
     }
-

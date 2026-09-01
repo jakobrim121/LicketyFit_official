@@ -5,8 +5,20 @@
 # the USER-FACING EMITTER DEFAULTS block immediately after the imports.  Do not
 # hunt through __init__ to decide whether deltas, primary MCS, or Rayleigh are on.
 # -----------------------------------------------------------------------------
+from contextlib import contextmanager
+import hashlib
+import json
 import math
 import os
+from pathlib import Path
+import platform
+import sys
+import zipfile
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux/CERN production provides fcntl.
+    fcntl = None
 
 import numpy as np
 from typing import List, Tuple
@@ -17,35 +29,87 @@ from numba import njit, prange
 # USER-FACING EMITTER DEFAULTS
 # =============================================================================
 # Edit the DEFAULT_* values here, or set the matching environment variable before
-# importing/constructing the Emitter. Environment variables override most defaults
-# below. Primary-muon MCS is the deliberate exception: its on/off state is controlled
-# only by DEFAULT_ENABLE_PRIMARY_MCS so that the optical model and every reconstruction
-# stage cannot become inconsistent. Accepted boolean values are:
+# importing/constructing the Emitter. Environment variables override the optical
+# process defaults and the two validated reconstruction-model selectors below.
+# The public launchers record every resolved selector so the optical model and
+# post-fit continuation cannot silently disagree. Accepted boolean values are:
 #     on:  1, true, yes, y, on
 #     off: 0, false, no, n, off
 #
 # Main physics switches:
 #   EMITTER_ENABLE_DELTA_E=1|0
+#   EMITTER_ENABLE_MCS=1|0
 #   EMITTER_ENABLE_RAYLEIGH=1|0
 #   EMITTER_ENABLE_REFLECTION=1|0
 #
 # Package defaults in this file:
 #   delta electrons: ON
-#   event-specific coherent Fermi--Eyges/KL continuation: ON
+#   primary-particle MCS: ON (routed to exactly one mode-specific path)
+#   cosmic MCS continuation: coherent Fermi--Eyges when MCS is ON
 #   molecular Rayleigh/Raman scattering: ON
 #   analytic one-bounce WCTE blacksheet reflection: ON for timing
 #
-# The unified batch driver uses DEFAULT_ENABLE_PRIMARY_MCS as the single source
-# of truth for primary-muon MCS. When it is false, both the local primary model
-# and every Fermi--Eyges/legacy reconstruction stage are disabled. There is no
-# environment or batch-driver MCS on/off switch.
+# ``DEFAULT_ENABLE_PRIMARY_MCS`` is the historical name of the single MCS
+# master switch. In contained/full-length operation it activates the ordinary
+# primary-MCS implementation. In cosmic operation it leaves that ordinary path
+# off and activates exactly one implementation selected by
+# ``DEFAULT_COSMIC_MCS_CONTINUATION``. Turning the master switch off resolves the
+# effective cosmic continuation to ``off`` as well. This routing prevents the
+# ordinary and cosmic continuations from double-counting the same scattering.
+# ``DEFAULT_COSMIC_JOINT_INFERENCE_METHOD`` selects the optional joint engine.
+# ``DEFAULT_COSMIC_JOINT_INFERENCE_METHOD`` selects its numerical engine.  A run
+# may override only these two selectors with the validated string settings
+# ``EMITTER_COSMIC_MCS_CONTINUATION`` and
+# ``EMITTER_COSMIC_JOINT_INFERENCE_METHOD``; the resolved values are recorded in
+# every run configuration, avoiding source edits between comparison jobs.
 # =============================================================================
 TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
 FALSE_STRINGS = {"0", "false", "no", "n", "off"}
 
-# ---- primary on/off switches -------------------------------------------------
+# ---- reconstruction-model switches: edit these first -------------------------
+# Historical public name retained for compatibility. This is now the single MCS
+# master default for every fit mode; ``EMITTER_ENABLE_MCS`` is the per-run
+# override forwarded by both public launchers.
+DEFAULT_ENABLE_PRIMARY_MCS = True
+
+# Optional geometry-clipped general-mode continuation used by BOTH run_wcte.py and
+# run_wcsim.py when public FIT_MODE="general". Choose exactly one string:
+#
+#   "off"
+#       Original straight-track general result; no post-fit MCS continuation.
+#   "linear_fermi_eyges"
+#       Historical linear Fermi--Eyges process continuation.
+#   "coherent_fermi_eyges"
+#       Nonlinear coherent FE path profile with deterministic inverse-range
+#       energy unless a separately documented fixed-energy validation is used.
+#   "joint_k0_range_gaussian_fe"
+#       New charge-only continuous posterior over independent K0, stopping-range
+#       straggling z_R, and the Gaussian coherent FE path.
+#   "joint_k0_range_mixed_mcs"
+#       Experimental charge-only reference SMC over K0, z_R, a soft coherent
+#       Wentzel FE path, and explicit marked-Poisson hard scatters.  It is not a
+#       production fast path and currently supports contained trajectories only.
+# The joint choices require public FIT_MODE="general", a supported charge
+# likelihood, and the mode-routed ordinary primary path to be inactive. They support
+# charge_only and charge_time;
+# timing_only is rejected because it has no charge-shape constraint. The driver
+# validates these contracts.
+# Production general-mode default: the nonlinear coherent Fermi--Eyges path model
+# validated with the complete charge/time likelihood.  The ordinary straight
+# fitter keeps primary MCS off because it supplies only the seed; enabling both
+# would count the same scattering twice.
+DEFAULT_COSMIC_MCS_CONTINUATION = "coherent_fermi_eyges"
+
+# Numerical inference engine for the continuous joint model above:
+#   "laplace_cubature"  production deterministic continuous fit;
+#   "reference_smc"     slow annealed-SMC validation reference.
+# Both choices infer free K0, continuous range straggling, and all configured
+# Gaussian FE path modes with the same physical priors and optical likelihood.
+DEFAULT_COSMIC_JOINT_INFERENCE_METHOD = "laplace_cubature"
+
+
+# ---- optical-process on/off switches -----------------------------------------
 DEFAULT_ENABLE_DELTA_E = True
-DEFAULT_ENABLE_PRIMARY_MCS = False
 DEFAULT_ENABLE_RAYLEIGH = True
 DEFAULT_ENABLE_BLACKSHEET_REFLECTION = True
 
@@ -56,6 +120,11 @@ DEFAULT_DELTA_E_DISTANCE_PMT_RADIUS_MM = 45.0
 DEFAULT_DELTA_E_COST_SOFT = 0.0
 
 # ---- primary cone / endpoint defaults ----------------------------------------
+# Effective phase index used by the single-cone primary-light approximation.
+# The range tables retain their documented historical n=1.344 threshold; this
+# optical setting is deliberately explicit so a wavelength-integrated detector
+# response can be validated without silently rebuilding the range coordinate.
+DEFAULT_WATER_PHASE_INDEX = 1.344
 DEFAULT_PRIMARY_ENDPOINT_MODEL = "root_overlap_weight_only"
 DEFAULT_PRIMARY_ENDPOINT_APERTURE_RADIUS_MM = 45.0
 DEFAULT_PRIMARY_ENDPOINT_SCOPE = "start"
@@ -98,6 +167,16 @@ DEFAULT_WCTE_CDS_SPECULAR_TIMING_BINS = 12
 # validated conditional-likelihood studies.  Charge inclusion is an explicit
 # future/joint-likelihood option.
 DEFAULT_REFLECTION_IN_CHARGE = False
+# Charge policies when reflected light is enabled:
+#
+# ``unconditional`` preserves the historical analytic component.
+# ``prompt_group_gated`` applies the exact Poisson probability that at least
+# one non-blacksheet prompt PE opens a digitizer integration group on that PMT.
+# It is the data-independent WCSim SK-I response for the late one-bounce term
+# under the documented ordering approximation that prompt non-reflected light
+# opens the selected group.  Reflected light remains fully available to
+# first-arrival timing in both cases.
+DEFAULT_REFLECTION_CHARGE_POLICY = "unconditional"
 DEFAULT_REFLECTION_BSRFF = 2.5
 DEFAULT_REFLECTION_PMT_APERTURE_RADIUS_MM = 45.0
 DEFAULT_REFLECTION_TANGENT_BINS = 2
@@ -145,6 +224,8 @@ DEFAULT_RAYLEIGH_USE_PARALLEL_ACCUMULATOR = False
 # _last_expected_pes_for_timing; otherwise the floor makes every observed PMT
 # eligible for timing pulls even when the physical model predicts zero light.
 DEFAULT_CHARGE_FLOOR_PE = 1e-4
+DEFAULT_EVENT_MEAN_CONTAMINATION_MODEL = "off"
+DEFAULT_EVENT_MEAN_CONTAMINATION_MAX_FRACTION = 0.50
 DEFAULT_SMOOTH_TABLES = True
 DEFAULT_USE_FUSED_PRIMARY = True
 
@@ -194,30 +275,310 @@ def _env_str_switch(name, default, *aliases):
     return str(default)
 
 
-def emitter_switch_summary_from_env():
+def prompt_group_open_probability(expected_prompt_pe):
+    """Return the Poisson probability that a PMT opens a prompt group.
+
+    For a non-reflected prompt expectation ``mu``, the WCSim SK-I digitizer
+    opens an integration group exactly when at least one accepted PE exists.
+    Thus ``P(open) = 1 - exp(-mu)``.  The ``expm1`` form remains accurate for
+    dim PMTs, where an unconditional reflected-charge term is most harmful.
+    """
+
+    values = np.asarray(expected_prompt_pe, dtype=np.float64)
+    if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError("expected prompt PE must be finite and nonnegative")
+    return -np.expm1(-values)
+
+
+def profile_event_mean_uniform_contamination(
+    raw_signal,
+    observed_charge,
+    *,
+    max_fraction=DEFAULT_EVENT_MEAN_CONTAMINATION_MAX_FRACTION,
+    iterations=48,
+):
+    """Profile a broad channel-uniform contamination fraction.
+
+    With event-total normalization, the charge shape is multinomial.  This
+    profiles the convex one-parameter mixture
+
+        p_i(epsilon) = (1-epsilon) s_i/sum(s) + epsilon/N,
+
+    which gives isolated unmodelled PMTs bounded leverage without using event
+    truth or an absolute light-yield calibration.  The broad component is a
+    charge-only nuisance and deliberately supplies no timing prediction.
+    """
+
+    signal = np.asarray(raw_signal, dtype=np.float64).reshape(-1)
+    observed = np.asarray(observed_charge, dtype=np.float64).reshape(-1)
+    if (
+        signal.shape != observed.shape
+        or signal.size == 0
+        or np.any(~np.isfinite(signal))
+        or np.any(signal < 0.0)
+        or np.any(~np.isfinite(observed))
+        or np.any(observed < 0.0)
+    ):
+        raise ValueError("contamination profile requires matching finite PE arrays")
+    upper = float(max_fraction)
+    if not math.isfinite(upper) or upper < 0.0 or upper >= 1.0:
+        raise ValueError("contamination max_fraction must lie in [0,1)")
+    signal_total = float(np.sum(signal))
+    observed_total = float(np.sum(observed))
+    if upper == 0.0 or signal_total <= 0.0 or observed_total <= 0.0:
+        return 0.0
+
+    p_signal = signal / signal_total
+    p_uniform = 1.0 / float(signal.size)
+    delta = p_uniform - p_signal
+    active = observed > 0.0
+    q = observed[active]
+    p0 = p_signal[active]
+    d = delta[active]
+
+    def derivative(epsilon):
+        probability = np.maximum(p0 + float(epsilon) * d, 1.0e-300)
+        return -float(np.sum(q * d / probability))
+
+    derivative_zero = derivative(0.0)
+    if derivative_zero >= 0.0:
+        return 0.0
+    derivative_upper = derivative(upper)
+    if derivative_upper <= 0.0:
+        return upper
+    lo, hi = 0.0, upper
+    for _ in range(max(1, int(iterations))):
+        mid = 0.5 * (lo + hi)
+        if derivative(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return float(0.5 * (lo + hi))
+
+
+def fermi_eyges_bridge_variance(
+    s_mm, emission_weight, scattering_power_rad2_per_mm
+):
+    """Return projected FE variance about the fitted mean direction.
+
+    A free straight direction absorbs the emission-weighted mean tangent of a
+    scattered trajectory.  An angular increment at coordinate ``u`` is present
+    for the downstream fraction ``a(u)`` of the light, hence its mean-subtracted
+    variance is ``T(u) a(u) (1-a(u)) du``.  The second return value is the same
+    integral without ``T``; for constant light and scattering power it is
+    exactly ``L/6``.
+    """
+
+    s = np.asarray(s_mm, dtype=np.float64).reshape(-1)
+    weight = np.asarray(emission_weight, dtype=np.float64).reshape(-1)
+    power = np.asarray(
+        scattering_power_rad2_per_mm, dtype=np.float64
+    ).reshape(-1)
+    if (
+        s.size < 2
+        or s.shape != weight.shape
+        or s.shape != power.shape
+        or np.any(~np.isfinite(s))
+        or np.any(~np.isfinite(weight))
+        or np.any(~np.isfinite(power))
+        or np.any(weight < 0.0)
+        or np.any(power < 0.0)
+        or np.any(np.diff(s) <= 0.0)
+    ):
+        raise ValueError(
+            "FE bridge requires matching finite arrays on a strictly increasing grid"
+        )
+    ds = np.diff(s)
+    emission_intervals = 0.5 * (weight[:-1] + weight[1:]) * ds
+    total_emission = float(np.sum(emission_intervals))
+    if total_emission <= 0.0 or not np.isfinite(total_emission):
+        return 0.0, 0.0
+    downstream = np.zeros_like(s)
+    downstream[:-1] = np.cumsum(emission_intervals[::-1])[::-1]
+    fraction_downstream = np.clip(downstream / total_emission, 0.0, 1.0)
+    bridge_weight = fraction_downstream * (1.0 - fraction_downstream)
+    variance = float(
+        np.sum(
+            0.5
+            * (power[:-1] * bridge_weight[:-1]
+               + power[1:] * bridge_weight[1:])
+            * ds
+        )
+    )
+    equivalent_thickness = float(
+        np.sum(0.5 * (bridge_weight[:-1] + bridge_weight[1:]) * ds)
+    )
+    return max(variance, 0.0), max(equivalent_thickness, 0.0)
+
+
+def _resolved_mcs_enabled():
+    """Return the one mode-independent MCS master switch."""
+    return _env_bool_switch(
+        "EMITTER_ENABLE_MCS",
+        DEFAULT_ENABLE_PRIMARY_MCS,
+        "ENABLE_MCS",
+    )
+
+
+def _is_cosmic_fit_mode(fit_mode=None):
+    """Return whether the current public fit mode uses the cosmic engine."""
+    configured = fit_mode
+    if configured is None:
+        configured = os.environ.get("FIT_MODE", os.environ.get("LF_FIT_MODE", ""))
+    value = str(configured or "").strip().lower().replace("-", "_")
+    return value in {
+        "general",
+        "cosmic",
+        "auto_clipped",
+        "range_clipped",
+        "universal",
+    }
+
+
+def _resolved_cosmic_mcs_continuation(*, mcs_enabled=None):
+    """Return the validated source-default or per-run cosmic selector."""
+    if mcs_enabled is None:
+        mcs_enabled = _resolved_mcs_enabled()
+    if not bool(mcs_enabled):
+        return "off"
+    configured = _env_str_switch(
+        "EMITTER_COSMIC_MCS_CONTINUATION",
+        DEFAULT_COSMIC_MCS_CONTINUATION,
+    )
+    value = str(configured).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "off",
+        "straight": "off",
+        "straight_track": "off",
+        "linear_fe": "linear_fermi_eyges",
+        "fermi_eyges": "linear_fermi_eyges",
+        "coherent_fe": "coherent_fermi_eyges",
+        "coherent_profile": "coherent_fermi_eyges",
+        "joint": "joint_k0_range_gaussian_fe",
+        "joint_k0": "joint_k0_range_gaussian_fe",
+        "continuous_joint": "joint_k0_range_gaussian_fe",
+        "mixed": "joint_k0_range_mixed_mcs",
+        "mixed_mcs": "joint_k0_range_mixed_mcs",
+        "soft_hard": "joint_k0_range_mixed_mcs",
+    }
+    value = aliases.get(value, value)
+    allowed = {
+        "off",
+        "linear_fermi_eyges",
+        "coherent_fermi_eyges",
+        "joint_k0_range_gaussian_fe",
+        "joint_k0_range_mixed_mcs",
+    }
+    if value not in allowed:
+        raise ValueError(
+            "DEFAULT_COSMIC_MCS_CONTINUATION must be one of "
+            + ", ".join(sorted(allowed))
+            + f"; got {configured!r}"
+        )
+    return value
+
+
+def _resolved_cosmic_joint_inference_method(cosmic_continuation=None):
+    raw_override = os.environ.get("EMITTER_COSMIC_JOINT_INFERENCE_METHOD")
+    configured_override = (
+        None
+        if raw_override is None or not str(raw_override).strip()
+        else raw_override
+    )
+    configured = (
+        DEFAULT_COSMIC_JOINT_INFERENCE_METHOD
+        if configured_override is None
+        else configured_override
+    )
+    value = str(configured).strip().lower().replace(
+        "-", "_"
+    )
+    aliases = {
+        "laplace": "laplace_cubature",
+        "deterministic": "laplace_cubature",
+        "smc": "reference_smc",
+        "annealed_smc": "reference_smc",
+    }
+    value = aliases.get(value, value)
+    if cosmic_continuation == "joint_k0_range_mixed_mcs":
+        if configured_override is not None and value != "reference_smc":
+            raise ValueError(
+                "joint_k0_range_mixed_mcs requires the reference_smc engine"
+            )
+        return "reference_smc"
+    allowed = {"laplace_cubature", "reference_smc"}
+    if value not in allowed:
+        raise ValueError(
+            "DEFAULT_COSMIC_JOINT_INFERENCE_METHOD must be one of "
+            + ", ".join(sorted(allowed))
+            + f"; got {configured!r}"
+        )
+    return value
+
+
+def emitter_switch_summary_from_env(*, fit_mode=None):
     """Return resolved top-level physics switches without building an Emitter.
 
-    ``DEFAULT_ENABLE_PRIMARY_MCS`` is the sole MCS on/off switch. The effective
-    mean-cone smearing flag is deliberately separate: the validated
+    Both reconstruction selectors are resolved only from this file. The
+    effective mean-cone smearing flag is deliberately separate: the validated
     Fermi--Eyges process model keeps a sharp mean cone and applies MCS through
-    the post-fit process covariance/update, whereas the legacy model uses local
-    Highland broadening.
+    its path/process continuation, whereas the legacy model uses local Highland
+    broadening.
     """
+    mcs_enabled = _resolved_mcs_enabled()
     primary_mcs_model = _env_str_switch(
         "EMITTER_PRIMARY_MCS_MODEL", DEFAULT_PRIMARY_MCS_MODEL
     ).strip().lower().replace("-", "_")
-    primary_mcs_enabled = bool(DEFAULT_ENABLE_PRIMARY_MCS)
+    primary_mcs_enabled = bool(
+        mcs_enabled and not _is_cosmic_fit_mode(fit_mode)
+    )
+    cosmic_continuation = _resolved_cosmic_mcs_continuation(
+        mcs_enabled=mcs_enabled
+    )
+    cosmic_joint_inference = _resolved_cosmic_joint_inference_method(
+        cosmic_continuation
+    )
     legacy_smearing = primary_mcs_model in {
         "legacy", "cone_broadening", "local_highland"
     }
     return {
+        "water_phase_index": _env_float_switch(
+            "EMITTER_WATER_PHASE_INDEX", DEFAULT_WATER_PHASE_INDEX
+        ),
+        "event_mean_contamination_model": _env_str_switch(
+            "EMITTER_EVENT_MEAN_CONTAMINATION_MODEL",
+            DEFAULT_EVENT_MEAN_CONTAMINATION_MODEL,
+        ).strip().lower().replace("-", "_"),
+        "event_mean_contamination_max_fraction": _env_float_switch(
+            "EMITTER_EVENT_MEAN_CONTAMINATION_MAX_FRACTION",
+            DEFAULT_EVENT_MEAN_CONTAMINATION_MAX_FRACTION,
+        ),
         "enable_delta_e": _env_bool_switch("EMITTER_ENABLE_DELTA_E", DEFAULT_ENABLE_DELTA_E, "ENABLE_DELTA_E"),
+        "enable_mcs": bool(mcs_enabled),
         "enable_primary_mcs": primary_mcs_enabled,
         "enable_primary_mcs_smearing": primary_mcs_enabled and legacy_smearing,
         "primary_mcs_model": primary_mcs_model,
+        "cosmic_mcs_continuation": cosmic_continuation,
+        "cosmic_joint_inference_method": cosmic_joint_inference,
+        "enable_cosmic_linear_fermi_eyges": (
+            cosmic_continuation == "linear_fermi_eyges"
+        ),
+        "enable_cosmic_coherent_fermi_eyges": cosmic_continuation in {
+            "coherent_fermi_eyges",
+        },
+        "enable_cosmic_joint_k0_range_gaussian_fe": cosmic_continuation in {
+            "joint_k0_range_gaussian_fe",
+        },
+        "enable_cosmic_joint_k0_range_mixed_mcs": cosmic_continuation in {
+            "joint_k0_range_mixed_mcs",
+        },
         "enable_rayleigh_scatter": _env_bool_switch("EMITTER_ENABLE_RAYLEIGH", DEFAULT_ENABLE_RAYLEIGH, "ENABLE_RAYLEIGH"),
         "enable_blacksheet_reflection": _env_bool_switch("EMITTER_ENABLE_REFLECTION", DEFAULT_ENABLE_BLACKSHEET_REFLECTION, "ENABLE_REFLECTION"),
         "reflection_in_charge": _env_bool_switch("EMITTER_REFLECTION_IN_CHARGE", DEFAULT_REFLECTION_IN_CHARGE),
+        "reflection_charge_policy": _env_str_switch(
+            "EMITTER_REFLECTION_CHARGE_POLICY",
+            DEFAULT_REFLECTION_CHARGE_POLICY,
+        ).strip().lower().replace("-", "_"),
         "reflection_bsrff": _env_float_switch("EMITTER_REFLECTION_BSRFF", DEFAULT_REFLECTION_BSRFF),
         "use_first_arrival_timing": _env_bool_switch("EMITTER_USE_FIRST_ARRIVAL_TIMING", DEFAULT_USE_FIRST_ARRIVAL_TIMING),
         "reflection_first_arrival_nodes": _env_int_switch("EMITTER_REFLECTION_FIRST_ARRIVAL_NODES", DEFAULT_REFLECTION_FIRST_ARRIVAL_NODES),
@@ -646,8 +1007,9 @@ _RL_INV_RF = 557.0551063637078
 #   MINUIT_FAST_TOL=10
 #   MINUIT_FAST_STRATEGY=0
 #
-# Defaults here match the July 2026 MCS speed scan: Rayleigh off, MCS on,
-# delta on.  The strategy-0/tol10 fast Migrad policy gave ~3.6x speedup on the
+# These optimizer defaults were measured in the July 2026 MCS speed scan;
+# the present optical-process defaults are defined separately at the top of
+# this file.  The strategy-0/tol10 fast Migrad policy gave ~3.6x speedup on the
 # local z,cx,cy,L diagnostic with negligible FCN/parameter change; use the
 # driver env vars above to switch back to the old behavior for cross-checks.
 # -----------------------------------------------------------------------------
@@ -893,10 +1255,12 @@ _WCTE_REFLECTION_REFERENCE_BSRFF = 2.5
 _WCTE_REFLECTION_FINE_TANGENT = 10
 _WCTE_REFLECTION_FINE_Y = 36
 _WCTE_REFLECTION_FINE_CAP_SUBDIV = 10
+_WCTE_REFLECTION_TRANSFER_CACHE_SCHEMA = 1
 _WCTE_FAST_REFLECTION_CACHE = {}
 _WCTE_CDS_SPECULAR_SURFACE_CACHE = {}
 _PARTICLE_TOF_ANTIDERIVATIVE_CACHE = {}
 _WCTE_TIMING_NODE_ORDER_CACHE = {}
+_WCTE_REFLECTION_IMPLEMENTATION_SHA256 = None
 
 
 def _get_particle_tof_antiderivative(emitter):
@@ -1697,6 +2061,286 @@ class _WCTEFastReflectionTransfer:
     pass
 
 
+_WCTE_REFLECTION_TRANSFER_ARRAY_FIELDS = (
+    "surface_xyz",
+    "surface_normal",
+    "surface_area",
+    "surface_code",
+    "timing_region_id",
+    "transfer",
+    "transfer_r2",
+    "patch_min_mean_r2",
+    "patch_max_mean_r2",
+    "transfer_pmt",
+    "time_offset_pmt",
+    "patch_min_time_offset",
+    "patch_max_time_offset",
+)
+_WCTE_REFLECTION_TRANSFER_SCALAR_FIELDS = (
+    "n_timing_regions",
+    "group_index_over_c",
+    "bsrff",
+    "pmt_radius_mm",
+    "n_fine_surface_patches",
+    "n_macro_patches",
+    "n_removed_opening_patches",
+    "memory_bytes",
+)
+
+
+def _sha256_contiguous_array(value):
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(str(tuple(int(x) for x in array.shape)).encode("ascii"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _wcte_design_opening_geometry(wcd):
+    """Return the exact mPMT geometry consumed by the opening-mask builder."""
+    centres = []
+    axes = []
+    for mpmt in getattr(wcd, "mpmts", []):
+        if mpmt is None:
+            continue
+        try:
+            placement = mpmt.get_placement("design", wcd)
+            axis = np.asarray(placement["direction_z"], dtype=np.float64)
+            axis /= max(float(np.linalg.norm(axis)), 1.0e-30)
+            location = np.asarray(placement["location"], dtype=np.float64)
+            centre = location + (
+                _WCTE_REFLECTION_DOME_CYL_HEIGHT_MM
+                - _WCTE_REFLECTION_DOME_CUT_MM
+            ) * axis
+            centres.append(centre)
+            axes.append(axis)
+        except Exception:
+            continue
+    if centres:
+        return (
+            np.ascontiguousarray(centres, dtype=np.float64),
+            np.ascontiguousarray(axes, dtype=np.float64),
+        )
+    return (
+        np.empty((0, 3), dtype=np.float64),
+        np.empty((0, 3), dtype=np.float64),
+    )
+
+
+def _wcte_reflection_implementation_sha256():
+    global _WCTE_REFLECTION_IMPLEMENTATION_SHA256
+    if _WCTE_REFLECTION_IMPLEMENTATION_SHA256 is None:
+        try:
+            source = Path(__file__).resolve().read_bytes()
+        except OSError:
+            source = b""
+        _WCTE_REFLECTION_IMPLEMENTATION_SHA256 = hashlib.sha256(source).hexdigest()
+    return str(_WCTE_REFLECTION_IMPLEMENTATION_SHA256)
+
+
+def _wcte_reflection_cpuinfo_sha256():
+    try:
+        payload = Path("/proc/cpuinfo").read_bytes()
+    except OSError:
+        payload = (platform.machine() + "\0" + platform.processor()).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _wcte_reflection_persistent_metadata(
+    wcd,
+    p_locations,
+    direction_zs,
+    *,
+    bsrff,
+    pmt_radius_mm,
+    ntan,
+    ny,
+    nrad,
+):
+    p = np.ascontiguousarray(p_locations, dtype=np.float64)
+    pn = np.ascontiguousarray(direction_zs, dtype=np.float64)
+    opening_centres, opening_axes = _wcte_design_opening_geometry(wcd)
+    constants = {
+        "reflection_n_sides": int(_WCTE_REFLECTION_N_SIDES),
+        "reflection_apothem_mm": float(_WCTE_REFLECTION_APOTHEM_MM),
+        "reflection_height_mm": float(_WCTE_REFLECTION_HEIGHT_MM),
+        "reflection_y_center_mm": float(_WCTE_REFLECTION_Y_CENTER_MM),
+        "reflection_dome_outer_radius_mm": float(_WCTE_REFLECTION_DOME_OUTER_RADIUS_MM),
+        "reflection_dome_cut_mm": float(_WCTE_REFLECTION_DOME_CUT_MM),
+        "reflection_dome_cyl_height_mm": float(_WCTE_REFLECTION_DOME_CYL_HEIGHT_MM),
+        "reflection_leff_mm": float(_WCTE_REFLECTION_LEFF_MM),
+        "reflection_group_index": float(_WCTE_REFLECTION_GROUP_INDEX),
+        "reflection_spectral_c_bsrff2p5": float(_WCTE_REFLECTION_SPECTRAL_C_BSRFF2P5),
+        "reflection_reference_bsrff": float(_WCTE_REFLECTION_REFERENCE_BSRFF),
+        "reflection_fine_tangent": int(_WCTE_REFLECTION_FINE_TANGENT),
+        "reflection_fine_y": int(_WCTE_REFLECTION_FINE_Y),
+        "reflection_fine_cap_subdiv": int(_WCTE_REFLECTION_FINE_CAP_SUBDIV),
+        "reflection_power_law": [
+            3.0777000000000001,
+            0.1209,
+            1.6396999999999999,
+            0.79428866592713121,
+            1.002379253316015,
+        ],
+        "speed_of_light_mm_per_ns": 299.792458,
+    }
+    return {
+        "schema_version": int(_WCTE_REFLECTION_TRANSFER_CACHE_SCHEMA),
+        "table_kind": "licketyfit_wcte_analytic_reflection_transfer",
+        "implementation_sha256": _wcte_reflection_implementation_sha256(),
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "numpy_version": str(np.__version__),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "cpuinfo_sha256": _wcte_reflection_cpuinfo_sha256(),
+        "byteorder": sys.byteorder,
+        "p_locations_shape": list(p.shape),
+        "p_locations_sha256": _sha256_contiguous_array(p),
+        "direction_zs_shape": list(pn.shape),
+        "direction_zs_sha256": _sha256_contiguous_array(pn),
+        "opening_centres_shape": list(opening_centres.shape),
+        "opening_centres_sha256": _sha256_contiguous_array(opening_centres),
+        "opening_axes_shape": list(opening_axes.shape),
+        "opening_axes_sha256": _sha256_contiguous_array(opening_axes),
+        "bsrff": float(bsrff),
+        "pmt_radius_mm": float(pmt_radius_mm),
+        "tangent_bins": int(ntan),
+        "y_bins": int(ny),
+        "cap_radial_bins": int(nrad),
+        "constants": constants,
+    }
+
+
+def _wcte_reflection_persistent_cache_dir():
+    # The production driver resolves LF_RUNTIME_CACHE_DIR to a per-project,
+    # per-Python runtime root before importing this module.  Keep generated
+    # tables there; never write them to the release's source or tables tree.
+    runtime = (
+        os.environ.get("LF_RESOLVED_RUNTIME_CACHE_DIR", "").strip()
+        or os.environ.get("LF_RUNTIME_CACHE_DIR", "").strip()
+    )
+    if not runtime:
+        return None
+    root = Path(runtime).expanduser() / "reflection"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return root
+
+
+def _wcte_reflection_persistent_cache_path(metadata):
+    root = _wcte_reflection_persistent_cache_dir()
+    if root is None:
+        return None
+    payload = json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:24]
+    return root / f"wcte_reflection_transfer_{digest}_v{_WCTE_REFLECTION_TRANSFER_CACHE_SCHEMA}.npz"
+
+
+@contextmanager
+def _wcte_reflection_cache_lock(lock_path):
+    handle = None
+    try:
+        handle = open(lock_path, "a+b")
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if handle is not None:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+
+
+def _wcte_reflection_array_manifest(cache):
+    return {
+        name: {
+            "dtype": np.asarray(getattr(cache, name)).dtype.str,
+            "shape": list(np.asarray(getattr(cache, name)).shape),
+            "sha256": _sha256_contiguous_array(getattr(cache, name)),
+        }
+        for name in _WCTE_REFLECTION_TRANSFER_ARRAY_FIELDS
+    }
+
+
+def _wcte_load_persistent_reflection_transfer(path, expected_metadata):
+    try:
+        with np.load(path, allow_pickle=False) as payload:
+            metadata = json.loads(str(np.asarray(payload["metadata_json"]).item()))
+            if metadata != expected_metadata:
+                return None
+            manifest = json.loads(str(np.asarray(payload["array_manifest_json"]).item()))
+            if set(manifest) != set(_WCTE_REFLECTION_TRANSFER_ARRAY_FIELDS):
+                return None
+            out = _WCTEFastReflectionTransfer()
+            for name in _WCTE_REFLECTION_TRANSFER_ARRAY_FIELDS:
+                array = np.ascontiguousarray(payload[name])
+                expected = manifest[name]
+                if (
+                    array.dtype.str != str(expected["dtype"])
+                    or list(array.shape) != list(expected["shape"])
+                    or _sha256_contiguous_array(array) != str(expected["sha256"])
+                ):
+                    return None
+                setattr(out, name, array)
+            scalars = json.loads(str(np.asarray(payload["scalar_json"]).item()))
+            if set(scalars) != set(_WCTE_REFLECTION_TRANSFER_SCALAR_FIELDS):
+                return None
+            for name in _WCTE_REFLECTION_TRANSFER_SCALAR_FIELDS:
+                setattr(out, name, scalars[name])
+            out.active_transfer_cache = {}
+            out.active_patch_transfer_cache = {}
+            out.persistent_cache_path = str(path)
+            out.persistent_cache_hit = True
+            return out
+    except (
+        OSError,
+        EOFError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ):
+        return None
+
+
+def _wcte_save_persistent_reflection_transfer(path, metadata, cache):
+    manifest = _wcte_reflection_array_manifest(cache)
+    scalars = {
+        name: getattr(cache, name)
+        for name in _WCTE_REFLECTION_TRANSFER_SCALAR_FIELDS
+    }
+    temporary = path.with_name(path.stem + f".tmp.{os.getpid()}.npz")
+    arrays = {
+        name: np.ascontiguousarray(getattr(cache, name))
+        for name in _WCTE_REFLECTION_TRANSFER_ARRAY_FIELDS
+    }
+    try:
+        np.savez(
+            temporary,
+            metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+            array_manifest_json=np.asarray(json.dumps(manifest, sort_keys=True)),
+            scalar_json=np.asarray(json.dumps(scalars, sort_keys=True)),
+            **arrays,
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _wcte_build_fast_reflection_transfer(
     wcd,
     p_locations,
@@ -1822,6 +2466,10 @@ def _wcte_build_fast_reflection_transfer(
     out.n_macro_patches = int(len(gx))
     out.n_removed_opening_patches = int(n_removed)
     out.memory_bytes = int(out.transfer.nbytes + out.transfer_r2.nbytes + out.patch_min_mean_r2.nbytes + out.patch_max_mean_r2.nbytes)
+    out.active_transfer_cache = {}
+    out.active_patch_transfer_cache = {}
+    out.persistent_cache_path = None
+    out.persistent_cache_hit = False
     return out
 
 
@@ -1847,14 +2495,51 @@ def _get_wcte_fast_reflection_transfer(emitter, wcd, p_locations, direction_zs):
     key = _wcte_reflection_cache_key(wcd, p_locations, bsrff, pmt_radius, ntan, ny, nrad)
     cached = _WCTE_FAST_REFLECTION_CACHE.get(key)
     if cached is None:
-        cached = _wcte_build_fast_reflection_transfer(
-            wcd, p_locations, direction_zs,
+        resolved_ntan = max(1, ntan)
+        resolved_ny = max(1, ny)
+        resolved_nrad = max(1, nrad)
+        metadata = _wcte_reflection_persistent_metadata(
+            wcd,
+            p_locations,
+            direction_zs,
             bsrff=bsrff,
             pmt_radius_mm=pmt_radius,
-            ntan=max(1, ntan),
-            ny=max(1, ny),
-            nrad=max(1, nrad),
+            ntan=resolved_ntan,
+            ny=resolved_ny,
+            nrad=resolved_nrad,
         )
+        persistent_path = _wcte_reflection_persistent_cache_path(metadata)
+        if persistent_path is None:
+            cached = _wcte_build_fast_reflection_transfer(
+                wcd, p_locations, direction_zs,
+                bsrff=bsrff,
+                pmt_radius_mm=pmt_radius,
+                ntan=resolved_ntan,
+                ny=resolved_ny,
+                nrad=resolved_nrad,
+            )
+        else:
+            lock_path = persistent_path.with_suffix(persistent_path.suffix + ".lock")
+            with _wcte_reflection_cache_lock(lock_path):
+                cached = _wcte_load_persistent_reflection_transfer(
+                    persistent_path, metadata
+                )
+                if cached is None:
+                    cached = _wcte_build_fast_reflection_transfer(
+                        wcd, p_locations, direction_zs,
+                        bsrff=bsrff,
+                        pmt_radius_mm=pmt_radius,
+                        ntan=resolved_ntan,
+                        ny=resolved_ny,
+                        nrad=resolved_nrad,
+                    )
+                    try:
+                        _wcte_save_persistent_reflection_transfer(
+                            persistent_path, metadata, cached
+                        )
+                        cached.persistent_cache_path = str(persistent_path)
+                    except OSError:
+                        pass
         if len(_WCTE_FAST_REFLECTION_CACHE) >= 4:
             _WCTE_FAST_REFLECTION_CACHE.clear()
         _WCTE_FAST_REFLECTION_CACHE[key] = cached
@@ -1870,10 +2555,16 @@ def _wcte_integrated_primary_tof_fast(emitter, s_mm):
     s = np.asarray(s_mm, dtype=np.float64)
     rr, aa = _get_particle_tof_antiderivative(emitter)
     R0 = max(float(getattr(emitter, "range_to_threshold_mm", emitter.length)), 0.0)
-    rem = np.maximum(R0 - np.maximum(s, 0.0), 0.0)
+    coordinate_scale = float(
+        getattr(emitter, "stopping_range_coordinate_scale", 1.0)
+    )
+    coordinate_scale = max(coordinate_scale, 1.0e-30)
+    rem = np.maximum(R0 - coordinate_scale * np.maximum(s, 0.0), 0.0)
     a0 = float(np.interp(R0, rr, aa, left=aa[0], right=aa[-1]))
     arem = np.interp(rem, rr, aa, left=aa[0], right=aa[-1])
-    out = a0 - arem
+    # A is integrated in the mean-loss coordinate u.  Since u=c*s for a
+    # straggled track, physical flight time is integral(ds/beta c0)=dA/c.
+    out = (a0 - arem) / coordinate_scale
     return np.maximum(out, 0.0)
 
 
@@ -1881,7 +2572,8 @@ def _wcte_integrated_primary_tof_fast(emitter, s_mm):
 @njit(cache=True, fastmath=True)
 def _wcte_direct_node_times_active_numba(
     active, p_locations, start, direction, s_raw, scale, sroot, length,
-    tof_range, tof_A, range_to_threshold, starting_time, group_index_over_c,
+    tof_range, tof_A, range_to_threshold, energy_distance_scale,
+    starting_time, group_index_over_c,
 ):
     n = active.size
     out = np.empty(n, dtype=np.float32)
@@ -1895,9 +2587,9 @@ def _wcte_direct_node_times_active_numba(
         ex=start[0]+ss*tx;ey=start[1]+ss*ty;ez=start[2]+ss*tz
         dx=p_locations[i,0]-ex;dy=p_locations[i,1]-ey;dz=p_locations[i,2]-ez
         r=math.sqrt(dx*dx+dy*dy+dz*dz)+0.01
-        rem=range_to_threshold-ss
+        rem=range_to_threshold-energy_distance_scale*ss
         if rem<0.0:rem=0.0
-        tof=a0-_wcte_interp_scalar(rem,tof_range,tof_A)
+        tof=(a0-_wcte_interp_scalar(rem,tof_range,tof_A))/energy_distance_scale
         if tof<0.0:tof=0.0
         out[j]=starting_time+tof+r*group_index_over_c
     return out
@@ -1914,6 +2606,9 @@ def _prepare_wcte_fast_reflection_source(emitter, transfer_cache):
         pmt_pos=x, start_pos=start, track_dir=direction,
         s_a_mm=0.001, s_max_mm=length, theta_c_func=theta_c_func,
         range_stop_mm=float(getattr(emitter, "range_to_threshold_mm", length)),
+        energy_distance_scale=float(
+            getattr(emitter, "stopping_range_coordinate_scale", 1.0)
+        ),
         n_scan=150,
         near_cross_tol=float(emitter.effective_primary_soft_cone_sigma_rad(None)),
         edge_model=str(getattr(emitter, "primary_edge_model", "legacy")),
@@ -2025,6 +2720,9 @@ def _evaluate_wcte_cds_specular_reflection(
         s_max_mm=length,
         theta_c_func=theta_c_func,
         range_stop_mm=float(getattr(emitter, "range_to_threshold_mm", length)),
+        energy_distance_scale=float(
+            getattr(emitter, "stopping_range_coordinate_scale", 1.0)
+        ),
         n_scan=150,
         near_cross_tol=float(emitter.effective_primary_soft_cone_sigma_rad(None)),
         edge_model=str(getattr(emitter, "primary_edge_model", "legacy")),
@@ -5075,6 +5773,32 @@ class Emitter:
         self.direction = tuple(float(c) for c in direction)
         self.length = float(length)
         self.intensity = float(intensity)
+        # Charge shape is the backward-compatible default.  A calibrated
+        # absolute-light analysis may instead set ``global_scale`` together
+        # with a positive detector scale measured independently of the fitted
+        # event.  The scale is never inferred inside an event likelihood.
+        self.charge_normalization_mode = "event_mean"
+        self.global_charge_scale = None
+        self.event_mean_contamination_model = _env_str_switch(
+            "EMITTER_EVENT_MEAN_CONTAMINATION_MODEL",
+            DEFAULT_EVENT_MEAN_CONTAMINATION_MODEL,
+        ).strip().lower().replace("-", "_")
+        if self.event_mean_contamination_model not in {
+            "off", "none", "uniform_profile"
+        }:
+            raise ValueError(
+                "EMITTER_EVENT_MEAN_CONTAMINATION_MODEL must be off or "
+                "uniform_profile"
+            )
+        self.event_mean_contamination_max_fraction = _env_float_switch(
+            "EMITTER_EVENT_MEAN_CONTAMINATION_MAX_FRACTION",
+            DEFAULT_EVENT_MEAN_CONTAMINATION_MAX_FRACTION,
+        )
+        if not 0.0 <= self.event_mean_contamination_max_fraction < 1.0:
+            raise ValueError(
+                "event-mean contamination maximum must lie in [0,1)"
+            )
+        self._last_event_mean_contamination_fraction = 0.0
 
         self.particle_name = canonical_particle_name(particle)
         set_active_particle(self.particle_name)
@@ -5096,13 +5820,27 @@ class Emitter:
         #     ``fixed_initial_KE``.  Internally, ``range_to_threshold_mm`` still
         #     comes from the dE/dx table and is used to evaluate K(s), theta_c(s),
         #     beta, and dE/dx along the visible part of the track.
+        #
+        # straggled_threshold:
+        #     ``fixed_initial_KE`` determines the mean CSDA energy profile while
+        #     ``fixed_realized_range_mm`` is the event's independently realised
+        #     stopping range.  The mean loss coordinate is mapped continuously
+        #     onto that physical arc length.  This is the non-centred
+        #     stopping-range model; it is not an abrupt interaction.
         # ------------------------------------------------------------------
         self.track_end_mode = "threshold"
         self.fixed_initial_KE = None
+        self.fixed_realized_range_mm = None
         self.range_to_threshold_mm = float(length)
+        self.realized_range_to_threshold_mm = float(length)
+        self.stopping_range_coordinate_scale = 1.0
         self.last_visible_length_exceeds_range = False
 
-        self.n = 1.344
+        self.n = _env_float_switch(
+            "EMITTER_WATER_PHASE_INDEX", DEFAULT_WATER_PHASE_INDEX
+        )
+        if not math.isfinite(self.n) or self.n <= 1.0:
+            raise ValueError("EMITTER_WATER_PHASE_INDEX must be finite and greater than one")
         self.c = 299.792458  # mm/ns
 
         self.beta = float(beta)
@@ -5396,10 +6134,11 @@ class Emitter:
         # WCSim with primary multiple scattering.  Disable explicitly for
         # no-scattering control MC.
         # ------------------------------------------------------------------
-        # MCS on/off state is controlled only by DEFAULT_ENABLE_PRIMARY_MCS at
-        # the top of this file. It is intentionally not environment-overridable:
-        # the batch driver reads the same constant and derives every FE/legacy
-        # stage from it, so the optical and reconstruction paths cannot disagree.
+        # MCS on/off state is controlled by the one master switch at the top of
+        # this file (or EMITTER_ENABLE_MCS from a public launcher). Cosmic mode
+        # routes that master to the cosmic continuation and leaves this ordinary
+        # contained-track path inactive, so the two implementations cannot run
+        # together.
         # Evidence (July 2026 session, sandbox scale): applying sigma_eff=0.0148
         # as a wider ONE-SIDED soft cone (a) shifts the length minimum short via
         # edge-band (40-45 deg) over-fill, and (b) softens the per-event NLL(L)
@@ -5409,15 +6148,17 @@ class Emitter:
         # sigma=0.009 vs -40 mm at 0.0148 on the same events).  Ensemble-level
         # validations (fixed-z profiles, stacked fits) do NOT see this and can
         # look unbiased while per-event fits underestimate severely.
-        # Production MCS policy. ``DEFAULT_ENABLE_PRIMARY_MCS`` is the sole
-        # master switch. In Fermi--Eyges process mode the ordinary likelihood
+        # Production MCS policy. ``DEFAULT_ENABLE_PRIMARY_MCS`` is the source
+        # default for the sole master switch. In Fermi--Eyges process mode the ordinary likelihood
         # retains the validated sharp mean cone; MCS enters through the
         # correlated post-fit process update. Only the explicitly selected
         # legacy model uses deterministic local Highland cone broadening.
         self.primary_mcs_model = _env_str_switch(
             "EMITTER_PRIMARY_MCS_MODEL", DEFAULT_PRIMARY_MCS_MODEL
         ).strip().lower().replace("-", "_")
-        self.enable_primary_mcs = bool(DEFAULT_ENABLE_PRIMARY_MCS)
+        self.enable_primary_mcs = bool(
+            _resolved_mcs_enabled() and not _is_cosmic_fit_mode()
+        )
         self.enable_primary_mcs_smearing = bool(
             self.enable_primary_mcs
             and self.primary_mcs_model in {
@@ -5507,6 +6248,18 @@ class Emitter:
             "EMITTER_REFLECTION_IN_CHARGE",
             DEFAULT_REFLECTION_IN_CHARGE,
         )
+        self.reflection_charge_policy = _env_str_switch(
+            "EMITTER_REFLECTION_CHARGE_POLICY",
+            DEFAULT_REFLECTION_CHARGE_POLICY,
+        ).strip().lower().replace("-", "_")
+        if self.reflection_charge_policy not in {
+            "unconditional",
+            "prompt_group_gated",
+        }:
+            raise ValueError(
+                "EMITTER_REFLECTION_CHARGE_POLICY must be unconditional or "
+                "prompt_group_gated"
+            )
         self.reflection_bsrff = _env_float_switch(
             "EMITTER_REFLECTION_BSRFF",
             DEFAULT_REFLECTION_BSRFF,
@@ -5543,7 +6296,8 @@ class Emitter:
         # physical constant (effective scattering length; ~30-45 m on the
         # noE/noScat sample; MUST be recalibrated with deltas on / production).
         # ------------------------------------------------------------------
-        # CALIBRATION NOTE (physics-rooted, but preliminary; Rayleigh still defaults OFF here):
+        # CALIBRATION NOTE (physics-rooted, but preliminary; this legacy
+        # midpoint-Rayleigh branch is not the default molecular transport):
         # lambda_s = 120 m is set by matching the wide-angle (theta>42 deg) charge
         # fraction of the DIGITIZED WCSim mu- 300 MeV sample WITH secondary electrons
         # on (data 4.59%, model primary+delta+scatter 4.56%); 120 m sits in the
@@ -5706,6 +6460,44 @@ class Emitter:
         new.__dict__ = self.__dict__.copy()
         return new
 
+    def charge_normalization_factor(self, raw_mean, observed_mean):
+        """Return the configured raw-to-predicted PE scale.
+
+        ``event_mean`` conditions on the event total and therefore retains
+        charge shape only.  ``global_scale`` keeps absolute light information
+        and requires an externally calibrated, event-independent positive
+        scale.  There is deliberately no fitted-event or simulation-truth
+        fallback for a missing calibration.
+        """
+        raw = float(raw_mean)
+        observed = float(observed_mean)
+        mode = str(
+            getattr(self, "charge_normalization_mode", "event_mean")
+        ).strip().lower().replace("-", "_")
+        if mode == "event_mean":
+            if raw > 0.0:
+                return observed / raw
+            if observed <= 0.0:
+                return 0.0
+            raise ValueError(
+                "positive observed charge has zero raw optical prediction"
+            )
+        if mode == "global_scale":
+            scale = getattr(self, "global_charge_scale", None)
+            if (
+                scale is None
+                or not np.isfinite(float(scale))
+                or float(scale) <= 0.0
+            ):
+                raise ValueError(
+                    "global_scale charge normalization requires a positive "
+                    "externally calibrated global_charge_scale"
+                )
+            return float(scale)
+        raise ValueError(
+            "charge_normalization_mode must be event_mean or global_scale"
+        )
+
     def set_particle(self, particle):
         """Set the primary particle species for this emitter."""
         self.particle_name = canonical_particle_name(particle)
@@ -5721,6 +6513,9 @@ class Emitter:
         self._energy_dist_row = None
         self._energy_energy_row = None
         self.range_to_threshold_mm = float(self.length)
+        self.realized_range_to_threshold_mm = float(self.length)
+        self.stopping_range_coordinate_scale = 1.0
+        self.fixed_realized_range_mm = None
         self.last_visible_length_exceeds_range = False
         self.refresh_kinematics_from_length(self.length)
         return self
@@ -5746,12 +6541,18 @@ class Emitter:
             idx -= 1
         return int(idx)
 
-    def configure_track_end(self, mode="threshold", fixed_initial_KE=None, refresh=True):
+    def configure_track_end(
+        self,
+        mode="threshold",
+        fixed_initial_KE=None,
+        fixed_realized_range_mm=None,
+        refresh=True,
+    ):
         """Configure how the primary Cherenkov track terminates.
 
         Parameters
         ----------
-        mode : {"threshold", "abrupt"}
+        mode : {"threshold", "abrupt", "straggled_threshold"}
             ``threshold`` keeps the original behavior: fitted ``length`` is the
             dE/dx range to Cherenkov threshold and therefore determines the
             initial kinetic energy.
@@ -5761,8 +6562,16 @@ class Emitter:
             through ``fixed_initial_KE``.  This is intended for protons/hadrons
             whose clean Cherenkov ring can end suddenly before the particle has
             slowed to threshold.
+
+            ``straggled_threshold`` keeps a threshold endpoint but separates
+            the mean energy-loss range from the event's realised stopping
+            range.  Energy, Cherenkov yield, time of flight, and MCS power use
+            the fixed initial kinetic energy while optical support ends at
+            ``fixed_realized_range_mm``.
         fixed_initial_KE : float or None
-            Fixed initial kinetic energy in MeV for abrupt mode.
+            Fixed initial kinetic energy in MeV for abrupt or straggled mode.
+        fixed_realized_range_mm : float or None
+            Realised range to Cherenkov threshold for straggled mode.
         refresh : bool
             If True, immediately refresh beta and the cached K(s) lookup row.
         """
@@ -5777,10 +6586,14 @@ class Emitter:
             "interaction": "abrupt",
             "absorbed": "abrupt",
             "absorption": "abrupt",
+            "straggled_threshold": "straggled_threshold",
+            "stochastic_threshold": "straggled_threshold",
+            "range_straggling": "straggled_threshold",
         }
         if mode not in aliases:
             raise ValueError(
-                "track_end_mode must be 'threshold' or 'abrupt' "
+                "track_end_mode must be 'threshold', 'abrupt', or "
+                "'straggled_threshold' "
                 f"(got {mode!r})"
             )
 
@@ -5790,11 +6603,26 @@ class Emitter:
         else:
             self.fixed_initial_KE = float(fixed_initial_KE)
 
-        if self.track_end_mode == "abrupt" and self.fixed_initial_KE is None:
+        if fixed_realized_range_mm is None:
+            self.fixed_realized_range_mm = None
+        else:
+            self.fixed_realized_range_mm = float(fixed_realized_range_mm)
+
+        if self.track_end_mode in {"abrupt", "straggled_threshold"} and self.fixed_initial_KE is None:
             raise ValueError(
-                "abrupt track-end mode requires fixed_initial_KE in MeV. "
+                f"{self.track_end_mode} track-end mode requires fixed_initial_KE in MeV. "
                 "Use threshold mode if fitted length should determine energy."
             )
+        if self.track_end_mode == "straggled_threshold":
+            if self.fixed_realized_range_mm is None:
+                self.fixed_realized_range_mm = float(self.length)
+            if (
+                not math.isfinite(self.fixed_realized_range_mm)
+                or self.fixed_realized_range_mm <= 0.0
+            ):
+                raise ValueError(
+                    "straggled_threshold requires a positive finite realised range"
+                )
 
         self.interp_E_init = None
         self._energy_main_idx = None
@@ -5808,6 +6636,22 @@ class Emitter:
     # More explicit aliases for fit-driver code.
     set_track_end_mode = configure_track_end
     set_primary_truncation_mode = configure_track_end
+
+    def configure_stopping_range(
+        self,
+        initial_kinetic_energy_mev,
+        realized_range_mm,
+        *,
+        refresh=True,
+    ):
+        """Configure an independently realised threshold-stopping range."""
+
+        return self.configure_track_end(
+            "straggled_threshold",
+            fixed_initial_KE=float(initial_kinetic_energy_mev),
+            fixed_realized_range_mm=float(realized_range_mm),
+            refresh=bool(refresh),
+        )
 
     def _range_to_threshold_from_energy(self, initial_KE):
         """Interpolate dE/dx-only Cherenkov-visible range [mm] from K0 [MeV].
@@ -5841,7 +6685,12 @@ class Emitter:
         return main_idx
 
     def visible_length_is_physical(self, tol_mm=1e-9):
-        """Return False when an abrupt visible length exceeds the dE/dx range."""
+        """Return False when visible support exceeds its physical endpoint."""
+        if self.track_end_mode == "straggled_threshold":
+            return (
+                float(self.length)
+                <= float(self.realized_range_to_threshold_mm) + float(tol_mm)
+            )
         if self.track_end_mode != "abrupt":
             return True
         return float(self.length) <= float(self.range_to_threshold_mm) + float(tol_mm)
@@ -5883,11 +6732,19 @@ class Emitter:
             # SMOOTH-NLL: scalar version of the continuous master-curve lookup.
             return float(self.muon_energy_at_s_array(np.asarray([float(s_mm)]), L_stop_mm)[0])
         dist_row, energy_row = self._get_energy_rows_for_length(L_stop_mm)
-        idx = np.searchsorted(dist_row, s_mm)
+        scaled_s = float(s_mm)
+        if getattr(self, "track_end_mode", "threshold") == "straggled_threshold":
+            scaled_s *= float(getattr(self, "stopping_range_coordinate_scale", 1.0))
+        idx = np.searchsorted(dist_row, scaled_s)
         idx = np.clip(idx, 0, len(dist_row) - 1)
         return energy_row[idx]
 
     def muon_energy_at_s_array(self, s_mm, L_stop_mm):
+        distance = np.asarray(s_mm, dtype=np.float64)
+        if getattr(self, "track_end_mode", "threshold") == "straggled_threshold":
+            distance = distance * float(
+                getattr(self, "stopping_range_coordinate_scale", 1.0)
+            )
         if getattr(self, "smooth_tables", True):
             # SMOOTH-NLL: continuous K(s) from the master KE(range) curve.
             # The row-based lookup swaps the entire K(s) row when the fitted
@@ -5900,11 +6757,11 @@ class Emitter:
             except ImportError:
                 from particle_cherenkov_model import _ensure_tables_loaded as _pcm_tables
             _mt = _pcm_tables(self.particle_name)
-            rem = np.maximum(float(L_stop_mm) - np.asarray(s_mm, dtype=np.float64), 0.0)
+            rem = np.maximum(float(L_stop_mm) - distance, 0.0)
             return np.interp(rem, _mt["master_range"], _mt["master_ke"],
                              left=_mt["master_ke"][0], right=_mt["master_ke"][-1])
         dist_row, energy_row = self._get_energy_rows_for_length(L_stop_mm)
-        idx = np.searchsorted(dist_row, s_mm)
+        idx = np.searchsorted(dist_row, distance)
         idx = np.clip(idx, 0, len(dist_row) - 1)
         return energy_row[idx]
 
@@ -5929,8 +6786,29 @@ class Emitter:
         In abrupt mode, ``length_mm`` is only the visible/truncated Cherenkov
         length.  The dE/dx range row and beta are instead selected from the fixed
         initial kinetic energy.
+
+        In straggled-threshold mode, the fixed initial kinetic energy sets the
+        mean CSDA coordinate and ``fixed_realized_range_mm`` sets the physical
+        endpoint.  Their ratio maps physical arc length continuously onto the
+        mean energy-loss coordinate.
         """
         self.length = float(length_mm)
+
+        if getattr(self, "track_end_mode", "threshold") == "straggled_threshold":
+            if self.fixed_initial_KE is None or self.fixed_realized_range_mm is None:
+                raise ValueError(
+                    "Emitter straggled-threshold mode lacks energy or realised range."
+                )
+            mean_range = self._range_to_threshold_from_energy(self.fixed_initial_KE)
+            realized_range = float(self.fixed_realized_range_mm)
+            if not math.isfinite(realized_range) or realized_range <= 0.0:
+                raise ValueError("realised stopping range must be positive and finite")
+            self.range_to_threshold_mm = float(mean_range)
+            self.realized_range_to_threshold_mm = realized_range
+            self.stopping_range_coordinate_scale = float(mean_range / realized_range)
+            self._cache_energy_row_for_range(mean_range)
+            self.last_visible_length_exceeds_range = not self.visible_length_is_physical()
+            return self.refresh_kinematics_from_energy(self.fixed_initial_KE)
 
         if getattr(self, "track_end_mode", "threshold") == "abrupt":
             if self.fixed_initial_KE is None:
@@ -5938,12 +6816,16 @@ class Emitter:
                     "Emitter is in abrupt track-end mode but fixed_initial_KE is not set."
                 )
             self.range_to_threshold_mm = self._range_to_threshold_from_energy(self.fixed_initial_KE)
+            self.realized_range_to_threshold_mm = float(self.range_to_threshold_mm)
+            self.stopping_range_coordinate_scale = 1.0
             self._cache_energy_row_for_range(self.range_to_threshold_mm)
             self.last_visible_length_exceeds_range = not self.visible_length_is_physical()
             return self.refresh_kinematics_from_energy(self.fixed_initial_KE)
 
         # Default/old behavior: fitted length is the range to Cherenkov threshold.
         self.range_to_threshold_mm = float(self.length)
+        self.realized_range_to_threshold_mm = float(self.length)
+        self.stopping_range_coordinate_scale = 1.0
         self.last_visible_length_exceeds_range = False
         main_idx = self._cache_energy_row_for_range(self.length)
         tables = _get_tables(self.particle_name)
@@ -7057,6 +7939,13 @@ class Emitter:
           the RMS local Highland width, weighted by the Frank-Tamm
           sin^2(theta_c) yield.  This gives a deterministic energy/track-length
           dependence without tuning separate values for 300/400/500 MeV.
+        * ``bridge_weighted`` uses the Fermi--Eyges scattering power along the
+          complete visible support and measures each local tangent relative to
+          the Frank--Tamm-weighted mean tangent absorbed by the fitted straight
+          direction.  For constant scattering power and light yield this is
+          exactly ``sigma_total/sqrt(6)``.  It is the inexpensive marginal
+          broadening appropriate after fitting a straight direction, rather
+          than the unrelated PMT-patch thickness used by the legacy model.
 
         The result is a single effective angular width because the current
         collapse solver accepts one ``near_cross_tol`` per call.  The edge model
@@ -7186,6 +8075,72 @@ class Emitter:
                 sigma_mcs = float(math.sqrt(np.sum(good_w * sig2) / max(np.sum(good_w), 1e-30)))
                 ell_mm = float(np.sum(good_w * ells) / max(np.sum(good_w), 1e-30))
                 self._last_primary_mcs_eval_ke_mev = float(np.sum(good_w * good_K) / max(np.sum(good_w), 1e-30))
+        elif mode in {
+            "bridge", "bridge_weighted", "fermi_eyges_bridge", "fe_bridge"
+        }:
+            # Let dtheta(u) be an independent projected FE angular increment
+            # with variance T(u)du.  If the free straight direction absorbs the
+            # Frank--Tamm-weighted mean tangent, an increment at u contributes
+            # to the local residual with variance a(u)(1-a(u)), where a(u) is
+            # the fraction of visible emission downstream of u.  Thus
+            #
+            #   sigma_eff^2 = integral T(u) a(u) [1-a(u)] du.
+            #
+            # This is a true marginal second moment, contains no fitted scale,
+            # and remains well behaved for an abruptly terminated track.
+            n_samp = max(17, int(getattr(self, "primary_mcs_energy_samples", 24)))
+            s_max = min(L_visible, L_stop)
+            s_vals = np.linspace(0.0, s_max, n_samp, dtype=np.float64)
+            K_vals = np.asarray(
+                self.muon_energy_at_s_array(s_vals, L_stop), dtype=np.float64
+            )
+            weights = _cherenkov_weight_from_energy(
+                K_vals, float(self.particle_mass), float(self.n)
+            )
+            mass = float(self.particle_mass)
+            gamma = 1.0 + np.maximum(K_vals, 0.0) / max(mass, 1e-30)
+            beta2 = np.maximum(
+                1.0 - 1.0 / np.maximum(gamma * gamma, 1.0), 1e-15
+            )
+            beta = np.sqrt(beta2)
+            momentum = np.sqrt(
+                np.maximum(K_vals * (K_vals + 2.0 * mass), 1e-30)
+            )
+            zq = abs(float(getattr(self, "primary_mcs_charge_number", 1.0)))
+            X0 = max(
+                float(getattr(self, "primary_mcs_radiation_length_mm", 360.8)),
+                1e-30,
+            )
+            scattering_power = (
+                13.6 * zq / np.maximum(beta * momentum, 1e-30)
+            ) ** 2 / X0
+
+            if s_vals.size < 2 or not np.any(weights > 0.0):
+                sigma_mcs, ell_mm = 0.0, 0.0
+                self._last_primary_mcs_eval_ke_mev = np.nan
+            else:
+                ds = np.diff(s_vals)
+                emission_intervals = 0.5 * (weights[:-1] + weights[1:]) * ds
+                total_emission = float(np.sum(emission_intervals))
+                if total_emission <= 0.0 or not np.isfinite(total_emission):
+                    sigma_mcs, ell_mm = 0.0, 0.0
+                    self._last_primary_mcs_eval_ke_mev = np.nan
+                else:
+                    sigma2, ell_mm = fermi_eyges_bridge_variance(
+                        s_vals, weights, scattering_power
+                    )
+                    sigma_mcs = math.sqrt(max(sigma2, 0.0))
+                    # Do not apply the legacy 25-mrad local-cone cap here.  The
+                    # bridge variance is already the fitted-line residual of a
+                    # complete FE process, and truncating it selectively removes
+                    # the physically largest broadening near threshold.
+                    weighted_intervals = 0.5 * (
+                        weights[:-1] * K_vals[:-1]
+                        + weights[1:] * K_vals[1:]
+                    ) * ds
+                    self._last_primary_mcs_eval_ke_mev = float(
+                        np.sum(weighted_intervals) / total_emission
+                    )
         else:
             # Unknown mode: fail safe by preserving legacy behavior rather than
             # silently disabling MCS.
@@ -7366,6 +8321,9 @@ class Emitter:
                 s_max_mm=self.length,
                 theta_c_func=theta_c_func,
                 range_stop_mm=float(getattr(self, "range_to_threshold_mm", self.length)),
+                energy_distance_scale=float(
+                    getattr(self, "stopping_range_coordinate_scale", 1.0)
+                ),
                 n_scan=150,
                 near_cross_tol=float(self.effective_primary_soft_cone_sigma_rad(wcd)),
                 edge_model=str(getattr(self, "primary_edge_model", "legacy")),
@@ -7668,16 +8626,29 @@ class Emitter:
             _want_reflection_nodes = bool(
                 need_times and getattr(self, "use_first_arrival_timing", True)
             )
+            # Keep the source identity of the direct row so a coherent curved
+            # path can replace that row before the reflection nodes are
+            # generated.  Absolute-charge mode still needs reflected charge on
+            # every PMT, so evaluate that marginal once while deferring only
+            # the active-PMT timing expansion.
             _can_defer = bool(
                 _want_reflection_nodes
-                and not getattr(self, "reflection_in_charge", False)
                 and not getattr(self, "store_expected_component_diagnostics", False)
             )
             if _can_defer:
+                if getattr(self, "reflection_in_charge", False):
+                    mu_reflection, t_reflection = (
+                        _evaluate_wcte_fast_reflection(
+                            self,
+                            reflection_cache,
+                            active_pmt_indices=None,
+                            return_nodes=False,
+                        )
+                    )
                 _ru, _rtb = _prepare_wcte_fast_reflection_source(
                     self, reflection_cache
                 )
-                _ractive = np.ascontiguousarray(_reflection_active_pmts, dtype=np.int32)
+                _ractive = np.ascontiguousarray(_timing_active, dtype=np.int32)
                 _rpatch = np.ascontiguousarray(
                     np.flatnonzero(np.isfinite(_ru) & (_ru > 0.0)), dtype=np.int16
                 )
@@ -7705,8 +8676,6 @@ class Emitter:
                 else:
                     mu_reflection, t_reflection = _reflection_result
                     _reflection_node_mu = _reflection_node_t = _reflection_node_active = None
-                if getattr(self, "reflection_in_charge", False):
-                    mean_pes_raw = mean_pes_raw + mu_reflection
 
         # Single-scatter Rayleigh light (opt-in).  Scales off the PRIMARY
         # component (scattering of primary photons; delta-photon scattering is
@@ -7724,14 +8693,69 @@ class Emitter:
             if _sc_sum > 0.0 and _pr_sum > 0.0 and _Pbar > 0.0:
                 mean_pes_raw = mean_pes_raw + _mu_sc * (_Pbar * _pr_sum / _sc_sum)
 
-        # Reflection was validated first as a conditional timing component.  When
-        # reflection_in_charge=False, use the same event normalization as the
-        # direct+delta charge model but include reflected physical PE in timing
-        # eligibility and weighting.
+        # Apply the detector readout response to reflected charge only after all
+        # non-blacksheet prompt components are known.  WCSim's SK-I digitizer
+        # opens a 144 ns group at the first accepted PE on a PMT.  A later
+        # reflected PE contributes to the selected prompt charge only if such a
+        # group exists.  With Poisson non-reflected mean mu this opening
+        # probability is exactly 1-exp(-mu).  The WCTE dimensions make the
+        # one-bounce delay much shorter than 144 ns.  The approximation neglects
+        # the small reflection-only subset that can itself start inside the
+        # prompt window; no event-derived timing fraction is introduced.
+        mean_pes_without_reflection_raw = np.asarray(
+            mean_pes_raw, dtype=np.float64
+        )
+        mu_reflection_charge = np.zeros_like(mu_reflection)
         if getattr(self, "reflection_in_charge", False):
-            mean_pes_timing_raw = mean_pes_raw
+            _reflection_charge_policy = str(getattr(
+                self,
+                "reflection_charge_policy",
+                DEFAULT_REFLECTION_CHARGE_POLICY,
+            )).strip().lower().replace("-", "_")
+            if _reflection_charge_policy == "unconditional":
+                mu_reflection_charge = np.asarray(
+                    mu_reflection, dtype=np.float64
+                )
+            elif _reflection_charge_policy == "prompt_group_gated":
+                _normalization_mode = str(getattr(
+                    self, "charge_normalization_mode", "event_mean"
+                )).strip().lower().replace("-", "_")
+                _absolute_scale = getattr(self, "global_charge_scale", None)
+                if (
+                    _normalization_mode != "global_scale"
+                    or _absolute_scale is None
+                    or not np.isfinite(float(_absolute_scale))
+                    or float(_absolute_scale) <= 0.0
+                ):
+                    raise ValueError(
+                        "prompt_group_gated reflected charge requires a "
+                        "positive global absolute-light scale"
+                    )
+                _open_probability = prompt_group_open_probability(
+                    float(_absolute_scale) * mean_pes_without_reflection_raw
+                )
+                mu_reflection_charge = (
+                    np.asarray(mu_reflection, dtype=np.float64)
+                    * _open_probability
+                )
+            else:
+                raise ValueError(
+                    "reflection_charge_policy must be unconditional or "
+                    "prompt_group_gated"
+                )
+            mean_pes_raw = (
+                mean_pes_without_reflection_raw + mu_reflection_charge
+            )
         else:
-            mean_pes_timing_raw = mean_pes_raw + mu_reflection
+            mean_pes_raw = mean_pes_without_reflection_raw
+
+        # Timing uses the complete reflected source.  Charge gating is a
+        # digitizer-selection marginal and must not erase physical photons from
+        # the first-arrival source mixture.
+        mean_pes_timing_raw = (
+            mean_pes_without_reflection_raw
+            + np.asarray(mu_reflection, dtype=np.float64)
+        )
 
         # Fail closed on a non-finite optical prediction.  The historical path
         # allowed NaN/inf values to reach ``raw_mean`` and then multiplied them
@@ -7755,11 +8779,11 @@ class Emitter:
         if _prediction_valid:
             obs_mean = float(np.mean(_obs_array))
             raw_mean = float(np.mean(_raw_array))
-            if raw_mean > 0.0:
-                norm = obs_mean / raw_mean
-            elif obs_mean <= 0.0:
-                norm = 0.0
-            else:
+            try:
+                norm = self.charge_normalization_factor(
+                    raw_mean, obs_mean
+                )
+            except ValueError:
                 _prediction_valid = False
                 norm = np.nan
         else:
@@ -7768,10 +8792,43 @@ class Emitter:
             norm = np.nan
 
         if _prediction_valid and np.isfinite(norm) and norm >= 0.0:
-            mean_pes_unfloored = _raw_array * norm
+            contamination_fraction = 0.0
+            contamination_charge = np.zeros_like(_raw_array)
+            contamination_model = str(
+                getattr(self, "event_mean_contamination_model", "off")
+            ).strip().lower().replace("-", "_")
+            normalization_mode = str(
+                getattr(self, "charge_normalization_mode", "event_mean")
+            ).strip().lower().replace("-", "_")
+            if (
+                normalization_mode == "event_mean"
+                and contamination_model == "uniform_profile"
+            ):
+                contamination_fraction = profile_event_mean_uniform_contamination(
+                    _raw_array,
+                    _obs_array,
+                    max_fraction=float(
+                        getattr(
+                            self,
+                            "event_mean_contamination_max_fraction",
+                            DEFAULT_EVENT_MEAN_CONTAMINATION_MAX_FRACTION,
+                        )
+                    ),
+                )
+                total_observed = float(np.sum(_obs_array))
+                norm *= 1.0 - contamination_fraction
+                contamination_charge.fill(
+                    contamination_fraction
+                    * total_observed
+                    / float(max(_raw_array.size, 1))
+                )
+            mean_pes_unfloored = _raw_array * norm + contamination_charge
+            # The contamination component has no source-time prediction.
             mean_pes_timing_unfloored = _timing_raw_array * norm
             mean_pes = np.maximum(mean_pes_unfloored, self.charge_floor_pe)
         else:
+            contamination_fraction = np.nan
+            contamination_charge = np.full_like(_raw_array, np.nan)
             mean_pes_unfloored = np.full_like(_raw_array, np.nan)
             mean_pes_timing_unfloored = np.full_like(_timing_raw_array, np.nan)
             mean_pes = np.full_like(_raw_array, np.nan)
@@ -7863,6 +8920,12 @@ class Emitter:
         self._last_expected_pes_raw = _raw_array
         self._last_expected_pes_timing_raw = _timing_raw_array
         self._last_mu_primary_raw = np.asarray(mu_primary, dtype=np.float64)
+        # Retain the already-scaled analytic delta component separately.  The
+        # coherent FE continuation uses this accepted straight field as its
+        # literal zero-bend reference and adds only a curved-minus-straight
+        # difference.  No extra optical evaluation or truth information is
+        # needed to recover the component here.
+        self._last_mu_delta_raw = np.asarray(mu_delta_scaled, dtype=np.float64)
         self._last_direct_molecular_survival = np.asarray(
             _direct_molecular_survival, dtype=np.float64
         )
@@ -7870,8 +8933,15 @@ class Emitter:
         self._last_expected_pes_for_timing = mean_pes_timing_unfloored
         self._last_expected_pes_charge = mean_pes
         self._last_expected_pes_norm = float(norm)
+        self._last_event_mean_contamination_fraction = float(
+            contamination_fraction
+        )
+        self._last_event_mean_contamination_charge = np.asarray(
+            contamination_charge, dtype=np.float64
+        )
         self._last_charge_floor_pe = float(self.charge_floor_pe)
         self._last_reflection_raw = mu_reflection
+        self._last_reflection_charge_raw = mu_reflection_charge
         self._last_reflection_time = t_reflection
         self._last_wcte_cds_specular_raw = mu_cds_reflection
         self._last_wcte_cds_specular_time = t_cds_reflection
@@ -7880,12 +8950,14 @@ class Emitter:
             sum_primary = float(np.sum(mu_primary))
             sum_delta = float(np.sum(mu_delta_scaled))
             sum_reflection = float(np.sum(mu_reflection))
+            sum_reflection_charge = float(np.sum(mu_reflection_charge))
             sum_cds_reflection = float(np.sum(mu_cds_reflection))
             sum_total_charge = float(np.sum(mean_pes_raw))
             self._last_expected_components = {
                 "mu_primary_raw": mu_primary.copy(),
                 "mu_delta_raw": mu_delta_scaled.copy(),
                 "mu_reflection_raw": mu_reflection.copy(),
+                "mu_reflection_charge_raw": mu_reflection_charge.copy(),
                 "mu_wcte_cds_specular_raw": mu_cds_reflection.copy(),
                 "t_wcte_cds_specular_raw_ns": (
                     None if t_cds_reflection is None else t_cds_reflection.copy()
@@ -7900,11 +8972,19 @@ class Emitter:
                 "mean_pes": mean_pes.copy(),
                 "charge_floor_pe": float(self.charge_floor_pe),
                 "norm": float(norm),
+                "event_mean_contamination_model": str(
+                    getattr(self, "event_mean_contamination_model", "off")
+                ),
+                "event_mean_contamination_fraction": float(
+                    contamination_fraction
+                ),
+                "event_mean_contamination_charge": contamination_charge.copy(),
                 "obs_mean": float(obs_mean),
                 "raw_mean": float(raw_mean),
                 "sum_primary_raw": sum_primary,
                 "sum_delta_raw": sum_delta,
                 "sum_reflection_raw": sum_reflection,
+                "sum_reflection_charge_raw": sum_reflection_charge,
                 "sum_wcte_cds_specular_raw": sum_cds_reflection,
                 "wcte_cds_specular_fraction_of_direct_delta_raw": (
                     sum_cds_reflection / max(sum_primary + sum_delta, 1e-300)
@@ -7928,6 +9008,11 @@ class Emitter:
                     sum_reflection / max(sum_primary + sum_delta, 1e-300)
                 ),
                 "reflection_in_charge": bool(getattr(self, "reflection_in_charge", False)),
+                "reflection_charge_policy": str(getattr(
+                    self,
+                    "reflection_charge_policy",
+                    DEFAULT_REFLECTION_CHARGE_POLICY,
+                )),
                 "reflection_bsrff": float(getattr(self, "reflection_bsrff", np.nan)),
                 "reflection_macro_patches": (
                     int(reflection_cache.n_macro_patches)
@@ -7936,6 +9021,13 @@ class Emitter:
                 "reflection_transfer_memory_bytes": (
                     int(reflection_cache.memory_bytes)
                     if reflection_cache is not None else 0
+                ),
+                "reflection_transfer_persistent_cache_hit": bool(
+                    getattr(reflection_cache, "persistent_cache_hit", False)
+                ) if reflection_cache is not None else False,
+                "reflection_transfer_persistent_cache_path": (
+                    getattr(reflection_cache, "persistent_cache_path", None)
+                    if reflection_cache is not None else None
                 ),
                 "primary_fraction_raw": (
                     sum_primary / sum_total_charge if sum_total_charge > 0.0 else np.nan
@@ -8033,6 +9125,7 @@ class Emitter:
                         np.ascontiguousarray(_tof_r, dtype=np.float64),
                         np.ascontiguousarray(_tof_a, dtype=np.float64),
                         float(getattr(self, "range_to_threshold_mm", self.length)),
+                        float(getattr(self, "stopping_range_coordinate_scale", 1.0)),
                         float(self.starting_time),
                         float(_WCTE_REFLECTION_GROUP_INDEX / 299.792458),
                     )

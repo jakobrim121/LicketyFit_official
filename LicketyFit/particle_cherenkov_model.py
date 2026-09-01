@@ -666,6 +666,7 @@ def _find_scale_kernel(
     master_r,
     master_k,
     range_stop_mm,
+    energy_distance_scale,
     edge_model,
 ):
     """
@@ -784,14 +785,18 @@ def _find_scale_kernel(
                 # the fitted length crosses a table-row boundary (~5 mm), which
                 # shifts every crossing tube's Frank-Tamm scale coherently and
                 # imprints cliffs on NLL(L).
-                rem = range_stop_mm - (sb - s_a_mm)
+                rem = range_stop_mm - energy_distance_scale * (sb - s_a_mm)
                 if rem < 0.0:
                     rem = 0.0
                 Eb = np.interp(rem, master_r, master_k)
             elif refine != 0:
-                Eb = _interp_energy_at_dist(dist_row, energy_row, sb - s_a_mm)
+                Eb = _interp_energy_at_dist(
+                    dist_row, energy_row, energy_distance_scale * (sb - s_a_mm)
+                )
             else:
-                eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
+                eidx = _nearest_index_1d(
+                    dist_row, energy_distance_scale * (sb - s_a_mm)
+                )
                 Eb = energy_row[eidx]
 
             s_b[i] = sb
@@ -816,12 +821,14 @@ def _find_scale_kernel(
         else:
             sb = s_grid[min_idx]
             if master_r.size > 1:
-                rem = range_stop_mm - (sb - s_a_mm)
+                rem = range_stop_mm - energy_distance_scale * (sb - s_a_mm)
                 if rem < 0.0:
                     rem = 0.0
                 Eb = np.interp(rem, master_r, master_k)
             else:
-                eidx = _nearest_index_1d(dist_row, sb - s_a_mm)
+                eidx = _nearest_index_1d(
+                    dist_row, energy_distance_scale * (sb - s_a_mm)
+                )
                 Eb = energy_row[eidx]
 
             s_b[i] = sb
@@ -861,6 +868,7 @@ def find_scale_for_pmts(
     particle_mass: float | None = None,
     n_water: float = 1.344,
     range_stop_mm: float | None = None,
+    energy_distance_scale: float = 1.0,
     subgrid_refine: bool = True,
     legacy_grid: bool = False,
 ):
@@ -874,6 +882,9 @@ def find_scale_for_pmts(
       range_stop_mm : dE/dx range-to-threshold used for K(s).  If omitted,
                       the old behavior uses s_max_mm for both visible length
                       and range-to-threshold.
+      energy_distance_scale : maps physical arc length to the mean-loss
+                      coordinate.  It is R_mean/L_realized for a straggled
+                      threshold track and exactly one historically.
     """
     del theta_c_func  # kept only for drop-in API compatibility
 
@@ -896,8 +907,13 @@ def find_scale_for_pmts(
         range_stop_for_energy = float(s_max_mm)
     else:
         range_stop_for_energy = float(range_stop_mm)
+    energy_distance_scale = float(energy_distance_scale)
+    if not np.isfinite(energy_distance_scale) or energy_distance_scale <= 0.0:
+        raise ValueError("energy_distance_scale must be positive and finite")
 
-    visible_s_max = min(float(s_max_mm), range_stop_for_energy)
+    visible_s_max = min(
+        float(s_max_mm), range_stop_for_energy / energy_distance_scale
+    )
     visible_s_max = max(visible_s_max, float(s_a_mm))
 
     # The Cherenkov-angle scan grid (dist_row, energy_row, s_grid, E_grid,
@@ -913,6 +929,7 @@ def find_scale_for_pmts(
         visible_s_max,
         int(n_scan),
         range_stop_for_energy,
+        energy_distance_scale,
         float(particle_mass),
         float(n_water),
         bool(legacy_grid),
@@ -933,7 +950,7 @@ def find_scale_for_pmts(
             # ---- historical behavior (bit-exact): L-dependent grid spacing,
             # nearest-row K(s), nearest-point E lookup.  Kept for A/B checks. ----
             s_grid = np.linspace(float(s_a_mm), visible_s_max, int(n_scan), dtype=np.float64)
-            ds_mm = s_grid - float(s_a_mm)
+            ds_mm = energy_distance_scale * (s_grid - float(s_a_mm))
             idx = np.searchsorted(dist_row, ds_mm)
             idx_right = np.clip(idx, 0, dist_row.size - 1)
             idx_left = np.clip(idx - 1, 0, dist_row.size - 1)
@@ -961,7 +978,11 @@ def find_scale_for_pmts(
                 s_grid = np.append(s_grid, visible_s_max)
             master_r = tables["master_range"]
             master_k = tables["master_ke"]
-            remaining = np.maximum(range_stop_for_energy - (s_grid - float(s_a_mm)), 0.0)
+            remaining = np.maximum(
+                range_stop_for_energy
+                - energy_distance_scale * (s_grid - float(s_a_mm)),
+                0.0,
+            )
             E_grid = np.interp(remaining, master_r, master_k,
                                left=master_k[0], right=master_k[-1])
             E_grid = np.maximum(E_grid, threshold)
@@ -1004,6 +1025,7 @@ def find_scale_for_pmts(
         (np.empty(0, dtype=np.float64) if legacy_grid else tables["master_range"]),
         (np.empty(0, dtype=np.float64) if legacy_grid else tables["master_ke"]),
         float(range_stop_for_energy),
+        float(energy_distance_scale),
         int(1 if str(edge_model).lower() == "erf" else 0),
     )
 

@@ -302,13 +302,24 @@ def run_coherent_fisher_update(
         eval_S = np.empty(0); cutoff_S = np.nan; keep_S = np.empty(0, dtype=bool)
 
     # Arc-length contraction is an analytically known second-order diagnostic.
-    em = template_emitter.copy()
+    # Reuse the already validated contained threshold-range context that
+    # generated ``mu`` and ``Ju``.  The shared production template may retain
+    # abrupt/fixed-KE boundary-clipping semantics and is therefore not an
+    # authoritative scattering-power context for this contained continuation.
+    em = base_context_emitter
     em.start_coord = tuple(theta0[:3])
     direction0 = chart.direction(float(theta0[3]), float(theta0[4]))
     if direction0 is None:
         raise RuntimeError("invalid reference direction")
     em.direction = tuple(direction0)
-    em.refresh_kinematics_from_length(float(theta0[5]))
+    if abs(
+        float(getattr(em, "range_to_threshold_mm", theta0[5]))
+        - float(theta0[5])
+    ) > max(1.0e-4, 2.0e-6 * float(theta0[5])):
+        raise RuntimeError(
+            "legacy coherent contraction context has an inconsistent "
+            "contained threshold range"
+        )
     cmean, cexpected, contraction_matrix = _contraction_quadratic(em, umean, ucov)
     if apply_expected_contraction and 5 in free:
         theta_candidate = theta1.copy()

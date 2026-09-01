@@ -215,34 +215,75 @@ class ParticleRangeLookup:
         if self.initial_energies_mev.size < 2:
             raise ValueError(f"Range table for {self.particle} has too few rows.")
 
+        # Anchor the scalar conversion at the exact physical Cherenkov
+        # threshold. Historical tables begin at the next integer MeV, so using
+        # the first tabulated energy as the left endpoint incorrectly mapped a
+        # zero visible range to a positive above-threshold energy.
+        above_threshold = self.initial_energies_mev > self.threshold_mev
+        self._conversion_energies_mev = np.concatenate((
+            np.asarray([self.threshold_mev], dtype=np.float64),
+            self.initial_energies_mev[above_threshold],
+        ))
+        self._conversion_ranges_mm = np.concatenate((
+            np.asarray([0.0], dtype=np.float64),
+            self.overall_distances_mm[above_threshold],
+        ))
+        if (
+            self._conversion_energies_mev.size < 2
+            or np.any(np.diff(self._conversion_energies_mev) <= 0.0)
+            or np.any(np.diff(self._conversion_ranges_mm) <= 0.0)
+        ):
+            raise ValueError(
+                f"Range table for {self.particle} is not strictly monotone "
+                "above the Cherenkov threshold."
+            )
+
     def energy_to_range_mm(self, kinetic_energy_mev: float) -> float:
         """
         Return the above-threshold Cherenkov-visible range in mm.
         """
-        return float(
-            np.interp(
-                float(kinetic_energy_mev),
-                self.initial_energies_mev,
-                self.overall_distances_mm,
-                left=0.0,
-                right=self.overall_distances_mm[-1],
+        kinetic = float(kinetic_energy_mev)
+        if not np.isfinite(kinetic):
+            raise ValueError("kinetic energy must be finite")
+        if kinetic < 0.0:
+            raise ValueError("kinetic energy must be nonnegative")
+        maximum = float(self._conversion_energies_mev[-1])
+        if kinetic > maximum:
+            raise ValueError(
+                f"kinetic energy {kinetic:g} MeV exceeds the validated "
+                f"{self.particle} range-table maximum {maximum:g} MeV"
             )
-        )
+        if kinetic <= self.threshold_mev:
+            return 0.0
+        return float(np.interp(
+            kinetic,
+            self._conversion_energies_mev,
+            self._conversion_ranges_mm,
+        ))
 
     def range_mm_to_energy(self, travel_distance_mm: float) -> float:
         """
         Return the initial kinetic energy corresponding to an above-threshold
         range in mm.
         """
-        return float(
-            np.interp(
-                float(travel_distance_mm),
-                self.overall_distances_mm,
-                self.initial_energies_mev,
-                left=self.initial_energies_mev[0],
-                right=self.initial_energies_mev[-1],
+        distance = float(travel_distance_mm)
+        if not np.isfinite(distance):
+            raise ValueError("travel distance must be finite")
+        if distance < 0.0:
+            raise ValueError("travel distance must be nonnegative")
+        maximum = float(self._conversion_ranges_mm[-1])
+        if distance > maximum:
+            raise ValueError(
+                f"travel distance {distance:g} mm exceeds the validated "
+                f"{self.particle} range-table maximum {maximum:g} mm"
             )
-        )
+        if distance == 0.0:
+            return float(self.threshold_mev)
+        return float(np.interp(
+            distance,
+            self._conversion_ranges_mm,
+            self._conversion_energies_mev,
+        ))
 
 
 _LOOKUP_CACHE = {}

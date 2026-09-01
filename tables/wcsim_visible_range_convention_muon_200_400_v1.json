@@ -1,0 +1,85 @@
+{
+  "allowed_scope": "wcsim_reporting_only",
+  "applies_to_wcte_data": false,
+  "calibration_anchor_energy_domain_mev": [
+    200.0,
+    400.0
+  ],
+  "calibration_id": "sha256:78462e8aef0ec281010ffa09b29e5646a1a7e9952178ab18eafb7db48dcf38d1",
+  "calibration_samples": [
+    {
+      "cernbox_path": "mu-/1kmu-_200MeV_x0y0zn1330.npz",
+      "endpoint_proxy_mean_mm": 662.0478232554453,
+      "endpoint_proxy_sd_mm": 19.7849950280543,
+      "endpoint_proxy_sem_mm": 0.6256564778375857,
+      "etag": "\"1124535792480288768:e1b7a690\"",
+      "kinetic_energy_mev": 200.0,
+      "member_sha256": {
+        "track_flag.npy": "5db363b91089c6376c5acad9489fb0487bfa5119b60d4da049fcfe09c0b45448",
+        "track_parent.npy": "f51efdc65893a7cb2e8a6f3949654ed29f57ab8ade755cbce15e11cf750cc3a4",
+        "track_pid.npy": "8f1900f416c31c1e8cdc2591b8fdfde21620bdd2d9d275f3cc8a6e042e0875d3",
+        "track_start_position.npy": "f85db9ab4bdc8c7b24dcf89aa0b32d2df2907273915036dda8c2517c083b005f",
+        "track_stop_position.npy": "bcd0f441ca7dd9bba0a26df1a01f48ffe04dff32ac2bc1ee85174b4b8c13298d"
+      },
+      "n_events": 1000,
+      "range_table_mean_mm": 669.8771224334855,
+      "size_bytes": 68658922,
+      "table_minus_proxy_mean_mm": 7.8292991780401735
+    },
+    {
+      "cernbox_path": "mu-/1kmu-_300MeV_bp.npz",
+      "endpoint_proxy_mean_mm": 1153.9344197520275,
+      "endpoint_proxy_sd_mm": 30.24707615059211,
+      "endpoint_proxy_sem_mm": 0.9564965319642922,
+      "etag": "\"1163466156124667904:5e9efc16\"",
+      "kinetic_energy_mev": 300.0,
+      "member_sha256": {
+        "track_flag.npy": "52558d033c50260650749ab0c58d0cd5b6b4ec6b0dcd3851e8ce81929c3135d3",
+        "track_parent.npy": "513fa27868c3e11d0f62435fefe6ac67f5d71b182fd28430f704a815f1b790ee",
+        "track_pid.npy": "7151872c74ccc663f4647f9bd3078088758d9952c67aa75e59be41d1bee7da38",
+        "track_start_position.npy": "8cb50ee62306b7b46f8cf35350dcd0009963c11a0eba04dd8116a6c2eb15bc4e",
+        "track_stop_position.npy": "69b935002fd5856453b65fb3f2939f05e5967f27affe756a5016105467abb2c5"
+      },
+      "n_events": 1000,
+      "range_table_mean_mm": 1171.4771222080642,
+      "size_bytes": 122012532,
+      "table_minus_proxy_mean_mm": 17.54270245603675
+    },
+    {
+      "cernbox_path": "mu-/1kmu-_400MeV_bp.npz",
+      "endpoint_proxy_mean_mm": 1649.7940387705821,
+      "endpoint_proxy_sd_mm": 47.347592011196404,
+      "endpoint_proxy_sem_mm": 1.4972623247977321,
+      "etag": "\"1191663590038306816:f3eeaffc\"",
+      "kinetic_energy_mev": 400.0,
+      "member_sha256": {
+        "track_flag.npy": "09d13e745c351035b7f104215e68693fe83ee6fceb156ab103e641fbf461ece7",
+        "track_parent.npy": "bb7d50d13ae2c328939e0f0e4aa931474bcd1ce5e1fd55000ac87c4918e02a07",
+        "track_pid.npy": "81c5fc4f35d544e3f8099e425e7df83453c6a8033fba87a0aeb1d5b0f59a8baf",
+        "track_start_position.npy": "a22c48971c79e20fd96cd78d5ff02c74bc093743816182bb6a44305e9faef1a8",
+        "track_stop_position.npy": "16995c280c5c18e68ac67a1961df4d2c1e636f8d6fe131e85f7bcf28b874d11b"
+      },
+      "n_events": 1000,
+      "range_table_mean_mm": 1676.4771217314717,
+      "size_bytes": 175852362,
+      "table_minus_proxy_mean_mm": 26.68308296088958
+    }
+  ],
+  "changes_likelihood": false,
+  "correction_model": {
+    "fit_method": "unweighted_ordinary_least_squares_over_energy_means",
+    "intercept_mm": -10.928980809285294,
+    "kind": "linear_in_range_equivalent_kinetic_energy",
+    "maximum_calibration_mean_residual_mm": 0.19100759104792786,
+    "slope_mm_per_mev": 0.09426891891424706
+  },
+  "definition": "visible_length_wcsim_mm = raw_CSDA_visible_length_mm - correction_mm(range_equivalent_ke_mev)",
+  "endpoint_proxy_id": "sha256:1fe9a322d3c295d36bc5a3baf8270494e8356b5b962f5197df099266f7fc9711",
+  "kinetic_energy_domain_mev": [
+    180.0,
+    425.0
+  ],
+  "particle": "muon",
+  "schema": "licketyfit-wcsim-visible-range-convention-v1",
+  "truth_used_in_event_fit_or_selection": false
+}

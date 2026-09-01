@@ -403,8 +403,9 @@ class SingleEventFitter:
             # A notebook can initialize WCTE and WCSim engines in one kernel.
             # Numba forbids changing its thread-pool size after first launch,
             # while the two batch launchers deliberately carry different CPU
-            # budgets.  One stable serial budget avoids cross-engine failure.
-            "NUMBA_NUM_THREADS": "1",
+            # budgets.  One stable four-thread latency budget avoids cross-engine
+            # pool-size changes while matching the production NPROC=1 MCS policy.
+            "NUMBA_NUM_THREADS": "4",
             "OMP_NUM_THREADS": "1",
             "WARM_FIT_KERNELS": "0",
             "SAVE_AFTER_EACH_BATCH": "0",

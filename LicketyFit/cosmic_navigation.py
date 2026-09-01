@@ -692,6 +692,94 @@ def select_range_stratified_positions(
             break
     return selected
 
+
+def select_cosmic_topology_primary_positions(
+    exact_start_scores: Sequence[float],
+    hypotheses: Sequence[str],
+    baseline_flags: Sequence[bool],
+    causal_timing_flags: Sequence[bool],
+    *,
+    max_probes: int,
+    strong_causal_gain_nll: float = 150.0,
+) -> tuple[dict[str, int], tuple[dict[str, object], ...]]:
+    """Select one mandatory exact probe per cosmic start topology.
+
+    The charge-bank baseline remains the default representative.  When the
+    entire probe budget is consumed by topology coverage, however, a causal
+    timing candidate would otherwise be excluded without a single exact
+    optimization sweep.  Substitute it only when its already-computed exact
+    start NLL beats the charge baseline by a large configured margin.  This is
+    a truth-blind basin certificate and does not add objective evaluations.
+
+    The conservative margin protects ordinary events from prediction-seeded
+    time fluctuations while recovering cases where the charge baseline is
+    plainly in the wrong longitudinal basin.
+    """
+
+    scores = np.asarray(exact_start_scores, dtype=np.float64)
+    hypotheses = [str(value) for value in hypotheses]
+    baseline = np.asarray(baseline_flags, dtype=bool)
+    causal = np.asarray(causal_timing_flags, dtype=bool)
+    if scores.ndim != 1 or not (
+        len(hypotheses) == baseline.size == causal.size == scores.size
+    ):
+        raise ValueError("cosmic topology-primary inputs must be aligned vectors")
+
+    finite = [
+        position
+        for position in range(int(scores.size))
+        if math.isfinite(float(scores[position]))
+    ]
+    primary: dict[str, int] = {}
+    for hypothesis in sorted({hypotheses[position] for position in finite}):
+        positions = [
+            position for position in finite
+            if hypotheses[position] == hypothesis
+        ]
+        baseline_positions = [
+            position for position in positions if bool(baseline[position])
+        ]
+        noncausal_positions = [
+            position for position in positions if not bool(causal[position])
+        ]
+        pool = baseline_positions or noncausal_positions or positions
+        primary[hypothesis] = min(
+            pool,
+            key=lambda position: (float(scores[position]), int(position)),
+        )
+
+    diagnostics: list[dict[str, object]] = []
+    budget_is_topology_limited = max(1, int(max_probes)) <= len(primary)
+    gain_gate = max(0.0, float(strong_causal_gain_nll))
+    if budget_is_topology_limited:
+        for hypothesis in sorted(primary):
+            baseline_position = int(primary[hypothesis])
+            causal_positions = [
+                position for position in finite
+                if hypotheses[position] == hypothesis
+                and bool(causal[position])
+                and position != baseline_position
+            ]
+            if not causal_positions:
+                continue
+            causal_position = min(
+                causal_positions,
+                key=lambda position: (float(scores[position]), int(position)),
+            )
+            gain = float(scores[baseline_position] - scores[causal_position])
+            if gain + 1.0e-12 < gain_gate:
+                continue
+            primary[hypothesis] = int(causal_position)
+            diagnostics.append({
+                "track_start_hypothesis": str(hypothesis),
+                "baseline_position": int(baseline_position),
+                "causal_position": int(causal_position),
+                "exact_start_gain_nll": float(gain),
+                "required_gain_nll": float(gain_gate),
+            })
+
+    return primary, tuple(diagnostics)
+
 def select_cosmic_tournament_positions(
     exact_start_scores: Sequence[float],
     hypotheses: Sequence[str],

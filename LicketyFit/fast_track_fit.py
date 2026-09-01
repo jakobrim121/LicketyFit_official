@@ -15,11 +15,13 @@ changes only fit coordinates and optimizer navigation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
 import time
 from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
 
 import numpy as np
+from scipy.optimize import minimize
 
 from .track_parameterization import (
     TangentDirectionChart,
@@ -33,6 +35,32 @@ from .detector_geometry import (
     WCTE_PRISM_N_SIDES,
     WCTE_PRISM_Y_MAX_MM,
     WCTE_PRISM_Y_MIN_MM,
+)
+
+
+@lru_cache(maxsize=8)
+def _regular_prism_face_normals_xz(n_sides: int) -> tuple[tuple[float, float], ...]:
+    """Return detector-static regular-prism face normals.
+
+    Geometry containment is evaluated thousands of times per fit.  The face
+    angles are detector constants, so recomputing the same sine and cosine in
+    every call adds latency without adding physical information.  Computing
+    them once retains the exact scalar inequalities and operation order.
+    """
+    n = int(n_sides)
+    if n <= 0:
+        return ()
+    return tuple(
+        (
+            math.cos(2.0 * math.pi * j / float(n)),
+            math.sin(2.0 * math.pi * j / float(n)),
+        )
+        for j in range(n)
+    )
+
+
+_WCTE_PRISM_FACE_NORMALS_XZ = _regular_prism_face_normals_xz(
+    WCTE_PRISM_N_SIDES
 )
 
 
@@ -180,11 +208,15 @@ class ConvexDetectorVolume:
             return False
         if self.boundary_model == "wcte_prism":
             limit = float(self.prism_apothem_mm) - margin
-            for j in range(int(self.prism_n_sides)):
-                phi = 2.0 * math.pi * j / float(self.prism_n_sides)
+            face_normals = (
+                _WCTE_PRISM_FACE_NORMALS_XZ
+                if int(self.prism_n_sides) == int(WCTE_PRISM_N_SIDES)
+                else _regular_prism_face_normals_xz(self.prism_n_sides)
+            )
+            for nx, nz in face_normals:
                 if (
-                    math.cos(phi) * float(x[0])
-                    + math.sin(phi) * float(x[2])
+                    nx * float(x[0])
+                    + nz * float(x[2])
                     > limit + tolerance_mm
                 ):
                     return False
@@ -193,6 +225,58 @@ class ConvexDetectorVolume:
             distances = np.einsum("ij,ij->i", x[None, :] - self.locations, self.inward_axes)
             if float(np.min(distances)) < margin - tolerance_mm:
                 return False
+        return True
+
+    def contains_many(
+        self,
+        points,
+        *,
+        tolerance_mm: float = 1.0e-8,
+        extra_margin_mm: float = 0.0,
+    ) -> bool:
+        """Vectorized equivalent of calling :meth:`contains` for every point.
+
+        Coherent paths carry 81--241 nodes and are validated after every exact
+        optical evaluation.  Applying the same convex half-space inequalities
+        to whole coordinate columns removes Python method/allocation overhead;
+        it does not approximate or omit a detector boundary.
+        """
+        xyz = np.asarray(points, dtype=np.float64)
+        if (
+            xyz.ndim != 2
+            or xyz.shape[1:] != (3,)
+            or xyz.shape[0] == 0
+            or not np.all(np.isfinite(xyz))
+        ):
+            return False
+        margin = self._effective_margin(extra_margin_mm)
+        if np.any(xyz < self.axis_lo[None, :] + margin - tolerance_mm) or np.any(
+            xyz > self.axis_hi[None, :] - margin + tolerance_mm
+        ):
+            return False
+        if self.boundary_model == "wcte_prism":
+            limit = float(self.prism_apothem_mm) - margin + tolerance_mm
+            face_normals = (
+                _WCTE_PRISM_FACE_NORMALS_XZ
+                if int(self.prism_n_sides) == int(WCTE_PRISM_N_SIDES)
+                else _regular_prism_face_normals_xz(self.prism_n_sides)
+            )
+            x = xyz[:, 0]
+            z = xyz[:, 2]
+            for nx, nz in face_normals:
+                if np.any(nx * x + nz * z > limit):
+                    return False
+            return True
+        if self.locations.size:
+            # Preserve the plane-by-plane half-space definition while doing
+            # each plane's independent point arithmetic in compiled NumPy.
+            threshold = margin - tolerance_mm
+            for location, inward in zip(self.locations, self.inward_axes):
+                distances = np.sum(
+                    (xyz - location[None, :]) * inward[None, :], axis=1
+                )
+                if np.any(distances < threshold):
+                    return False
         return True
 
     def ray_exit_distance(
@@ -239,10 +323,12 @@ class ConvexDetectorVolume:
 
         if self.boundary_model == "wcte_prism":
             limit = float(self.prism_apothem_mm) - margin
-            for j in range(int(self.prism_n_sides)):
-                phi = 2.0 * math.pi * j / float(self.prism_n_sides)
-                nx = math.cos(phi)
-                nz = math.sin(phi)
+            face_normals = (
+                _WCTE_PRISM_FACE_NORMALS_XZ
+                if int(self.prism_n_sides) == int(WCTE_PRISM_N_SIDES)
+                else _regular_prism_face_normals_xz(self.prism_n_sides)
+            )
+            for nx, nz in face_normals:
                 velocity = nx * float(d[0]) + nz * float(d[2])
                 if velocity > 1.0e-15:
                     distance = (
@@ -420,6 +506,13 @@ class TrackObjective:
     prediction_cache: dict[
         tuple[float, ...], tuple[np.ndarray, object, np.ndarray | None] | None
     ] = field(default_factory=dict)
+    # Event-mean nuisance values are geometry dependent just like the optical
+    # prediction.  Cache them alongside that prediction so a caller can report
+    # the value at the accepted geometry without relying on whichever trial
+    # happened to be the Emitter's most recent evaluation.
+    event_mean_contamination_cache: dict[tuple[float, ...], float] = field(
+        default_factory=dict
+    )
     calls: int = 0
     evaluations: int = 0
     optical_evaluations: int = 0
@@ -444,6 +537,165 @@ class TrackObjective:
         else:
             names = ("x0", "y0", "z0", "dir_u", "dir_v", "length")
         return tuple(round(float(values.get(name, 0.0)), 12) for name in names)
+
+    def _prediction_nll(self, prediction, t0: float) -> float:
+        """Evaluate the configured likelihood for an existing optical field."""
+        exp_pes_array, exp_ts_zero, timing_pes = prediction
+        if self.objective_mode == "charge_only":
+            fval = self.pmt_model.get_neg_log_likelihood_npe(
+                exp_pes_array, self.obs_pes
+            )
+        elif self.objective_mode == "timing_only":
+            fval = self.pmt_model.get_neg_log_likelihood_t(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                timing_pes=timing_pes,
+                model_time_shift_ns=t0,
+            )
+        elif self.objective_mode == "charge_time":
+            fval = self.pmt_model.get_neg_log_likelihood_npe_t(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                timing_pes=timing_pes,
+                model_time_shift_ns=t0,
+            )
+        else:
+            raise ValueError(f"unknown objective_mode={self.objective_mode!r}")
+        fval = float(fval)
+        if (
+            self.use_t0_prior
+            and self.objective_mode != "charge_only"
+            and self.t0_prior_sigma
+        ):
+            fval += 0.5 * (t0 / float(self.t0_prior_sigma)) ** 2
+        return float(fval)
+
+    def evaluate_t0_many(
+        self, values: Mapping[str, float], t0_values
+    ) -> np.ndarray:
+        """Evaluate exact NLLs for many additive-time values in one kernel.
+
+        Only the evaluation schedule changes: callers provide the same t0
+        sample points as the scalar path.  The cached optical prediction is
+        immutable in t0, and the PMT model's compiled many-t0 routine evaluates
+        the identical conditional first-arrival likelihood for every point.
+        """
+        shifts = np.ascontiguousarray(t0_values, dtype=np.float64).reshape(-1)
+        out = np.full(shifts.size, np.inf, dtype=np.float64)
+        if shifts.size == 0:
+            return out
+
+        base = {k: float(v) for k, v in values.items()}
+        geometry_key = self._geometry_key(base)
+        # A scalar evaluation builds and validates this optical prediction.
+        # Retain the scalar compatibility path for direct callers that have not
+        # yet evaluated the geometry.
+        if geometry_key not in self.prediction_cache:
+            for i, shift in enumerate(shifts):
+                trial = dict(base)
+                trial["t0"] = float(shift)
+                out[i] = float(self(trial))
+            return out
+        prediction = self.prediction_cache.get(geometry_key)
+        if prediction is None:
+            for i, shift in enumerate(shifts):
+                trial = dict(base)
+                trial["t0"] = float(shift)
+                out[i] = float(self(trial))
+            return out
+
+        pending_indices: list[int] = []
+        pending_values: list[float] = []
+        pending_keys: list[tuple[float, ...]] = []
+        for i, shift_value in enumerate(shifts):
+            self.calls += 1
+            shift = float(shift_value)
+            trial = dict(base)
+            trial["t0"] = shift
+            key = self._key(trial)
+            cached = self.cache.get(key)
+            if cached is not None:
+                out[i] = float(cached)
+                continue
+            self.evaluations += 1
+            if not math.isfinite(shift):
+                self.invalid_evaluations += 1
+                self.cache[key] = np.inf
+                continue
+            if self.t0_limits is not None:
+                lo, hi = (float(self.t0_limits[0]), float(self.t0_limits[1]))
+                if shift < lo or shift > hi:
+                    self.invalid_evaluations += 1
+                    self.cache[key] = np.inf
+                    continue
+            pending_indices.append(i)
+            pending_values.append(shift)
+            pending_keys.append(key)
+
+        if not pending_indices:
+            return out
+
+        exp_pes_array, exp_ts_zero, timing_pes = prediction
+        shift_array = np.ascontiguousarray(pending_values, dtype=np.float64)
+        values_include_prior = False
+        if (
+            self.objective_mode == "charge_time"
+            and hasattr(self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0")
+        ):
+            values_array = self.pmt_model.get_neg_log_likelihood_npe_t_many_t0(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                shift_array,
+                timing_pes=timing_pes,
+            )
+        elif (
+            self.objective_mode == "timing_only"
+            and hasattr(self.pmt_model, "get_neg_log_likelihood_t_many_t0")
+        ):
+            values_array = self.pmt_model.get_neg_log_likelihood_t_many_t0(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                shift_array,
+                timing_pes=timing_pes,
+            )
+        else:
+            values_array = np.asarray(
+                [self._prediction_nll(prediction, float(v)) for v in shift_array],
+                dtype=np.float64,
+            )
+            values_include_prior = True
+
+        values_array = np.asarray(values_array, dtype=np.float64).reshape(-1)
+        if values_array.size != len(pending_indices):
+            raise RuntimeError("batched t0 likelihood returned the wrong size")
+        if (
+            not values_include_prior
+            and self.use_t0_prior
+            and self.objective_mode != "charge_only"
+            and self.t0_prior_sigma
+        ):
+            values_array = values_array + 0.5 * (
+                shift_array / float(self.t0_prior_sigma)
+            ) ** 2
+
+        for index, key, value in zip(
+            pending_indices, pending_keys, values_array, strict=True
+        ):
+            fval = float(value)
+            if not math.isfinite(fval):
+                self.invalid_evaluations += 1
+                fval = np.inf
+            self.cache[key] = fval
+            out[index] = fval
+        return out
 
     def __call__(self, values: Mapping[str, float]) -> float:
         self.calls += 1
@@ -616,6 +868,13 @@ class TrackObjective:
                 ),
             )
             self.prediction_cache[geometry_key] = prediction
+            self.event_mean_contamination_cache[geometry_key] = float(
+                getattr(
+                    self.emitter,
+                    "_last_event_mean_contamination_fraction",
+                    0.0,
+                )
+            )
         else:
             prediction = self.prediction_cache[geometry_key]
         if prediction is None:
@@ -1081,6 +1340,8 @@ def track_aligned_block_optimize(
         history.append(
             {
                 "sweep": int(sweep),
+                "sweep_start_fval": float(sweep_start),
+                "sweep_gain": float(sweep_start - fval),
                 "fval": float(fval),
                 "nfcn": int(objective.evaluations - nfcn_start),
                 "invalid_evaluations": int(objective.invalid_evaluations - invalid_start),
@@ -1128,6 +1389,265 @@ def track_aligned_block_optimize(
     )
 
 
+def cobyqa_exact_continuation(
+    objective: TrackObjective,
+    start_values: Mapping[str, float],
+    *,
+    fixed_params: Mapping[str, float] | None = None,
+    initial_steps: OptimizerSteps = OptimizerSteps(),
+    length_limits: tuple[float, float] = (0.0, 3000.0),
+    full_range_limits: tuple[float, float] | None = None,
+    allow_longitudinal: bool = True,
+    allow_transverse: bool = True,
+    allow_direction: bool = True,
+    project_vertex_steps: bool = False,
+    max_evaluations: int = 240,
+    initial_trust_radius: float = 1.0,
+    final_trust_radius: float = 5.0e-3,
+    poll_radii: Sequence[float] = (1.0e-2, 3.0e-3),
+    poll_tolerance: float = 1.0e-3,
+    max_restarts: int = 2,
+    initial_errors: Mapping[str, float] | None = None,
+) -> tuple[BlockOptimizerResult, dict[str, object]]:
+    """Derivative-free exact continuation in the existing physical fit chart.
+
+    Active coordinates, fixed-parameter handling, detector projection, endpoint
+    inequalities, and track topology are exactly those of the block optimizer.
+    Standardized COBYQA coordinates merely scale each active physical direction
+    by the carried trust radius; they are not an additional physical model.
+    """
+
+    wall0 = time.perf_counter()
+    fixed = {} if fixed_params is None else {
+        str(name): float(value) for name, value in fixed_params.items()
+    }
+    base = {str(name): float(value) for name, value in start_values.items()}
+    base.setdefault("dir_u", 0.0)
+    base.setdefault("dir_v", 0.0)
+    base.setdefault("t0", 0.0)
+    for name, value in fixed.items():
+        if name in base:
+            base[name] = value
+    if not objective.detector.contains([base["x0"], base["y0"], base["z0"]]):
+        raise ValueError("COBYQA continuation start vertex lies outside detector volume")
+    if objective.track_end_mode == "absorption" and full_range_limits is None:
+        raise ValueError("absorption continuation requires full_range_limits")
+
+    vertex_basis = _free_vertex_basis(objective.chart, fixed)
+    blocks = _active_blocks(
+        track_end_mode=objective.track_end_mode,
+        objective_mode=objective.objective_mode,
+        fixed_params=fixed,
+        allow_longitudinal=bool(allow_longitudinal),
+        allow_transverse=bool(allow_transverse),
+        allow_direction=bool(allow_direction),
+        vertex_basis=vertex_basis,
+    )
+    dimensions = tuple(dict.fromkeys(
+        dimension for block in blocks for dimension in block.dimensions
+    ))
+    if not dimensions:
+        raise ValueError("COBYQA continuation has no active fit dimensions")
+    scales = np.asarray(
+        [_step_for_dimension(name, initial_steps) for name in dimensions],
+        dtype=np.float64,
+    )
+    if np.any(~np.isfinite(scales)) or np.any(scales <= 0.0):
+        raise ValueError("COBYQA continuation scales must be positive and finite")
+
+    nfcn_start = int(objective.evaluations)
+    invalid_start = int(objective.invalid_evaluations)
+    initial_fval = float(objective(base))
+    if not math.isfinite(initial_fval):
+        raise RuntimeError("non-finite COBYQA continuation start FCN")
+    invalid_penalty = max(1.0e6, abs(initial_fval) + 1.0e6)
+    cache: dict[tuple[float, ...], tuple[float, float | None, dict[str, float]]] = {}
+    history: list[dict[str, object]] = []
+
+    def values_from_scaled(scaled) -> dict[str, float]:
+        x = np.asarray(scaled, dtype=np.float64).reshape(len(dimensions))
+        updates = {
+            name: float(x[index] * scales[index])
+            for index, name in enumerate(dimensions)
+        }
+        return _apply_dimension_updates(
+            base,
+            updates,
+            chart=objective.chart,
+            detector=objective.detector,
+            vertex_basis=vertex_basis,
+            fixed_params=fixed,
+            length_limits=length_limits,
+            full_range_limits=full_range_limits,
+            track_end_mode=objective.track_end_mode,
+            project_vertex_steps=bool(project_vertex_steps),
+        )
+
+    def evaluate_scaled(scaled) -> float:
+        x = np.asarray(scaled, dtype=np.float64).reshape(len(dimensions))
+        key = tuple(np.round(x, 12))
+        cached = cache.get(key)
+        if cached is not None:
+            return float(cached[0])
+        candidate = values_from_scaled(x)
+        exact = float(objective(candidate))
+        physical = math.isfinite(exact)
+        value = exact if physical else invalid_penalty * (
+            1.0 + 1.0e-6 * float(x @ x)
+        )
+        cache[key] = (float(value), exact if physical else None, candidate)
+        history.append({
+            "scaled_coordinates": np.ascontiguousarray(x.copy()),
+            "values": dict(candidate),
+            "objective_value": float(value),
+            "exact_fval": float(exact) if physical else None,
+            "physical": bool(physical),
+        })
+        return float(value)
+
+    def best_physical():
+        physical = [entry for entry in history if entry["physical"]]
+        if not physical:
+            raise RuntimeError("COBYQA continuation found no physical exact point")
+        return min(physical, key=lambda entry: float(entry["exact_fval"]))
+
+    def poll(center_scaled):
+        center = np.asarray(center_scaled, dtype=np.float64)
+        center_value = float(evaluate_scaled(center))
+        best_value = center_value
+        best_scaled = center.copy()
+        rows = []
+        maximum_downhill = 0.0
+        for radius in tuple(float(value) for value in poll_radii):
+            radius_downhill = 0.0
+            physical_trials = 0
+            for index in range(len(dimensions)):
+                for sign in (-1.0, 1.0):
+                    trial = center.copy()
+                    trial[index] += sign * radius
+                    value = float(evaluate_scaled(trial))
+                    row = cache[tuple(np.round(trial, 12))]
+                    if row[1] is None:
+                        continue
+                    physical_trials += 1
+                    downhill = center_value - float(row[1])
+                    radius_downhill = max(radius_downhill, downhill)
+                    if float(row[1]) < best_value:
+                        best_value = float(row[1])
+                        best_scaled = trial.copy()
+            maximum_downhill = max(maximum_downhill, radius_downhill)
+            rows.append({
+                "radius_scaled": radius,
+                "max_downhill_nll": float(radius_downhill),
+                "physical_trials": int(physical_trials),
+            })
+        return {
+            "base_value": center_value,
+            "best_value": best_value,
+            "best_scaled": np.ascontiguousarray(best_scaled),
+            "max_downhill_nll": float(maximum_downhill),
+            "rows": tuple(rows),
+        }
+
+    def run(start, initial_radius):
+        return minimize(
+            evaluate_scaled,
+            np.asarray(start, dtype=np.float64),
+            method="COBYQA",
+            options={
+                "maxfev": max(1, int(max_evaluations)),
+                "initial_tr_radius": float(initial_radius),
+                "final_tr_radius": float(final_trust_radius),
+                "scale": False,
+                "disp": False,
+            },
+        )
+
+    attempts = []
+    result = run(np.zeros(len(dimensions), dtype=np.float64), initial_trust_radius)
+    attempts.append(result)
+    best = best_physical()
+    best_scaled = np.asarray(best["scaled_coordinates"], dtype=np.float64)
+    certificate = poll(best_scaled)
+    restart_count = 0
+    while (
+        float(certificate["max_downhill_nll"]) > float(poll_tolerance)
+        and restart_count < max(0, int(max_restarts))
+    ):
+        restart_start = np.asarray(certificate["best_scaled"], dtype=np.float64)
+        result = run(
+            restart_start,
+            max(10.0 * float(final_trust_radius), 5.0e-2 / (2.0 ** restart_count)),
+        )
+        attempts.append(result)
+        restart_count += 1
+        best = best_physical()
+        best_scaled = np.asarray(best["scaled_coordinates"], dtype=np.float64)
+        certificate = poll(best_scaled)
+
+    best = best_physical()
+    final_values = dict(best["values"])
+    final_fval = float(best["exact_fval"])
+    errors = {
+        "x0": np.nan, "y0": np.nan, "z0": np.nan,
+        "dir_u": np.nan, "dir_v": np.nan,
+        "length": np.nan, "visible_length": np.nan,
+        "full_range": np.nan, "t0": np.nan,
+    }
+    if initial_errors is not None:
+        for name, value in initial_errors.items():
+            errors[str(name)] = float(value)
+    backend_diagnostics = {
+        "backend": "cobyqa_exact_physical_chart",
+        "active_dimensions": dimensions,
+        "scales": tuple(float(value) for value in scales),
+        "initial_fval": initial_fval,
+        "final_fval": final_fval,
+        "gain_nll": float(initial_fval - final_fval),
+        "nfev": int(len(cache)),
+        "restart_count": int(restart_count),
+        "max_restarts": int(max_restarts),
+        "max_evaluations_per_attempt": int(max_evaluations),
+        "converged": bool(
+            float(certificate["max_downhill_nll"]) <= float(poll_tolerance)
+        ),
+        "max_poll_downhill_nll": float(certificate["max_downhill_nll"]),
+        "poll_tolerance_nll": float(poll_tolerance),
+        "poll": tuple(certificate["rows"]),
+        "optimizer_attempts": tuple({
+            "success": bool(attempt.success),
+            "message": str(attempt.message),
+            "nfev": int(getattr(attempt, "nfev", 0)),
+            "nit": int(getattr(attempt, "nit", -1)),
+        } for attempt in attempts),
+    }
+    result_history = [{
+        "sweep": 0,
+        "sweep_start_fval": initial_fval,
+        "sweep_gain": float(initial_fval - final_fval),
+        "fval": final_fval,
+        "nfcn": int(objective.evaluations - nfcn_start),
+        "invalid_evaluations": int(objective.invalid_evaluations - invalid_start),
+        "values": dict(final_values),
+        "steps": {
+            name: float(scales[index]) for index, name in enumerate(dimensions)
+        },
+        "adaptive_backend": "cobyqa_exact_physical_chart",
+        "backend_diagnostics": dict(backend_diagnostics),
+    }]
+    return BlockOptimizerResult(
+        values=final_values,
+        fval=final_fval,
+        errors=errors,
+        nfcn=int(objective.evaluations - nfcn_start),
+        history=result_history,
+        chart=objective.chart,
+        wall_s=float(time.perf_counter() - wall0),
+        invalid_evaluations=int(objective.invalid_evaluations - invalid_start),
+        quadratic_skips=0,
+    ), backend_diagnostics
+
+
 def profile_t0(
     objective,
     values: Mapping[str, float],
@@ -1172,13 +1692,36 @@ def profile_t0(
         samples[key] = value
         return value
 
+    def evaluate_many(points) -> None:
+        requested: list[float] = []
+        requested_keys: list[float] = []
+        for point in points:
+            t = float(np.clip(float(point), lo, hi))
+            key = round(t, 12)
+            if key in samples or key in requested_keys:
+                continue
+            requested.append(t)
+            requested_keys.append(key)
+        if not requested:
+            return
+        if hasattr(objective, "evaluate_t0_many"):
+            values_array = np.asarray(
+                objective.evaluate_t0_many(base, requested), dtype=np.float64
+            ).reshape(-1)
+            if values_array.size != len(requested):
+                raise RuntimeError("batched t0 objective returned the wrong size")
+            for key, value in zip(requested_keys, values_array, strict=True):
+                samples[key] = float(value)
+        else:
+            for point in requested:
+                evaluate(point)
+
     if hi == lo:
         evaluate(lo)
     else:
         n = max(1, int(math.ceil((hi - lo) / step)))
         grid = np.linspace(lo, hi, n + 1, dtype=np.float64)
-        for point in grid:
-            evaluate(float(point))
+        evaluate_many(grid)
 
         for _ in range(max(0, int(refine_levels))):
             finite = [(t, f) for t, f in samples.items() if math.isfinite(f)]
@@ -1189,8 +1732,7 @@ def profile_t0(
             local_lo = max(lo, best_t - step)
             local_hi = min(hi, best_t + step)
             n_local = max(2, int(math.ceil((local_hi - local_lo) / new_step)))
-            for point in np.linspace(local_lo, local_hi, n_local + 1):
-                evaluate(float(point))
+            evaluate_many(np.linspace(local_lo, local_hi, n_local + 1))
             step = new_step
 
     finite = [(t, f) for t, f in samples.items() if math.isfinite(f)]
@@ -1971,8 +2513,17 @@ def filter_seed_grid_for_fixed_parameters(
     fixed_params: Mapping[str, float] | None = None,
     fixed_direction: Sequence[float] | None = None,
     full_range_limits: tuple[float, float] | None = None,
+    prevalidated: bool = False,
 ) -> list[dict[str, object]]:
-    """Apply fixed values, reject nonphysical rows, and deduplicate."""
+    """Apply fixed values, reject nonphysical rows, and deduplicate.
+
+    ``prevalidated=True`` is an explicit contract for seed builders that have
+    already checked every vertex, direction, visible length, full range and
+    detector segment.  It avoids repeating the comparatively expensive ray
+    intersection for an unchanged bank.  Any fixed value other than ``t0`` (or
+    any fixed direction) can change physicality and therefore automatically
+    restores the complete validation path.
+    """
     fixed = {} if fixed_params is None else dict(fixed_params)
     fixed_d = None
     if fixed_direction is not None:
@@ -1985,6 +2536,11 @@ def filter_seed_grid_for_fixed_parameters(
         ):
             raise ValueError("fixed_direction must be a finite nonzero 3-vector")
         fixed_d = fixed_d / norm
+    must_validate = (
+        not bool(prevalidated)
+        or fixed_d is not None
+        or any(str(name) != "t0" for name in fixed)
+    )
     output: list[dict[str, object]] = []
     for original in seeds:
         seed = dict(original)
@@ -2003,6 +2559,9 @@ def filter_seed_grid_for_fixed_parameters(
                     "cz_sign": -1.0 if float(fixed_d[2]) < 0.0 else 1.0,
                 }
             )
+        if not must_validate:
+            output.append(seed)
+            continue
         try:
             direction = direction_from_mapping(seed)
             vertex = np.asarray(
@@ -2479,6 +3038,19 @@ def predict_charge_and_process_jacobian(
     emitter.primary_mcs_process_modes_per_plane = int(process_modes_per_plane)
     emitter.primary_mcs_process_grid_points = int(process_grid_points)
     emitter.compute_primary_mcs_process_jacobian = bool(need_process_jacobian)
+    # This helper represents a contained full-length hypothesis: ``length`` is
+    # the remaining CSDA range to Cherenkov threshold.  The production template
+    # can be configured in abrupt mode to support boundary-clipped straight
+    # fits, but carrying that fixed nominal KE into this contained FE context
+    # makes the precomputed emitter's full range disagree with ``length``.
+    # Reset the copied emitter explicitly; never mutate the shared template.
+    if hasattr(emitter, "configure_track_end"):
+        emitter.configure_track_end(
+            "threshold", fixed_initial_KE=None, refresh=False
+        )
+    else:
+        emitter.track_end_mode = "threshold"
+        emitter.fixed_initial_KE = None
     emitter.start_coord = tuple(float(x) for x in vertex)
     emitter.direction = tuple(float(x) for x in direction)
     emitter.starting_time = 0.0

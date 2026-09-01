@@ -5,7 +5,7 @@ three public fit modes. Normal users should configure and launch it through
 ``run_wcte.py`` or ``run_wcsim.py`` in this directory rather than editing this
 large implementation file directly:
 
-    FIT_MODE = "full_length"
+    FIT_MODE = "beam"
         Fast seven-parameter internal-start fit. The fitted longitudinal
         coordinate is the remaining CSDA range; the visible optical support is
         clipped at the detector boundary when an energetic particle exits.
@@ -14,7 +14,7 @@ large implementation file directly:
         Original fast eight-parameter abrupt-endpoint fit with separate visible
         length and full range / initial kinetic energy.
 
-    FIT_MODE = "cosmic"
+    FIT_MODE = "general"
         More careful geometry-clipped fit supporting all four combinations of
         start inside/outside and stop inside/outside.
 
@@ -23,8 +23,8 @@ sections into the driver's environment interface and then execute this file
 directly. Direct execution and the fallback defaults below remain supported for
 backward compatibility.
 The four engine implementations are embedded in this file, so no
-``_batch_fit_driver_*`` files and no separate cosmic supervisor are required.
-Both WCSim and real-WCTE cosmic operation use the same compact-charge,
+``_batch_fit_driver_*`` files and no separate supervisor are required.
+Both WCSim and real-WCTE general operation use the same compact-charge,
 causal-timing, two-anchor, exact range/topology, and analytic mPMT-boundary
 reconstruction core.  Only the input/calibration adapter differs.  Real WCTE
 ROOT selection is provided by the shared ``analysis_tools.DataLoader`` and
@@ -37,13 +37,125 @@ from __future__ import annotations
 import base64
 import faulthandler
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import sys
-import zlib
 
-UNIFIED_DRIVER_RELEASE = "2026-08-11-three-mode-nonmcs-universal-v1.24-absorption-navigation"
+_DRIVER_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_DRIVER_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DRIVER_PROJECT_ROOT))
+
+from LicketyFit.event_indexing import resolve_event_window
+from LicketyFit.adaptive_exact import continue_adaptive_exact
+from LicketyFit.mcs_configuration import (
+    coherent_warmup_action,
+    default_coherent_modes_per_plane,
+    validate_coherent_configuration,
+)
+from LicketyFit.runtime_cache import runtime_cache_content_tag
+from LicketyFit.cosmic_basin_arbitration import (
+    select_coherent_basin_payloads,
+)
+from LicketyFit.absolute_light_calibration import (
+    file_sha256 as absolute_light_file_sha256,
+    load_calibration_manifest,
+    validate_pmt_charge_response_context,
+    validate_wcte_runtime_context,
+)
+
+
+def _runtime_pmt_charge_response_metadata(pmt_model):
+    """Serialize the detector response that turns latent PEs into charge."""
+    model = str(pmt_model.spe_response_model).strip().lower().replace("-", "_")
+    if model == "wcsim_r14374_ski":
+        from LicketyFit.wcsim_charge_response import response_metadata
+
+        return response_metadata()
+    if model == "gaussian_censored":
+        return {
+            "model": model,
+            "single_pe_amp_mean": float(pmt_model.single_pe_amp_mean),
+            "single_pe_amp_std": float(pmt_model.single_pe_amp_std),
+            "amp_threshold_pe": float(pmt_model.amp_threshold),
+        }
+    raise ValueError(f"unsupported PMT charge-response model {model!r}")
+
+
+def _prepare_numba_thread_budget(requested: int) -> int:
+    """Set Numba's pool size before import, or respect an existing pool.
+
+    Numba permits changing the active thread count after initialization but
+    not the maximum pool encoded by ``NUMBA_NUM_THREADS``.  Test notebooks and
+    embedded callers may already have launched that pool, so mutating the
+    environment at that point causes Numba's next configuration reload to
+    raise.  A fresh production process still receives the requested pool size.
+    """
+    requested = max(1, int(requested))
+    if "numba" not in sys.modules:
+        os.environ.setdefault("NUMBA_NUM_THREADS", str(requested))
+        return requested
+    try:
+        from numba import config as numba_config
+
+        maximum = max(1, int(numba_config.NUMBA_NUM_THREADS))
+    except Exception:
+        return requested
+    return min(requested, maximum)
+
+
+UNIFIED_DRIVER_RELEASE = "2026-08-31-v1.43.0-mode-rename-beam-speed"
+
+
+_REMOVED_COSMIC_MODEL_ENV_SWITCHES = (
+    "COSMIC_FERMI_EYGES_ENABLED",
+    "COSMIC_COHERENT_PROFILE_ENABLED",
+    "COSMIC_JOINT_ENERGY_RANGE_ENABLED",
+)
+
+
+def _cosmic_model_switches_from_emitter(emitter_switches):
+    """Resolve the one authoritative cosmic continuation selected in Emitter.py."""
+    for name in _REMOVED_COSMIC_MODEL_ENV_SWITCHES:
+        if os.environ.get(name, "").strip():
+            raise ValueError(
+                f"{name} has been removed. Use COSMIC_MCS_CONTINUATION in "
+                "scripts/run_wcte.py or scripts/run_wcsim.py (or the validated "
+                "EMITTER_COSMIC_MCS_CONTINUATION direct-driver interface)."
+            )
+    if (
+        str(_UNIFIED_FIT_MODE).strip().lower() != "cosmic"
+        or not bool(emitter_switches.get("enable_mcs", True))
+    ):
+        return {
+            "model": "off",
+            "linear_fermi_eyges": False,
+            "coherent_fermi_eyges": False,
+            "joint_k0_range_gaussian_fe": False,
+            "joint_k0_range_mixed_mcs": False,
+            "joint_energy_range": False,
+        }
+    model = str(emitter_switches["cosmic_mcs_continuation"])
+    return {
+        "model": model,
+        "linear_fermi_eyges": bool(
+            emitter_switches["enable_cosmic_linear_fermi_eyges"]
+        ),
+        "coherent_fermi_eyges": bool(
+            emitter_switches["enable_cosmic_coherent_fermi_eyges"]
+        ),
+        "joint_k0_range_gaussian_fe": bool(
+            emitter_switches["enable_cosmic_joint_k0_range_gaussian_fe"]
+        ),
+        "joint_k0_range_mixed_mcs": bool(
+            emitter_switches["enable_cosmic_joint_k0_range_mixed_mcs"]
+        ),
+        "joint_energy_range": bool(
+            emitter_switches["enable_cosmic_joint_k0_range_gaussian_fe"]
+            or emitter_switches["enable_cosmic_joint_k0_range_mixed_mcs"]
+        ),
+    }
 
 # =============================================================================
 # BACKWARD-COMPATIBILITY FALLBACK DEFAULTS
@@ -54,8 +166,8 @@ UNIFIED_DRIVER_RELEASE = "2026-08-11-three-mode-nonmcs-universal-v1.24-absorptio
 # Which input/calibration adapter to use: "wcsim" or "wcte".
 DEFAULT_DATA_SOURCE = "wcsim"
 
-# Exactly one of: "full_length", "absorption", "cosmic".
-DEFAULT_FIT_MODE = "cosmic"
+# Exactly one public mode: "beam", "absorption", or "general".
+DEFAULT_FIT_MODE = "general"
 
 # Shared settings.
 DEFAULT_FIT_PARTICLE = "muon"
@@ -126,7 +238,7 @@ DEFAULT_WCTE_GOOD_PMT_ROOT_SEARCH_BASES = ()
 # Reject silent integer truncation, mixed per-event identities, non-finite hit
 # values, negative charge and malformed WCTE PMT IDs in user event files.
 DEFAULT_WCTE_STRICT_USER_EVENT_VALIDATION = True
-DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_only"
+DEFAULT_WCTE_LIKELIHOOD_MODE = "charge_time"
 DEFAULT_WCTE_BEAM_MOMENTUM_MEV_C = 430.0
 DEFAULT_WCTE_REL_EFF_MODE = "slot"
 DEFAULT_WCTE_PLACEMENT_KEY = "est"
@@ -146,6 +258,7 @@ DEFAULT_WCTE_TIME_REFERENCE_LOCAL_HALF_WIDTH_NS = 1.0
 # It is intentionally not the default until a detector/run calibration is frozen.
 DEFAULT_WCTE_CHARGE_NORMALIZATION_MODE = "event_mean"
 DEFAULT_WCTE_GLOBAL_CHARGE_SCALE = None
+DEFAULT_WCTE_GLOBAL_CHARGE_CALIBRATION_ID = ""
 # The selected beam population and fitted particle hypothesis are independent.
 # Nominal analysis_tools selections exist for muon, pion, electron and proton.
 # LicketyFit fit hypotheses currently exist for muon, pion, kaon and proton; an
@@ -227,8 +340,8 @@ def _configure_process_runtime_environment() -> None:
         or os.environ.get("TMPDIR", "").strip()
         or "/tmp"
     )
-    project_identity = str(Path(__file__).resolve().parent.parent)
-    project_tag = f"{zlib.crc32(project_identity.encode('utf-8')) & 0xffffffff:08x}"
+    project_root = Path(__file__).resolve().parent.parent
+    project_tag = runtime_cache_content_tag(project_root)
     runtime_root = Path(cache_base).expanduser() / (
         f"licketyfit-{os.getuid()}-{project_tag}-"
         f"py{sys.version_info.major}{sys.version_info.minor}"
@@ -290,7 +403,16 @@ def _receiver_status_without_prefork_native_load(
     return status
 
 _VALID_DATA_SOURCES = {"wcsim", "wcte"}
-_VALID_FIT_MODES = {"full_length", "absorption", "cosmic"}
+_VALID_FIT_MODES = {"beam", "absorption", "general"}
+_LEGACY_FIT_MODE_ALIASES = {
+    "full_length": "beam",
+    "cosmic": "general",
+}
+_INTERNAL_FIT_MODE_BY_PUBLIC = {
+    "beam": "full_length",
+    "absorption": "absorption",
+    "general": "cosmic",
+}
 
 
 def _normalize_choice(value: str, allowed: set[str], label: str) -> str:
@@ -299,6 +421,13 @@ def _normalize_choice(value: str, allowed: set[str], label: str) -> str:
         choices = ", ".join(sorted(allowed))
         raise ValueError(f"{label} must be one of: {choices}")
     return normalized
+
+
+def _normalize_public_fit_mode(value: str) -> str:
+    """Canonicalize the public mode while accepting the two retired names."""
+    normalized = str(value).strip().lower().replace("-", "_")
+    normalized = _LEGACY_FIT_MODE_ALIASES.get(normalized, normalized)
+    return _normalize_choice(normalized, _VALID_FIT_MODES, "FIT_MODE")
 
 
 def _setdefault_text(name: str, value) -> None:
@@ -322,6 +451,259 @@ def _run_config_provenance() -> dict[str, str] | None:
         "kind": config_kind,
         "file": config_file,
         "sha256": config_sha256,
+    }
+
+
+def _validate_charge_likelihood_calibration(
+    *,
+    normalization_mode: str,
+    global_scale,
+    calibration_id: str,
+    environment_prefix: str,
+) -> str:
+    """Validate the absolute-charge contract and return the PMT mode.
+
+    The calibrated compound-SPE likelihood is meaningful only when Emitter
+    predictions retain an independently calibrated, event-independent absolute
+    scale.  Enforce that contract in the direct batch driver as well as in the
+    public launchers so a stale shell invocation cannot silently profile the
+    event total.
+    """
+    charge_mode = os.environ.get(
+        "PMT_CHARGE_LIKELIHOOD", "poisson_pe"
+    ).strip().lower().replace("-", "_")
+    if charge_mode != "compound_spe_calibrated":
+        return charge_mode
+    if str(normalization_mode) != "global_scale":
+        raise ValueError(
+            "PMT_CHARGE_LIKELIHOOD=compound_spe_calibrated requires "
+            f"{environment_prefix}_CHARGE_NORMALIZATION_MODE=global_scale"
+        )
+    if (
+        global_scale is None
+        or not math.isfinite(float(global_scale))
+        or float(global_scale) <= 0.0
+    ):
+        raise ValueError(
+            "PMT_CHARGE_LIKELIHOOD=compound_spe_calibrated requires a "
+            f"positive {environment_prefix}_GLOBAL_CHARGE_SCALE"
+        )
+    if not str(calibration_id).strip():
+        raise ValueError(
+            "PMT_CHARGE_LIKELIHOOD=compound_spe_calibrated requires a "
+            f"non-empty {environment_prefix}_GLOBAL_CHARGE_CALIBRATION_ID"
+        )
+    manifest_variable = f"{environment_prefix}_GLOBAL_CHARGE_CALIBRATION_MANIFEST"
+    manifest_path = os.environ.get(manifest_variable, "").strip()
+    if not manifest_path:
+        raise ValueError(
+            "PMT_CHARGE_LIKELIHOOD=compound_spe_calibrated requires an "
+            f"immutable {manifest_variable}"
+        )
+    manifest_sha_variable = f"{manifest_variable}_SHA256"
+    expected_manifest_sha = os.environ.get(manifest_sha_variable, "").strip()
+    if not expected_manifest_sha:
+        raise ValueError(
+            "absolute-light calibration requires the launcher-provided "
+            f"{manifest_sha_variable}"
+        )
+    actual_manifest_sha = absolute_light_file_sha256(manifest_path)
+    if actual_manifest_sha != expected_manifest_sha:
+        raise ValueError(
+            "absolute-light calibration manifest changed after launcher "
+            f"validation: {actual_manifest_sha} != {expected_manifest_sha}"
+        )
+    manifest = load_calibration_manifest(
+        manifest_path,
+        expected_detector=environment_prefix.lower(),
+        expected_particle=os.environ.get("FIT_PARTICLE", "muon"),
+        project_root=_DRIVER_PROJECT_ROOT,
+        verify_model_files=True,
+    )
+    if not math.isclose(
+        float(manifest["global_charge_scale"]),
+        float(global_scale),
+        rel_tol=0.0,
+        abs_tol=1.0e-15,
+    ):
+        raise ValueError(
+            "absolute-light manifest scale does not match the active global scale"
+        )
+    if str(manifest["calibration_id"]) != str(calibration_id).strip():
+        raise ValueError(
+            "absolute-light manifest identity does not match the active "
+            "calibration ID"
+        )
+    validate_pmt_charge_response_context(
+        manifest,
+        model=os.environ.get("PMT_SPE_RESPONSE_MODEL", "gaussian_censored"),
+        single_pe_amp_mean=float(
+            os.environ.get("PMT_SINGLE_PE_AMP_MEAN", "1.0")
+        ),
+        single_pe_amp_std=float(
+            os.environ.get("PMT_SINGLE_PE_AMP_STD", "0.3")
+        ),
+        amp_threshold_pe=0.2,
+    )
+    if environment_prefix in {"WCSIM", "WCTE"}:
+        model_contract = manifest.get("model_contract", {})
+        expected_reflection = model_contract.get(
+            "analytic_reflection_in_charge"
+        )
+        if not isinstance(expected_reflection, bool):
+            raise ValueError(
+                f"{environment_prefix} absolute-light manifest must declare boolean "
+                "model_contract.analytic_reflection_in_charge"
+            )
+        reflection_value = os.environ.get(
+            "EMITTER_REFLECTION_IN_CHARGE", ""
+        ).strip().lower()
+        active_reflection = reflection_value in {"1", "true", "yes", "on"}
+        if active_reflection != expected_reflection:
+            raise ValueError(
+                f"the {environment_prefix} absolute-light calibration reflection-charge "
+                "contract does not match EMITTER_REFLECTION_IN_CHARGE"
+            )
+        expected_reflection_policy = str(
+            model_contract.get(
+                "analytic_reflection_charge_policy", "unconditional"
+            )
+        ).strip().lower().replace("-", "_")
+        active_reflection_policy = os.environ.get(
+            "EMITTER_REFLECTION_CHARGE_POLICY", "unconditional"
+        ).strip().lower().replace("-", "_")
+        if active_reflection_policy != expected_reflection_policy:
+            raise ValueError(
+                f"the {environment_prefix} absolute-light calibration "
+                "reflection-charge policy does not match "
+                "EMITTER_REFLECTION_CHARGE_POLICY"
+            )
+    if environment_prefix == "WCTE":
+        # WCTE's global light scale is downstream of the per-mPMT data/MC
+        # efficiency correction and ADC-to-PE conversion.  Bind the frozen
+        # calibration to those active settings so a shell invocation cannot
+        # silently reuse a scale derived under a different detector response.
+        active_rel_eff = os.environ.get("REL_EFF_MODE", "slot").strip().lower().replace(
+            "-", "_"
+        )
+        calibrated_rel_eff = os.environ.get(
+            "WCTE_GLOBAL_CHARGE_CALIBRATION_REL_EFF_MODE", ""
+        ).strip().lower().replace("-", "_")
+        if calibrated_rel_eff != active_rel_eff:
+            raise ValueError(
+                "WCTE absolute-light calibration relative-efficiency mode "
+                f"{calibrated_rel_eff!r} does not match active REL_EFF_MODE "
+                f"{active_rel_eff!r}"
+            )
+        active_adc_text = os.environ.get("CHARGE_ADC_PER_PE", "143.0").strip()
+        calibrated_adc_text = os.environ.get(
+            "WCTE_GLOBAL_CHARGE_CALIBRATION_ADC_PER_PE", ""
+        ).strip()
+        active_adc = float(active_adc_text or "143.0")
+        calibrated_adc = (
+            None if not calibrated_adc_text else float(calibrated_adc_text)
+        )
+        if calibrated_adc is None or not math.isclose(
+            float(calibrated_adc), float(active_adc), rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            raise ValueError(
+                "WCTE absolute-light calibration ADC-per-PE conversion does "
+                "not match active CHARGE_ADC_PER_PE"
+            )
+        active_placement = os.environ.get(
+            "WCTE_PLACEMENT_KEY", "est"
+        ).strip().lower()
+        calibrated_placement = os.environ.get(
+            "WCTE_GLOBAL_CHARGE_CALIBRATION_GEOMETRY_PLACEMENT", ""
+        ).strip().lower()
+        if calibrated_placement != active_placement:
+            raise ValueError(
+                "WCTE absolute-light calibration geometry placement does not "
+                "match active WCTE_PLACEMENT_KEY"
+            )
+    return charge_mode
+
+
+def _validate_realized_wcte_absolute_light_context(
+    *,
+    relative_efficiency_metadata,
+    adc_per_pe,
+    geometry_placement,
+    detector_summary,
+    active_pmt_ids,
+) -> None:
+    """Validate hashes that exist only after WCTE geometry/masks are loaded."""
+    if os.environ.get("PMT_CHARGE_LIKELIHOOD", "").strip().lower().replace(
+        "-", "_"
+    ) != "compound_spe_calibrated":
+        return
+    manifest_path = os.environ.get(
+        "WCTE_GLOBAL_CHARGE_CALIBRATION_MANIFEST", ""
+    ).strip()
+    manifest = load_calibration_manifest(
+        manifest_path,
+        expected_detector="wcte",
+        expected_particle=os.environ.get("FIT_PARTICLE", "muon"),
+        project_root=_DRIVER_PROJECT_ROOT,
+        verify_model_files=True,
+    )
+    geometry_metadata = detector_summary.metadata()
+    validate_wcte_runtime_context(
+        manifest,
+        relative_efficiency_metadata=relative_efficiency_metadata,
+        adc_per_pe=float(adc_per_pe),
+        geometry_placement=str(geometry_placement),
+        geometry_sha256=geometry_metadata.get("geometry_sha256"),
+        active_pmt_ids=active_pmt_ids,
+    )
+
+
+def _absolute_light_calibration_metadata(environment_prefix: str) -> dict:
+    """Return explicit measured-versus-mathematical output provenance."""
+    prefix = str(environment_prefix).strip().upper()
+    enabled = os.environ.get(
+        "PMT_CHARGE_LIKELIHOOD", ""
+    ).strip().lower().replace("-", "_") == "compound_spe_calibrated"
+    if not enabled:
+        return {"enabled": False, "source": "shape_only"}
+    manifest_path = os.environ.get(
+        f"{prefix}_GLOBAL_CHARGE_CALIBRATION_MANIFEST", ""
+    ).strip()
+    manifest = load_calibration_manifest(
+        manifest_path,
+        expected_detector=prefix.lower(),
+        expected_particle=os.environ.get("FIT_PARTICLE", "muon"),
+        project_root=_DRIVER_PROJECT_ROOT,
+        verify_model_files=False,
+    )
+    ground_up = manifest.get("ground_up_light_model", {})
+    basis = str(
+        manifest.get("calibration_basis", "measured_empirical")
+    ).strip()
+    return {
+        "enabled": True,
+        "source": os.environ.get(
+            f"{prefix}_ABSOLUTE_LIGHT_YIELD_SOURCE", "unspecified"
+        ).strip(),
+        "calibration_basis": basis,
+        "manifest": str(manifest_path),
+        "manifest_sha256": os.environ.get(
+            f"{prefix}_GLOBAL_CHARGE_CALIBRATION_MANIFEST_SHA256", ""
+        ).strip(),
+        "calibration_id": str(manifest.get("calibration_id", "")),
+        "calibration_data_used": bool(
+            ground_up.get("calibration_data_used", basis != "ground_up_mathematical")
+        ),
+        "include_wcsim_qe_boosts": ground_up.get(
+            "include_wcsim_qe_boosts"
+        ),
+        "relative_systematic_uncertainty": ground_up.get(
+            "relative_systematic_uncertainty"
+        ),
+        "mathematical_estimate_warning": (
+            "engineering estimate; use measured calibration for precision data"
+            if basis == "ground_up_mathematical" else None
+        ),
     }
 
 
@@ -411,12 +793,12 @@ def _apply_unified_defaults() -> tuple[str, str]:
         _VALID_DATA_SOURCES,
         "DATA_SOURCE/LF_DATA_SOURCE",
     )
-    mode = _normalize_choice(
-        os.environ.get("FIT_MODE", DEFAULT_FIT_MODE),
-        _VALID_FIT_MODES,
-        "FIT_MODE",
+    public_mode = _normalize_public_fit_mode(
+        os.environ.get("FIT_MODE", DEFAULT_FIT_MODE)
     )
+    mode = _INTERNAL_FIT_MODE_BY_PUBLIC[public_mode]
     os.environ["LF_DATA_SOURCE"] = source
+    os.environ["LF_PUBLIC_FIT_MODE"] = public_mode
     os.environ["FIT_MODE"] = mode
 
     # Record whether the resolved truth setting came from the user's shell or
@@ -714,7 +1096,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import zipfile
 import struct
 import statistics
@@ -890,7 +1272,7 @@ def _default_wcsim_output(script_dir: Path) -> Path:
     energy = int(float(os.environ.get("ENERGY_TRUE", "300")))
     likelihood = os.environ.get("LIKELIHOOD_MODE", "charge_time").strip().lower().replace("-", "_")
     return project_root / "outputs" / (
-        f"estimates_{detector}_{particle}_{energy}MeV_cosmic_{likelihood}.dict"
+        f"estimates_{detector}_{particle}_{energy}MeV_general_{likelihood}.dict"
     )
 
 
@@ -902,7 +1284,7 @@ def _default_wcte_output(script_dir: Path) -> Path:
     likelihood = os.environ.get("LIKELIHOOD_MODE", "charge_only").strip().lower().replace("-", "_")
     rel_eff = os.environ.get("REL_EFF_MODE", "slot").strip().lower()
     return project_root / "outputs" / (
-        f"estimates_run{run}_{beam:g}p_{particle}_cosmic_"
+        f"estimates_run{run}_{beam:g}p_{particle}_general_"
         f"{likelihood}_relEff-{rel_eff}.dict"
     )
 
@@ -1223,7 +1605,7 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
 
     n_chunks = int(math.ceil(requested / chunk_size))
     print(
-        f"LicketyFit cosmic: fitting {requested} events with {nproc} workers "
+        f"LicketyFit general: fitting {requested} events with {nproc} workers "
         f"in {n_chunks} clean chunks",
         flush=True,
     )
@@ -1239,7 +1621,7 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
             child_env = os.environ.copy()
             child_env.update({
                 "LF_DATA_SOURCE": "wcsim",
-                "FIT_MODE": "cosmic",
+                "FIT_MODE": "general",
                 "LF_COSMIC_SUPERVISED_CHILD": "1",
                 "LF_EVENT_START_INDEX": str(int(absolute_start)),
                 "TOT_EVENTS": str(int(count)),
@@ -1376,7 +1758,7 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         prepare_env["TOT_EVENTS"] = str(int(prepare_limit))
     prepare_env.update({
         "LF_DATA_SOURCE": "wcte",
-        "FIT_MODE": "cosmic",
+        "FIT_MODE": "general",
         "NPROC": "1",
         "LF_WCTE_PREPARE_EVENTS_ONLY": "1",
         "LF_WCTE_PREPARED_EVENT_FILE": str(prepared_path),
@@ -1384,7 +1766,7 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         "LF_COSMIC_SUPERVISED_CHILD": "1",
     })
 
-    print("LicketyFit cosmic: preparing selected WCTE events", flush=True)
+    print("LicketyFit general: preparing selected WCTE events", flush=True)
     wall0 = time.perf_counter()
     prepare_env.update({
         "LF_COSMIC_CHILD_QUIET": "1",
@@ -1429,7 +1811,7 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
     chunk_size = max(1, min(max_events, nproc * tasks_per_worker))
     n_chunks = int(math.ceil(requested / chunk_size))
     print(
-        f"LicketyFit cosmic: fitting {requested} selected WCTE events with "
+        f"LicketyFit general: fitting {requested} selected WCTE events with "
         f"{nproc} workers in {n_chunks} clean chunks",
         flush=True,
     )
@@ -1447,7 +1829,7 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             child_env = os.environ.copy()
             child_env.update({
                 "LF_DATA_SOURCE": "wcte",
-                "FIT_MODE": "cosmic",
+                "FIT_MODE": "general",
                 "EVENT_SOURCE": "file",
                 "USER_EVENT_FILE": str(prepared_path),
                 "USER_EVENT_KEY": "",
@@ -1840,6 +2222,237 @@ def _print_optional_wcsim_truth(record: Mapping[str, Any] | None) -> None:
     )
 
 
+def _apply_internal_start_longitudinal_gauge(
+    values: Mapping[str, object],
+    *,
+    start_hypothesis: str,
+    refractive_index: float,
+    range_lookup=None,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Return optimizer coordinates unchanged, retaining legacy audit fields.
+
+    Appendix I of the physical-longitudinal handoff removed the v1.35 post-fit
+    reporting gauge: its translated point was not selected by the likelihood
+    and could mask a real MCS/topology failure.  Event time remains free.  This
+    compatibility helper deliberately has no feature switch and cannot move a
+    fitted coordinate, even if an old environment still requests the removed
+    behavior.
+    """
+    raw_values = dict(values)
+    public_values = dict(values)
+    max_abs_t0_ns = abs(
+        _env_float("WCSIM_LONGITUDINAL_GAUGE_MAX_ABS_T0_NS", 0.10)
+    )
+    try:
+        raw_t0 = float(raw_values.get("t0", math.nan))
+    except (TypeError, ValueError, OverflowError):
+        raw_t0 = math.nan
+    metadata: dict[str, object] = {
+        "enabled": False,
+        "applied": False,
+        "reason": "removed_by_physical_longitudinal_reconstruction_policy",
+        "start_hypothesis": str(start_hypothesis),
+        "max_abs_t0_ns": float(max_abs_t0_ns),
+        "raw_t0_ns": float(raw_t0),
+        "public_t0_ns": float(raw_t0),
+        "excess_t0_ns": 0.0,
+        "translation_mm": 0.0,
+        "speed_of_light_mm_per_ns": 299.792458,
+        "refractive_index": float(refractive_index),
+        "legacy_environment_requested": bool(
+            _env_bool("WCSIM_LONGITUDINAL_GAUGE_ENABLED", False)
+        ),
+    }
+    return public_values, raw_values, metadata
+
+
+class _CosmicMCSContinuationFailure(RuntimeError):
+    """A converged straight cosmic fit whose optional MCS continuation failed."""
+
+
+_EVENT_MCS_STRAIGHT_FALLBACK_ACTIVE = False
+
+
+def _event_mcs_straight_fallback_active() -> bool:
+    return bool(_EVENT_MCS_STRAIGHT_FALLBACK_ACTIVE)
+
+
+def _fit_event_with_failure_record(
+    fit_callable,
+    obs_pes,
+    obs_ts,
+    *,
+    event_index: int,
+    prompt_time_min_ns: float,
+    prompt_time_max_ns: float,
+):
+    """Run one event while honoring the launcher's fail/continue policy."""
+    global _EVENT_MCS_STRAIGHT_FALLBACK_ACTIVE
+    event_wall0 = time.perf_counter()
+    try:
+        try:
+            return fit_callable(obs_pes, obs_ts)
+        except _CosmicMCSContinuationFailure as mcs_exc:
+            if not _env_bool("MCS_RETAIN_STRAIGHT_ON_FAILURE", True):
+                raise
+            import traceback
+            mcs_traceback = traceback.format_exc()
+            # Re-run only the deterministic straight pipeline.  The retry is
+            # deliberately event-local and process-local; worker processes fit
+            # events serially, and the flag is reset even if the retry fails.
+            # This rare failure path trades one repeated straight fit for a
+            # complete, auditable result instead of manufacturing curved-path
+            # coordinates from an invalid MCS initialization.
+            _EVENT_MCS_STRAIGHT_FALLBACK_ACTIVE = True
+            try:
+                result = dict(fit_callable(obs_pes, obs_ts))
+            finally:
+                _EVENT_MCS_STRAIGHT_FALLBACK_ACTIVE = False
+            failure = {
+                "failure_stage": "cosmic_mcs_continuation",
+                "failure_type": type(mcs_exc).__name__,
+                "failure_message": str(mcs_exc),
+                "failure_traceback": mcs_traceback,
+            }
+            result["mcs_status"] = "failed_straight_fallback"
+            result["mcs_failure"] = failure
+            result["mcs_process"] = {
+                "enabled": True,
+                "applied": False,
+                "status": "failed_straight_fallback",
+                **failure,
+            }
+            result["fval_definition"] = (
+                str(result.get("fval_definition", "accepted straight-track NLL"))
+                + "; cosmic MCS was attempted, failed initialization, and the "
+                "accepted straight fit was retained"
+            )
+            result["event_fit_wall_s"] = float(
+                time.perf_counter() - event_wall0
+            )
+            if _env_bool("PRINT_EVENT_RESULTS", True):
+                print(
+                    f"event {int(event_index)}: cosmic MCS continuation failed "
+                    f"({type(mcs_exc).__name__}); accepted straight fit retained",
+                    flush=True,
+                )
+            return result
+    except Exception as exc:
+        if not _env_bool("MCS_RECORD_EVENT_FAILURES", False):
+            raise
+        import traceback
+        return {
+            "event_index": int(event_index),
+            "fit_accepted": False,
+            "values": {
+                "x0": math.nan, "y0": math.nan, "z0": math.nan,
+                "cx": math.nan, "cy": math.nan, "cz": math.nan,
+                "length": math.nan, "visible_length": math.nan,
+                "full_range": math.nan, "t0": math.nan,
+            },
+            "raw_values": {
+                "x0": math.nan, "y0": math.nan, "z0": math.nan,
+                "cx": math.nan, "cy": math.nan, "cz": math.nan,
+                "length": math.nan, "visible_length": math.nan,
+                "full_range": math.nan, "t0": math.nan,
+            },
+            "longitudinal_gauge": {
+                "enabled": False,
+                "applied": False,
+                "reason": "removed_by_physical_longitudinal_reconstruction_policy",
+                "translation_mm": 0.0,
+            },
+            "errors": {},
+            "fval": math.inf,
+            "event_fit_wall_s": float(time.perf_counter() - event_wall0),
+            "total_nfcn": 0,
+            "mcs_process": None,
+            "failure_stage": "event_fit_or_mcs_reference",
+            "failure_type": type(exc).__name__,
+            "failure_message": str(exc),
+            "failure_traceback": traceback.format_exc(),
+            "prompt_time_min_ns": float(prompt_time_min_ns),
+            "prompt_time_max_ns": float(prompt_time_max_ns),
+            "worker_pid": int(os.getpid()),
+        }
+
+
+def _append_event_status_columns(
+    output: dict[str, Any], ordered: Sequence[Mapping[str, Any]]
+) -> None:
+    """Attach the same failure/MCS status contract to every embedded engine."""
+    event_failures = [
+        {
+            "event_index": int(result["event_index"]),
+            "failure_stage": str(result.get("failure_stage", "unknown")),
+            "failure_type": str(result.get("failure_type", "")),
+            "failure_message": str(result.get("failure_message", "")),
+            "failure_traceback": str(result.get("failure_traceback", "")),
+            "event_fit_wall_s": float(
+                result.get("event_fit_wall_s", math.nan)
+            ),
+            "worker_pid": int(result.get("worker_pid", -1)),
+        }
+        for result in ordered
+        if result.get("failure_type")
+    ]
+    mcs_failures = [
+        {
+            "event_index": int(result["event_index"]),
+            "failure_stage": str(
+                result.get("mcs_failure", {}).get(
+                    "failure_stage", "coherent_mcs"
+                )
+            ),
+            "failure_type": str(
+                result.get("mcs_failure", {}).get("failure_type", "")
+            ),
+            "failure_message": str(
+                result.get("mcs_failure", {}).get("failure_message", "")
+            ),
+            "failure_traceback": str(
+                result.get("mcs_failure", {}).get("failure_traceback", "")
+            ),
+            "straight_fit_retained": True,
+            "retained_fit_fval": float(result.get("fval", math.nan)),
+            "straight_fit_fval_before_range_profile": float(
+                result.get("straight_fit_fval", math.nan)
+            ),
+            "event_fit_wall_s": float(
+                result.get("event_fit_wall_s", math.nan)
+            ),
+            "worker_pid": int(result.get("worker_pid", -1)),
+        }
+        for result in ordered
+        if result.get("mcs_status") == "failed_straight_fallback"
+    ]
+    statuses = [
+        str(result.get("mcs_status", "not_requested"))
+        for result in ordered
+    ]
+    output.update({
+        "event_failures": event_failures,
+        "mcs_failures": mcs_failures,
+        "mcs_status": statuses,
+        "mcs_applied": [
+            bool(result.get("mcs_applied", status == "applied"))
+            for result, status in zip(ordered, statuses)
+        ],
+        "mcs_fit_accepted": [
+            bool(result.get("mcs_fit_accepted", status == "applied"))
+            for result, status in zip(ordered, statuses)
+        ],
+    })
+    metadata = output.setdefault("metadata", {})
+    metadata.update({
+        "n_events_accepted": int(sum(
+            bool(result.get("fit_accepted", False)) for result in ordered
+        )),
+        "n_events_failed": int(len(event_failures)),
+        "n_mcs_failed_straight_retained": int(len(mcs_failures)),
+    })
+
+
 # =============================================================================
 # SELECT ONE EMBEDDED ENGINE.  Module-level ``if`` blocks do not create a new
 # scope, so the selected engine's functions remain normal __main__ globals and
@@ -1847,10 +2460,21 @@ def _print_optional_wcsim_truth(record: Mapping[str, Any] | None) -> None:
 # The unselected engines are parsed but never imported, initialized, or run.
 # =============================================================================
 _UNIFIED_DATA_SOURCE, _UNIFIED_FIT_MODE = _apply_unified_defaults()
+_PUBLIC_FIT_MODE = os.environ["LF_PUBLIC_FIT_MODE"]
+# Publish the normalized mode before importing/constructing an Emitter. Its one
+# MCS master switch uses this value to route scattering to the ordinary
+# contained-track path or the mutually exclusive cosmic continuation.
+os.environ["FIT_MODE"] = str(_UNIFIED_FIT_MODE)
+os.environ.setdefault(
+    "PMT_SPE_RESPONSE_MODEL",
+    "wcsim_r14374_ski"
+    if _UNIFIED_DATA_SOURCE == "wcsim"
+    else "gaussian_censored",
+)
 if _UNIFIED_FIT_MODE != "cosmic" or _env_bool("VERBOSE_SETUP", False):
     print(
         f"Unified LicketyFit driver {UNIFIED_DRIVER_RELEASE}: "
-        f"DATA_SOURCE={_UNIFIED_DATA_SOURCE}, FIT_MODE={_UNIFIED_FIT_MODE}",
+        f"DATA_SOURCE={_UNIFIED_DATA_SOURCE}, FIT_MODE={_PUBLIC_FIT_MODE}",
         flush=True,
     )
     _config_provenance = _run_config_provenance()
@@ -1917,7 +2541,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-11-standard-absorption-navigation-v2"
+    DRIVER_RELEASE = "2026-08-31-standard-v9-beam-seed-speed"
 
     import hashlib
     import json
@@ -1999,6 +2623,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # LicketyFit/Emitter.py:
     #   DEFAULT_ENABLE_DELTA_E
     #   DEFAULT_ENABLE_PRIMARY_MCS
+    #   DEFAULT_COSMIC_MCS_CONTINUATION
     #   DEFAULT_ENABLE_RAYLEIGH
     #   DEFAULT_ENABLE_BLACKSHEET_REFLECTION
     # The driver prints the resolved process state at startup.
@@ -2013,6 +2638,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # Input sample and fit hypothesis.
     ENERGY_TRUE = _env_float("ENERGY_TRUE", 300.0)  # seed guidance only
     TOT_EVENTS = _env_int("TOT_EVENTS", 100)
+    EVENT_START_INDEX = max(0, _env_int("LF_EVENT_START_INDEX", 0))
 
     # Event-level multiprocessing. NPROC is the number of concurrent event workers,
     # not a statement about the intrinsic single-event latency. Set NPROC=1 only for
@@ -2061,6 +2687,34 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # Optional fixed prompt window. Leave both as None to use the event peak.
     PROMPT_MIN_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MIN_NS", None)
     PROMPT_MAX_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MAX_NS", None)
+    CHARGE_NORMALIZATION_MODE = os.environ.get(
+        "WCSIM_CHARGE_NORMALIZATION_MODE", "event_mean"
+    ).strip().lower().replace("-", "_")
+    GLOBAL_CHARGE_SCALE = _env_optional_float(
+        "WCSIM_GLOBAL_CHARGE_SCALE", None
+    )
+    GLOBAL_CHARGE_CALIBRATION_ID = os.environ.get(
+        "WCSIM_GLOBAL_CHARGE_CALIBRATION_ID", ""
+    ).strip()
+    if CHARGE_NORMALIZATION_MODE not in {"event_mean", "global_scale"}:
+        raise ValueError(
+            "WCSIM_CHARGE_NORMALIZATION_MODE must be event_mean or global_scale"
+        )
+    if CHARGE_NORMALIZATION_MODE == "global_scale" and (
+        GLOBAL_CHARGE_SCALE is None
+        or not math.isfinite(float(GLOBAL_CHARGE_SCALE))
+        or float(GLOBAL_CHARGE_SCALE) <= 0.0
+    ):
+        raise ValueError(
+            "WCSIM_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
+            "WCSIM_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
+        )
+    CHARGE_LIKELIHOOD_MODE = _validate_charge_likelihood_calibration(
+        normalization_mode=CHARGE_NORMALIZATION_MODE,
+        global_scale=GLOBAL_CHARGE_SCALE,
+        calibration_id=GLOBAL_CHARGE_CALIBRATION_ID,
+        environment_prefix="WCSIM",
+    )
 
     # =============================================================================
     # END ROUTINE USER CONFIGURATION
@@ -2132,19 +2786,28 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     )
     WCTE_EXPLICIT_LENGTHS_MM = _env_float_list("WCTE_SEED_LENGTHS_MM", ())
     WCTE_BEAM_LONGITUDINAL_OFFSETS_MM = (-50.0, 0.0, 50.0)
+    WCTE_BEAM_CORE_TRANSVERSE_MAX_MM = max(
+        0.0, _env_float("WCTE_BEAM_CORE_TRANSVERSE_MAX_MM", 150.0)
+    )
     WCTE_BEAM_TRANSVERSE_OFFSETS_MM = (
         (0.0, 0.0),
         (150.0, 0.0), (-150.0, 0.0),
         (0.0, 150.0), (0.0, -150.0),
-    )
+    ) + ((
+        (300.0, 0.0), (-300.0, 0.0),
+        (0.0, 300.0), (0.0, -300.0),
+    ) if FIT_MODE_REQUEST == "full_length" else ())
     WCTE_BEAM_DIRECTION_TANGENT_OFFSETS = (
         (0.0, 0.0),
         (0.04, 0.0), (-0.04, 0.0),
         (0.0, 0.04), (0.0, -0.04),
     )
-    # Keep this True for arbitrary-direction WCTE validation. Setting it False gives
-    # the smallest beam-only proxy library.
-    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool("WCTE_INCLUDE_ORIENTATION_GUARD", True)
+    # Beam mode is intentionally a compact beam-pipe search.  Absorption keeps
+    # the broad guard by default because its abrupt light pattern can be more
+    # ambiguous.  Experts can opt the guard back into beam studies explicitly.
+    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool(
+        "WCTE_INCLUDE_ORIENTATION_GUARD", FIT_MODE_REQUEST != "full_length"
+    )
     WCTE_GUARD_DIRECTION_FIBONACCI = _env_int("WCTE_GUARD_DIRECTION_FIBONACCI", 14)
     WCTE_GUARD_ENTRY_INSETS_MM = (200.0, 350.0, 550.0)
     WCTE_GUARD_TRANSVERSE_OFFSETS_MM = (
@@ -2156,7 +2819,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # the high-resolution default for beam events, while this library guarantees
     # interior-vertex and full-sphere coverage for calibration, validation and IWCD-
     # style topologies.  It is built from detector geometry only.
-    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool("WCTE_INCLUDE_DETECTOR_GLOBAL", True)
+    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool(
+        "WCTE_INCLUDE_DETECTOR_GLOBAL", FIT_MODE_REQUEST != "full_length"
+    )
     WCTE_GLOBAL_VERTEX_SPACING_MM = _env_float("WCTE_GLOBAL_SEED_SPACING_MM", 700.0)
     WCTE_GLOBAL_WALL_MARGIN_MM = _env_float("WCTE_GLOBAL_SEED_WALL_MARGIN_MM", 100.0)
     WCTE_GLOBAL_MAX_SEEDS = _env_int("WCTE_GLOBAL_MAX_SEEDS", 20_000)
@@ -2218,18 +2883,52 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     T0_LIMITS = (_env_float("T0_MIN", -3.0), _env_float("T0_MAX", 3.0))
     PROXY_CANDIDATES = _env_int("GLOBAL_PROXY_CANDIDATES", 8)
     WCTE_BEAM_PROXY_CANDIDATES = _env_int("WCTE_BEAM_PROXY_CANDIDATES", 8)
+    WCTE_BEAM_OUTER_PROXY_CANDIDATES = max(
+        0, _env_int("WCTE_BEAM_OUTER_PROXY_CANDIDATES", 4)
+    )
     WCTE_GUARD_CHALLENGE_CANDIDATES = _env_int("WCTE_GUARD_CHALLENGE_CANDIDATES", 2)
     JOINT_EXACT_SWEEPS = _env_int("JOINT_EXACT_SWEEPS", 2)
     JOINT_FULL_CROSS_SWEEPS = _env_int("JOINT_FULL_CROSS_SWEEPS", 1)
     JOINT_PROFILE_T0 = _env_bool("JOINT_PROFILE_T0", False)
-    # Continue the exact optimizer only when its final scheduled sweep is still
-    # making a substantial NLL improvement. This targets rare unconverged tails
-    # without paying extra sweeps on well-converged events.
+    # Continue the unchanged exact optimizer one sweep at a time only while its
+    # last accepted exact-NLL decrease exceeds the convergence threshold.  The
+    # cap counts base plus continuation sweeps.  The historical *_SWEEPS setting
+    # remains an accepted alias for the new explicit maximum-total setting.
+    # The certified COBYQA continuation is a robustness/reference option, not
+    # a mechanical speedup: on ordinary events it can add hundreds of exact
+    # optical evaluations.  Keep production latency/result compatibility by
+    # default and require an explicit opt-in for the additional stationarity
+    # certificate.
     ADAPTIVE_EXACT_POLISH = _env_bool("ADAPTIVE_EXACT_POLISH", False)
     ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT = _env_float(
-        "ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT", 2.5
+        "ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT", 1.0e-3
     )
-    ADAPTIVE_EXACT_POLISH_SWEEPS = _env_int("ADAPTIVE_EXACT_POLISH_SWEEPS", 1)
+    _ADAPTIVE_EXACT_TOTAL_RAW = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS", ""
+    ).strip()
+    _ADAPTIVE_EXACT_LEGACY_EXTRA_RAW = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_SWEEPS", ""
+    ).strip()
+    ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS = max(
+        1, _env_int("ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS", 12)
+    )
+    ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS = (
+        max(0, int(float(_ADAPTIVE_EXACT_LEGACY_EXTRA_RAW)))
+        if _ADAPTIVE_EXACT_LEGACY_EXTRA_RAW and not _ADAPTIVE_EXACT_TOTAL_RAW
+        else None
+    )
+    ADAPTIVE_EXACT_POLISH_SWEEPS = ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS
+    ADAPTIVE_EXACT_POLISH_BACKEND = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_BACKEND", "cobyqa"
+    ).strip().lower().replace("-", "_")
+    if ADAPTIVE_EXACT_POLISH_BACKEND not in {"cobyqa", "block"}:
+        raise ValueError("ADAPTIVE_EXACT_POLISH_BACKEND must be cobyqa or block")
+    ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS = max(
+        1, _env_int("ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS", 240)
+    )
+    ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS = max(
+        0, _env_int("ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS", 2)
+    )
     WCTE_SKIP_BROAD_PROXY_OPTIMIZATION = _env_bool("WCTE_SKIP_BROAD_PROXY_OPTIMIZATION", True)
     PROXY_SWEEPS = _env_int("GLOBAL_PROXY_SWEEPS", 1)
     EXACT_CHARGE_SWEEPS = _env_int("EXACT_CHARGE_SWEEPS", 3)
@@ -2289,8 +2988,13 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     PHOTON_SCATTER_NATIVE_RECEIVER = _env_bool(
         "EMITTER_PHOTON_SCATTER_NATIVE_RECEIVER", True
     )
+    _PHOTON_SCATTER_NATIVE_THREADS_DEFAULT = 4 if NPROC == 1 else 1
     PHOTON_SCATTER_NATIVE_THREADS = max(
-        1, _env_int("EMITTER_PHOTON_SCATTER_NATIVE_THREADS", 1)
+        1,
+        _env_int(
+            "EMITTER_PHOTON_SCATTER_NATIVE_THREADS",
+            _PHOTON_SCATTER_NATIVE_THREADS_DEFAULT,
+        ),
     )
     PHOTON_SCATTER_NATIVE_REQUIRED = _env_bool(
         "EMITTER_PHOTON_SCATTER_NATIVE_REQUIRED", False
@@ -2318,8 +3022,8 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # use the validated four-thread compiled FALI kernel. In multiprocessing mode
     # explicitly force the generic GNU OpenMP pool to one thread as well; the pool
     # is created before any OpenMP-backed kernel is executed in the parent.
-    os.environ.setdefault(
-        "NUMBA_NUM_THREADS", str(int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED))
+    _MCS_COHERENT_NUMBA_THREADS_REQUESTED = _prepare_numba_thread_budget(
+        _MCS_COHERENT_NUMBA_THREADS_REQUESTED
     )
     if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -2356,19 +3060,35 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # regression tests. The coherent-Fisher controls are numerical quadrature and
     # local trust-region choices, not empirical MCS scales.
     MCS_TIMING_POLICY = os.environ.get("MCS_PROCESS_TIMING_POLICY", "fe_prior_transverse").strip().lower().replace("-", "_")
-    MCS_PROCESS_MODES_PER_PLANE = _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
-    MCS_PROCESS_GRID_POINTS = _env_int("MCS_PROCESS_GRID_POINTS", 41)
+    _MCS_PROCESS_MODES_PER_PLANE_TEXT = os.environ.get(
+        "MCS_PROCESS_MODES_PER_PLANE", ""
+    ).strip()
+    MCS_COHERENT_IMPLEMENTATION = os.environ.get(
+        "MCS_COHERENT_IMPLEMENTATION", "physics_reference"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_IMPLEMENTATION not in {
+        "physics_reference", "fast12_profile", "legacy_fisher"
+    }:
+        raise ValueError(
+            "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
+            "fast12_profile, or legacy_fisher"
+        )
+    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    MCS_PROCESS_GRID_POINTS = _env_int(
+        "MCS_PROCESS_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
+    )
     MCS_FD_XYZ_MM = _env_float("MCS_PROCESS_CHARGE_FD_XYZ_MM", 1.0)
     MCS_FD_DIRECTION = _env_float("MCS_PROCESS_CHARGE_FD_DIRECTION", 2.0e-4)
     MCS_FD_LENGTH_MM = _env_float("MCS_PROCESS_CHARGE_FD_LENGTH_MM", 1.0)
     MCS_TIMING_SWEEPS = _env_int("MCS_PROCESS_TIMING_SWEEPS", 2)
 
-    # Validated fast defaults. Relative to the conservative 81-point/32-node
-    # reference, the 41-point FALI path and 24-node global Gauss--Legendre timing
-    # integral change reconstructed coordinates by far below the detector resolution
-    # while cutting the coherent continuation cost substantially. The conservative
-    # settings remain available through the same environment variables.
-    MCS_COHERENT_GRID_POINTS = _env_int("MCS_COHERENT_GRID_POINTS", 41)
+    # Fast12 uses the same validated 41-point numerical budget as the general
+    # engine.  The physics-reference implementation retains its mandatory
+    # 241-point convergence grid.  Explicit environment overrides remain
+    # available and are checked by validate_coherent_configuration below.
+    MCS_COHERENT_GRID_POINTS = _env_int(
+        "MCS_COHERENT_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
+    )
     MCS_COHERENT_TIMING_QUADRATURE_NODES = _env_int(
         "MCS_COHERENT_TIMING_QUADRATURE_NODES", 24
     )
@@ -2382,15 +3102,66 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     MCS_COHERENT_APPLY_EXPECTED_CONTRACTION = _env_bool(
         "MCS_COHERENT_APPLY_EXPECTED_CONTRACTION", False
     )
-    MCS_COHERENT_IMPLEMENTATION = os.environ.get(
-        "MCS_COHERENT_IMPLEMENTATION", "fast12_profile"
-    ).strip().lower().replace("-", "_")
-    if MCS_COHERENT_IMPLEMENTATION not in {"fast12_profile", "legacy_fisher"}:
-        raise ValueError(
-            "MCS_COHERENT_IMPLEMENTATION must be fast12_profile or legacy_fisher"
-        )
+    MCS_PROCESS_MODES_PER_PLANE = (
+        _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+        if _MCS_PROCESS_MODES_PER_PLANE_TEXT
+        else default_coherent_modes_per_plane(MCS_COHERENT_IMPLEMENTATION)
+    )
     MCS_COHERENT_LATENT_MAX_ITERATIONS = _env_int(
-        "MCS_COHERENT_LATENT_MAX_ITERATIONS", 4
+        "MCS_COHERENT_LATENT_MAX_ITERATIONS",
+        20 if _FAST12_NUMERICAL_DEFAULTS else 160,
+    )
+    MCS_COHERENT_LATENT_SOLVER = os.environ.get(
+        "MCS_COHERENT_LATENT_SOLVER", "physics_response"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_LATENT_SOLVER not in {
+        "physics_response", "derivative_free", "analytic"
+    }:
+        raise ValueError(
+            "MCS_COHERENT_LATENT_SOLVER must be physics_response, "
+            "derivative_free, or analytic"
+        )
+    MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS = _env_int(
+        "MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS", 600
+    )
+    MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS", 0.0003
+    )
+    MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS = _env_int(
+        "MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS", 12
+    )
+    MCS_PHYSICS_MULTIGRID_INITIALIZER = _env_bool(
+        "MCS_PHYSICS_MULTIGRID_INITIALIZER", True
+    )
+    MCS_PHYSICS_MULTIGRID_GRID_POINTS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_GRID_POINTS", 121
+    )
+    MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS", 40
+    )
+    MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS", 20
+    )
+    MCS_PHYSICS_RESPONSE_GRID_POINTS = _env_int(
+        "MCS_PHYSICS_RESPONSE_GRID_POINTS", 81
+    )
+    MCS_PHYSICS_RESPONSE_PRIMARY_TRUST = _env_float(
+        "MCS_PHYSICS_RESPONSE_PRIMARY_TRUST", 1.0
+    )
+    MCS_PHYSICS_RESPONSE_SECONDARY_TRUST = _env_float(
+        "MCS_PHYSICS_RESPONSE_SECONDARY_TRUST", 1.5
+    )
+    MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS", 12
+    )
+    MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS", 40
+    )
+    MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS", 4
+    )
+    MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT = _env_bool(
+        "MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT", True
     )
     MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS = _env_int(
         "MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS", 2
@@ -2404,6 +3175,37 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     )
     MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM = _env_float(
         "MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM", 100.0
+    )
+    MCS_COHERENT_GLOBAL_MAX_EVALUATIONS = _env_int(
+        "MCS_COHERENT_GLOBAL_MAX_EVALUATIONS", 300
+    )
+    MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS", 1.0
+    )
+    MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS", 0.02
+    )
+    MCS_COHERENT_GLOBAL_PROFILE_MODE = os.environ.get(
+        "MCS_COHERENT_GLOBAL_PROFILE_MODE", "conditional"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_GLOBAL_PROFILE_MODE not in {
+        "conditional", "fisher_laplace", "joint_exact"
+    }:
+        raise ValueError(
+            "MCS_COHERENT_GLOBAL_PROFILE_MODE must be conditional, "
+            "fisher_laplace, or joint_exact"
+        )
+    MCS_COHERENT_JOINT_MAX_CYCLES = _env_int(
+        "MCS_COHERENT_JOINT_MAX_CYCLES", 3
+    )
+    MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS", 0.005
+    )
+    MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS = _env_int(
+        "MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS", 3
+    )
+    MCS_COHERENT_JOINT_MODEL_CACHE_SIZE = _env_int(
+        "MCS_COHERENT_JOINT_MODEL_CACHE_SIZE", 32
     )
     MCS_COHERENT_NUMBA_THREADS = int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED)
 
@@ -2475,6 +3277,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     from LicketyFit.PMT import PMT
     from LicketyFit.mcs_coherent_fisher import run_coherent_fisher_update
     from LicketyFit.mcs_fast12_continuation import run_fast12_coherent_update
+    from LicketyFit.mcs_physics_continuation import run_physics_coherent_update
     from LicketyFit.fast_track_fit import (
         BlockOptimizerResult,
         ConvexDetectorVolume,
@@ -2492,6 +3295,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         profile_t0,
         reanchor_result,
         run_generalized_fermi_eyges_update,
+        cobyqa_exact_continuation,
         seed_values_from_mapping,
         select_diverse_seed_indices,
         track_aligned_block_optimize,
@@ -2582,8 +3386,27 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     USE_COHERENT_FISHER = MCS_RECONSTRUCTION_MODE == "coherent_fisher"
     USE_FERMI_EYGES = MCS_RECONSTRUCTION_MODE == "fermi_eyges_process"
     USE_LEGACY_MCS = MCS_RECONSTRUCTION_MODE == "legacy"
-    if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and FIT_MODE != "full_length":
-        raise ValueError("Fermi--Eyges reconstruction currently requires full_length mode")
+    if USE_COHERENT_FISHER:
+        MCS_COHERENT_IMPLEMENTATION = validate_coherent_configuration(
+            MCS_COHERENT_IMPLEMENTATION,
+            MCS_PROCESS_MODES_PER_PLANE,
+            MCS_PROCESS_GRID_POINTS,
+            MCS_COHERENT_GRID_POINTS,
+        )
+    _ABSORPTION_FAST12_COHERENT = bool(
+        FIT_MODE == "absorption"
+        and USE_COHERENT_FISHER
+        and MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    )
+    if (
+        (USE_FERMI_EYGES or USE_COHERENT_FISHER)
+        and FIT_MODE != "full_length"
+        and not _ABSORPTION_FAST12_COHERENT
+    ):
+        raise ValueError(
+            "Fermi--Eyges reconstruction requires full_length mode, except "
+            "for the absorption-compatible fast12 coherent profile"
+        )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and LIKELIHOOD_MODE == "timing_only":
         raise ValueError("Fermi--Eyges reconstruction requires a charge-capable fit")
     if MCS_TIMING_POLICY not in {"fe_prior_transverse", "fe_prior_all", "freeze_updated"}:
@@ -2631,7 +3454,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         OUTPUT_FILE = str(
             PROJECT_ROOT / "outputs" /
             f"estimates_{DETECTOR_MODE.lower()}_{FIT_PARTICLE}_{int(ENERGY_TRUE)}MeV_"
-            f"{FIT_MODE}_{LIKELIHOOD_MODE}.dict"
+            f"{_PUBLIC_FIT_MODE}_{LIKELIHOOD_MODE}.dict"
         )
 
     WCD = None
@@ -2995,6 +3818,23 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         if vertex_central or direction_central:
                             sparse.append(seed)
                     beam_seeds = sparse
+                # WCSim beam mode keeps the historical 150 mm cluster as an immutable core.
+                # The modest 300 mm ring is a separately arbitrated challenge
+                # tier: adding it must never displace the accepted core basin
+                # merely by perturbing proxy-shortlist diversity.
+                beam_reference = np.asarray(WCTE_BEAM_ENTRY_MM, dtype=np.float64)
+                for seed in beam_seeds:
+                    point = np.asarray(
+                        [seed["x0"], seed["y0"], seed["z0"]], dtype=np.float64
+                    )
+                    delta = point - beam_reference
+                    transverse = delta - np.dot(delta, beam_direction) * beam_direction
+                    seed["beam_seed_tier"] = (
+                        "outer"
+                        if np.linalg.norm(transverse)
+                        > float(WCTE_BEAM_CORE_TRANSVERSE_MAX_MM) + 1.0e-8
+                        else "core"
+                    )
                 if FIXED_DIRECTION is None and not beam_seeds:
                     raise ValueError(
                         "The WCTE beam seed cluster is empty. Check WCTE_BEAM_ENTRY_MM, "
@@ -3083,6 +3923,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 fixed_params=FIXED_PARAMS,
                 fixed_direction=FIXED_DIRECTION,
                 full_range_limits=full_range_limits,
+                prevalidated=True,
             )
             metadata = {
                 "strategy": "wcte_beam_focused_plus_detector_global",
@@ -3140,6 +3981,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             fixed_params=FIXED_PARAMS,
             fixed_direction=FIXED_DIRECTION,
             full_range_limits=full_range_limits,
+            prevalidated=True,
         )
         metadata = dict(metadata)
         metadata.update({
@@ -3774,6 +4616,43 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         }
 
 
+    def physics_profile_payload(result):
+        """Serialize the all-PMT, jointly reprofiled physics reference."""
+        return {
+            "model": "arc_length_fali_delta_survival_physics_reference",
+            "central_estimator": (
+                "fully converged nonlinear charge MAP in an onset-pinned "
+                "Fermi--Eyges/KL path, jointly reprofiled over the physical "
+                "onset line with an all-PMT Fisher--Laplace scalar"
+            ),
+            "initial_values": dict(result.initial_values),
+            "updated_values": result.output_values(),
+            "coefficients_mean": np.asarray(result.coefficients_mean).tolist(),
+            "coefficients_covariance": np.asarray(
+                result.coefficients_covariance
+            ).tolist(),
+            "charge_nll": float(result.charge_nll),
+            "posterior_nll": float(result.posterior_nll),
+            "laplace_nll": float(result.laplace_nll),
+            "start_along_track_correction_mm": float(
+                result.start_along_track_correction_mm
+            ),
+            "length_correction_mm": float(result.length_correction_mm),
+            "downstream_endpoint_correction_mm": float(
+                result.downstream_endpoint_correction_mm
+            ),
+            "latent_converged": bool(result.latent_converged),
+            "profile_converged": bool(result.profile_converged),
+            "path_s_mm": np.asarray(result.path_s_mm).tolist(),
+            "path_position_mm": np.asarray(result.path_position_mm).tolist(),
+            "path_tangent": np.asarray(result.path_tangent).tolist(),
+            "path_energy_mev": np.asarray(result.path_energy_mev).tolist(),
+            "path_beta": np.asarray(result.path_beta).tolist(),
+            "wall_s": float(result.wall_s),
+            "diagnostics": dict(result.diagnostics),
+        }
+
+
     def _fit_event_staged(obs_pes, obs_ts):
         wall0 = time.perf_counter()
         scores = PROXY_LIBRARY.score(obs_pes, charge_floor_pe=float(getattr(EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4)))
@@ -4247,9 +5126,20 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def _select_wcte_local_candidates(scores):
-        """Reproduce the accepted beam/entry-guard WCTE candidate policy."""
+        """Preserve the accepted beam core and add a gated outer challenge."""
         beam_indices, guard_indices, _ = _wcte_seed_family_indices()
-        local_indices = beam_indices + guard_indices
+        core_beam_indices = [
+            index for index in beam_indices
+            if str(SEEDS[int(index)].get("beam_seed_tier", "core")) != "outer"
+        ]
+        outer_beam_indices = [
+            index for index in beam_indices
+            if str(SEEDS[int(index)].get("beam_seed_tier", "core")) == "outer"
+        ]
+        # A legacy/custom seed file may predate the tier annotation.  In that
+        # case the complete beam family remains the core, exactly as before.
+        core_beam_indices = core_beam_indices or list(beam_indices)
+        local_indices = core_beam_indices + guard_indices
         if not local_indices:
             return []
         best_index = min(local_indices, key=lambda i: float(scores[i]))
@@ -4265,7 +5155,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         else:
             selected = _select_family_diverse(
                 scores,
-                beam_indices,
+                core_beam_indices,
                 n_keep=max(1, int(WCTE_BEAM_PROXY_CANDIDATES)),
                 raw_top=min(4, max(1, int(WCTE_BEAM_PROXY_CANDIDATES))),
             )
@@ -4280,19 +5170,48 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     used.add(index)
                     selected.append(index)
         for index in _select_full_length_range_challenges(
-            scores, beam_indices + guard_indices,
+            scores, core_beam_indices + guard_indices,
             n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
         ):
             if index not in used:
                 used.add(index)
                 selected.append(index)
         for index in _select_absorption_length_challenges(
-            scores, beam_indices + guard_indices,
+            scores, core_beam_indices + guard_indices,
             n_keep=ABSORPTION_LENGTH_CHALLENGE_CANDIDATES,
         ):
             if index not in used:
                 used.add(index)
                 selected.append(index)
+
+        # The outer ring is considered only when its charge proxy beats every
+        # core/guard seed.  Its shortlist and range strata stay separate, so
+        # merely adding the ring cannot perturb the historical core shortlist.
+        outer_triggered = bool(
+            FIT_MODE == "full_length"
+            and outer_beam_indices
+            and int(WCTE_BEAM_OUTER_PROXY_CANDIDATES) > 0
+            and min(float(scores[index]) for index in outer_beam_indices)
+            < min(float(scores[index]) for index in local_indices)
+        )
+        if outer_triggered:
+            for index in _select_family_diverse(
+                scores,
+                outer_beam_indices,
+                n_keep=int(WCTE_BEAM_OUTER_PROXY_CANDIDATES),
+                raw_top=min(2, int(WCTE_BEAM_OUTER_PROXY_CANDIDATES)),
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
+            for index in _select_full_length_range_challenges(
+                scores,
+                outer_beam_indices,
+                n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
         return selected
 
 
@@ -4377,44 +5296,83 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     def _maybe_continue_exact_optimizer(
         objective, result, *, fixed_params, length_limits, full_range_limits
     ):
-        """Finish rare events whose last exact sweep is visibly unconverged."""
-        if (
-            not ADAPTIVE_EXACT_POLISH
-            or int(ADAPTIVE_EXACT_POLISH_SWEEPS) <= 0
-            or len(result.history) < 2
-        ):
-            return result, False, math.nan
-        previous = float(result.history[-2]["fval"])
-        current = float(result.history[-1]["fval"])
-        last_improvement = previous - current
-        if (
-            not math.isfinite(last_improvement)
-            or last_improvement <= float(ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT)
-        ):
-            return result, False, last_improvement
+        """Continue exact NLL descent one sweep at a time to a total-sweep cap."""
 
-        continuation = track_aligned_block_optimize(
-            objective,
-            result.values,
-            fixed_params=fixed_params,
-            sweeps=int(ADAPTIVE_EXACT_POLISH_SWEEPS),
-            initial_steps=_optimizer_continuation_steps(result),
-            length_limits=length_limits,
-            full_range_limits=full_range_limits,
-            min_improvement=0.0,
-            full_cross_sweeps=1,
+        def continue_one_sweep(current):
+            if ADAPTIVE_EXACT_POLISH_BACKEND == "cobyqa":
+                continuation, backend_diagnostics = cobyqa_exact_continuation(
+                    objective,
+                    current.values,
+                    fixed_params=fixed_params,
+                    initial_steps=_optimizer_continuation_steps(current),
+                    length_limits=length_limits,
+                    full_range_limits=full_range_limits,
+                    max_evaluations=int(ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS),
+                    max_restarts=int(ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS),
+                    initial_errors=current.errors,
+                    poll_tolerance=float(
+                        ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+                    ),
+                )
+                return continuation, backend_diagnostics
+            return track_aligned_block_optimize(
+                objective,
+                current.values,
+                fixed_params=fixed_params,
+                sweeps=1,
+                initial_steps=_optimizer_continuation_steps(current),
+                length_limits=length_limits,
+                full_range_limits=full_range_limits,
+                min_improvement=0.0,
+                full_cross_sweeps=1,
+            )
+
+        continued, diagnostics = continue_adaptive_exact(
+            result,
+            enabled=bool(ADAPTIVE_EXACT_POLISH),
+            convergence_threshold_nll=float(
+                ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+            ),
+            max_total_sweeps=(
+                int(
+                    len(result.history)
+                    + ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS
+                )
+                if (
+                    ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                    and ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS is not None
+                )
+                else int(ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS)
+                if ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                else int(len(result.history) + 1)
+            ),
+            continue_step=continue_one_sweep,
+            backend=(
+                "one_sweep_block"
+                if ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                else "cobyqa_exact_physical_chart"
+            ),
         )
-        if not math.isfinite(continuation.fval) or continuation.fval >= result.fval:
-            return result, False, last_improvement
-        continuation.nfcn += int(result.nfcn)
-        continuation.wall_s += float(result.wall_s)
-        continuation.invalid_evaluations += int(result.invalid_evaluations)
-        continuation.quadratic_skips += int(result.quadratic_skips)
-        continuation.history = list(result.history) + [
-            {**entry, "adaptive_polish": True}
-            for entry in continuation.history
-        ]
-        return continuation, True, last_improvement
+        return (
+            continued,
+            bool(diagnostics.accepted_extra_sweeps > 0),
+            float(diagnostics.initial_gain_nll),
+            diagnostics.as_dict(),
+        )
+
+
+    def _disabled_adaptive_exact_diagnostics(result):
+        _, diagnostics = continue_adaptive_exact(
+            result,
+            enabled=False,
+            convergence_threshold_nll=float(
+                ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+            ),
+            max_total_sweeps=int(ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS),
+            continue_step=lambda current: current,
+            backend="disabled",
+        )
+        return diagnostics.as_dict()
 
 
     def _wcte_local_fit_is_beam_compatible(fit_payload):
@@ -4639,7 +5597,12 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 ),
             )
             if allow_adaptive:
-                exact_result, adaptive_polish_used, pre_polish_last_improvement = (
+                (
+                    exact_result,
+                    adaptive_polish_used,
+                    pre_polish_last_improvement,
+                    adaptive_exact_convergence,
+                ) = (
                     _maybe_continue_exact_optimizer(
                         exact_objective,
                         exact_result,
@@ -4650,10 +5613,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 )
             else:
                 adaptive_polish_used = False
-                pre_polish_last_improvement = (
-                    float(exact_result.history[-2]["fval"])
-                    - float(exact_result.history[-1]["fval"])
-                    if len(exact_result.history) >= 2 else math.nan
+                adaptive_exact_convergence = _disabled_adaptive_exact_diagnostics(
+                    exact_result
+                )
+                pre_polish_last_improvement = float(
+                    adaptive_exact_convergence["initial_gain_nll"]
                 )
             final_t0_profile = None
             if JOINT_PROFILE_T0 and exact_mode != "charge_only" and "t0" not in FIXED_PARAMS:
@@ -4682,13 +5646,23 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "result": exact_result,
                 "adaptive_polish_used": bool(adaptive_polish_used),
                 "pre_polish_last_improvement": float(pre_polish_last_improvement),
+                "adaptive_exact_convergence": dict(adaptive_exact_convergence),
             }
 
         local_rows = [
             row for row in candidate_rows
             if str(SEEDS[int(row[1])].get("seed_family", ""))
             != "wcte_detector_global"
+            and str(SEEDS[int(row[1])].get("beam_seed_tier", "core"))
+            != "outer"
         ] if WCTE else list(candidate_rows)
+        outer_beam_rows = [
+            row for row in candidate_rows
+            if str(SEEDS[int(row[1])].get("seed_family", ""))
+            == "wcte_beam_cluster"
+            and str(SEEDS[int(row[1])].get("beam_seed_tier", "core"))
+            == "outer"
+        ] if WCTE else []
         global_rows = [
             row for row in candidate_rows
             if str(SEEDS[int(row[1])].get("seed_family", ""))
@@ -4768,7 +5742,12 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     optimized_basins.append(global_probe)
                     if float(global_probe["result"].fval) < local_final - 1.0e-9:
                         global_escape_triggered = True
-                        continued_result, continued_used, continued_last = (
+                        (
+                            continued_result,
+                            continued_used,
+                            continued_last,
+                            continued_convergence,
+                        ) = (
                             _maybe_continue_exact_optimizer(
                                 global_probe["objective"],
                                 global_probe["result"],
@@ -4780,6 +5759,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         global_probe["result"] = continued_result
                         global_probe["adaptive_polish_used"] = bool(continued_used)
                         global_probe["pre_polish_last_improvement"] = float(continued_last)
+                        global_probe["adaptive_exact_convergence"] = dict(
+                            continued_convergence
+                        )
                         if float(global_probe["result"].fval) < float(chosen_fit["result"].fval):
                             chosen_fit = global_probe
         elif global_rows:
@@ -4789,6 +5771,26 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         else:
             chosen_fit = optimize_candidate_row(candidate_rows[0])
             optimized_basins.append(chosen_fit)
+
+        # The outer beam-pipe ring is an independent challenge basin.  Always
+        # complete its best exact fit once its proxy gate opens, then arbitrate
+        # on the same final likelihood.  The historical core fit is therefore
+        # immutable: the outer ring can improve it but can never displace it by
+        # changing shortlist diversity or an unoptimized start score.
+        outer_beam_challenge_tested = bool(outer_beam_rows)
+        outer_beam_challenge_accepted = False
+        if outer_beam_rows:
+            outer_beam_fit = optimize_candidate_row(outer_beam_rows[0])
+            optimized_basins.append(outer_beam_fit)
+            if (
+                float(outer_beam_fit["result"].fval)
+                < float(chosen_fit["result"].fval) - 1.0e-9
+            ):
+                chosen_fit = outer_beam_fit
+                outer_beam_challenge_accepted = True
+                local_beam_compatible, beam_basin_diagnostics = (
+                    _wcte_local_fit_is_beam_compatible(outer_beam_fit)
+                )
 
         # In absorption mode, an unoptimized exact seed score is not a reliable
         # ordering of endpoint basins: visible length and full range are coupled
@@ -4864,9 +5866,18 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         exact_result = chosen_fit["result"]
         adaptive_polish_used = chosen_fit["adaptive_polish_used"]
         pre_polish_last_improvement = chosen_fit["pre_polish_last_improvement"]
+        adaptive_exact_convergence = dict(
+            chosen_fit["adaptive_exact_convergence"]
+        )
         final_t0_profile = chosen_fit["final_t0_profile"]
 
         straight_values = exact_result.output_values()
+        straight_geometry_key = exact_objective._geometry_key(exact_result.values)
+        straight_event_mean_contamination_fraction = float(
+            exact_objective.event_mean_contamination_cache.get(
+                straight_geometry_key, math.nan
+            )
+        )
         straight_errors = {
             name: float(value)
             for name, value in exact_result.errors.items()
@@ -4874,14 +5885,64 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         }
         straight_fval = float(exact_result.fval)
         coherent_result = None
+        mcs_attempted = bool(USE_COHERENT_FISHER)
+        mcs_applied = False
+        mcs_status = "not_requested"
+        mcs_failure = None
         final_values = dict(straight_values)
         errors = dict(straight_errors)
         final_fval = straight_fval
         fval_definition = "accepted straight-track production NLL"
 
+        # Coherent helpers use the common seven-coordinate name ``length``.
+        # In absorption mode this is the abrupt visible support; the separate
+        # full-range/initial-energy coordinate stays conditioned at the
+        # accepted straight fit during the MCS path profile.
+        coherent_input_values = dict(exact_result.values)
+        coherent_fixed_params = dict(FIXED_PARAMS)
+        coherent_track_end_mode = "threshold"
+        coherent_full_range_mm = None
+        coherent_initial_ke_mev = None
+        coherent_profile_start_along = None
+        if FIT_MODE == "absorption":
+            coherent_input_values["length"] = float(
+                coherent_input_values["visible_length"]
+            )
+            coherent_full_range_mm = float(
+                coherent_input_values["full_range"]
+            )
+            coherent_initial_ke_mev = float(
+                RANGE_LOOKUP.range_mm_to_energy(coherent_full_range_mm)
+            )
+            coherent_track_end_mode = "abrupt"
+            if "visible_length" in coherent_fixed_params:
+                coherent_fixed_params["length"] = coherent_fixed_params[
+                    "visible_length"
+                ]
+            coherent_profile_start_along = not any(
+                name in coherent_fixed_params for name in ("x0", "y0", "z0")
+            )
+
+        def _attempt_coherent_stage(callback):
+            """Run MCS without sacrificing an already accepted straight fit."""
+            try:
+                return callback(), None
+            except Exception as exc:
+                if not _env_bool("MCS_RETAIN_STRAIGHT_ON_FAILURE", True):
+                    raise
+                import traceback
+                return None, {
+                    "failure_stage": "coherent_mcs",
+                    "failure_type": type(exc).__name__,
+                    "failure_message": str(exc),
+                    "failure_traceback": traceback.format_exc(),
+                }
+
         if USE_COHERENT_FISHER:
-            if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
-                coherent_result = run_fast12_coherent_update(
+            mcs_status = "attempted"
+            if MCS_COHERENT_IMPLEMENTATION == "physics_reference":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_physics_coherent_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
                     chart=exact_result.chart,
@@ -4893,6 +5954,107 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     obs_pes=obs_pes,
                     obs_ts=obs_ts,
                     fixed_params=FIXED_PARAMS,
+                    length_limits=length_limits,
+                    t0_limits=T0_LIMITS,
+                    modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                    process_grid_points=MCS_PROCESS_GRID_POINTS,
+                    coherent_grid_points=MCS_COHERENT_GRID_POINTS,
+                    latent_fd=MCS_COHERENT_LATENT_FD,
+                    latent_max_iterations=MCS_COHERENT_LATENT_MAX_ITERATIONS,
+                    latent_solver=MCS_COHERENT_LATENT_SOLVER,
+                    latent_exact_max_evaluations=(
+                        MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS
+                    ),
+                    latent_exact_final_trust_radius=(
+                        MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS
+                    ),
+                    latent_exact_max_restarts=(
+                        MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS
+                    ),
+                    multigrid_initializer=MCS_PHYSICS_MULTIGRID_INITIALIZER,
+                    multigrid_grid_points=(
+                        MCS_PHYSICS_MULTIGRID_GRID_POINTS
+                    ),
+                    multigrid_coarse_iterations=(
+                        MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS
+                    ),
+                    multigrid_fine_iterations=(
+                        MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS
+                    ),
+                    response_grid_points=MCS_PHYSICS_RESPONSE_GRID_POINTS,
+                    response_primary_trust=(
+                        MCS_PHYSICS_RESPONSE_PRIMARY_TRUST
+                    ),
+                    response_secondary_trust=(
+                        MCS_PHYSICS_RESPONSE_SECONDARY_TRUST
+                    ),
+                    response_probe_iterations=(
+                        MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS
+                    ),
+                    response_proposal_iterations=(
+                        MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS
+                    ),
+                    response_correction_iterations=(
+                        MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS
+                    ),
+                    response_fallback_to_exact=(
+                        MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT
+                    ),
+                    latent_trust_max_component=MCS_COHERENT_TRUST_BOX,
+                    max_global_evaluations=(
+                        MCS_COHERENT_GLOBAL_MAX_EVALUATIONS
+                    ),
+                    initial_global_trust_radius=(
+                        MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS
+                    ),
+                    final_global_trust_radius=(
+                        MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS
+                    ),
+                    global_profile_mode=MCS_COHERENT_GLOBAL_PROFILE_MODE,
+                    joint_max_cycles=MCS_COHERENT_JOINT_MAX_CYCLES,
+                    joint_final_global_trust_radius=(
+                        MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS
+                    ),
+                    joint_global_max_restarts=(
+                        MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS
+                    ),
+                    joint_model_cache_size=(
+                        MCS_COHERENT_JOINT_MODEL_CACHE_SIZE
+                    ),
+                    numba_threads=MCS_COHERENT_NUMBA_THREADS,
+                    )
+                )
+                if coherent_result is not None:
+                    final_values = coherent_result.output_values()
+                    errors = (
+                        {}
+                        if MCS_COHERENT_GLOBAL_PROFILE_MODE == "joint_exact"
+                        else dict(straight_errors)
+                    )
+                    # The MCS reference is deliberately charge-only until every
+                    # enabled source has curved first-photoelectron timing nodes.
+                    # Keep the accepted production charge-time NLL separate rather
+                    # than overwriting it with an incomparable marginal charge NLL.
+                    final_fval = straight_fval
+                    fval_definition = (
+                        "accepted straight-track production NLL at straight_fit_values; "
+                        "the coherent charge posterior is stored separately in "
+                        "mcs_process and is not a charge-time NLL or covariance claim"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_fast12_coherent_update(
+                    EMITTER_TEMPLATE,
+                    values=coherent_input_values,
+                    chart=exact_result.chart,
+                    detector=DETECTOR,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    obs_ts=obs_ts,
+                    fixed_params=coherent_fixed_params,
                     length_limits=length_limits,
                     t0_limits=T0_LIMITS,
                     modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
@@ -4912,20 +6074,39 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
                     ),
                     numba_threads=MCS_COHERENT_NUMBA_THREADS,
+                    track_end_mode=coherent_track_end_mode,
+                    full_range_mm=coherent_full_range_mm,
+                    initial_kinetic_energy_mev=coherent_initial_ke_mev,
+                    profile_start_along=coherent_profile_start_along,
+                    require_convergence=(FIT_MODE == "absorption"),
+                    )
                 )
-                final_values = coherent_result.output_values()
-                # The fast continuation profiles only the longitudinal endpoint
-                # block.  Preserve the accepted straight-fit uncertainty estimate
-                # rather than manufacturing unvalidated all-parameter errors from a
-                # two-coordinate charge profile.
-                errors = dict(straight_errors)
-                final_fval = float(coherent_result.laplace_nll)
-                fval_definition = (
-                    "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
-                    "modes per transverse plane; straight-fit errors retained"
-                )
-            else:
-                coherent_result = run_coherent_fisher_update(
+                if coherent_result is not None:
+                    coherent_output_values = coherent_result.output_values()
+                    if FIT_MODE == "absorption":
+                        final_values = dict(straight_values)
+                        final_values.update(coherent_output_values)
+                        final_values["visible_length"] = float(
+                            coherent_output_values["length"]
+                        )
+                        final_values["full_range"] = float(
+                            straight_values["full_range"]
+                        )
+                    else:
+                        final_values = coherent_output_values
+                    # The fast continuation profiles only the longitudinal endpoint
+                    # block.  Preserve the accepted straight-fit uncertainty estimate
+                    # rather than manufacturing unvalidated all-parameter errors from a
+                    # two-coordinate charge profile.
+                    errors = dict(straight_errors)
+                    final_fval = float(coherent_result.laplace_nll)
+                    fval_definition = (
+                        "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
+                        "modes per transverse plane; straight-fit errors retained"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "legacy_fisher":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_coherent_fisher_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
                     chart=exact_result.chart,
@@ -4948,24 +6129,43 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     trust_box=MCS_COHERENT_TRUST_BOX,
                     apply_expected_contraction=MCS_COHERENT_APPLY_EXPECTED_CONTRACTION,
                     straight_prediction_cache=exact_objective.prediction_cache,
+                    )
                 )
-                final_values = coherent_result.output_values()
-                covariance_global = np.asarray(
-                    coherent_result.marginal_covariance_global, dtype=np.float64
-                )
-                global_names = (
-                    "x0", "y0", "z0", "cx", "cy", "cz", "length", "t0"
-                )
-                errors = {
-                    name: float(math.sqrt(max(covariance_global[i, i], 0.0)))
-                    for i, name in enumerate(global_names)
-                    if np.isfinite(covariance_global[i, i])
-                }
-                final_fval = float(coherent_result.coherent_posterior_nll_updated)
+                if coherent_result is not None:
+                    final_values = coherent_result.output_values()
+                    covariance_global = np.asarray(
+                        coherent_result.marginal_covariance_global, dtype=np.float64
+                    )
+                    global_names = (
+                        "x0", "y0", "z0", "cx", "cy", "cz", "length", "t0"
+                    )
+                    errors = {
+                        name: float(math.sqrt(max(covariance_global[i, i], 0.0)))
+                        for i, name in enumerate(global_names)
+                        if np.isfinite(covariance_global[i, i])
+                    }
+                    final_fval = float(coherent_result.coherent_posterior_nll_updated)
+                    fval_definition = (
+                        "conditional coherent FALI data NLL plus standard-normal FE/KL "
+                        "prior; coefficients inferred from charge covariance at the "
+                        "accepted joint fit"
+                    )
+
+            if coherent_result is not None:
+                mcs_applied = True
+                mcs_status = "applied"
+            elif mcs_failure is not None:
+                # Preserve the already accepted no-MCS fit.  The explicit MCS
+                # failure fields below prevent this from masquerading as a curved
+                # reconstruction while retaining a scientifically usable event.
+                mcs_applied = False
+                mcs_status = "failed_straight_fallback"
+                final_values = dict(straight_values)
+                errors = dict(straight_errors)
+                final_fval = straight_fval
                 fval_definition = (
-                    "conditional coherent FALI data NLL plus standard-normal FE/KL "
-                    "prior; coefficients inferred from charge covariance at the "
-                    "accepted joint fit"
+                    "accepted straight-track production NLL; coherent MCS was "
+                    "attempted, failed, and was not applied"
                 )
 
         full_length_range_profile = None
@@ -4973,7 +6173,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         if FIT_MODE == "full_length":
             final_values["full_range"] = float(final_values["length"])
             final_values, _summary = _resolved_full_length_output(final_values)
-            if not (USE_FERMI_EYGES or USE_COHERENT_FISHER):
+            if not (USE_FERMI_EYGES or (USE_COHERENT_FISHER and mcs_applied)):
                 final_values, final_fval, full_length_range_profile, full_length_range_profile_nfcn = (
                     _profile_full_length_range(
                         obs_pes, obs_ts, final_values, final_fval
@@ -5008,7 +6208,17 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "straight_fit_fval": float(straight_fval),
             "straight_fit_values": dict(straight_values),
             "straight_fit_errors": dict(straight_errors),
+            "event_mean_contamination_fraction": float(
+                straight_event_mean_contamination_fraction
+            ),
             "fit_accepted": bool(np.isfinite(final_fval)),
+            "mcs_attempted": bool(mcs_attempted),
+            "mcs_applied": bool(mcs_applied),
+            "mcs_fit_accepted": bool(mcs_applied),
+            "mcs_status": str(mcs_status),
+            "mcs_failure": (
+                None if mcs_failure is None else dict(mcs_failure)
+            ),
             "chosen_seed_index": int(chosen_index),
             "chosen_seed": dict(SEEDS[chosen_index]),
             "proxy_candidate_indices": [int(x) for x in candidate_indices],
@@ -5030,6 +6240,12 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "policy": "accepted_wcte_local_then_two_sweep_exact_global_escape",
                 "global_escape_tested": bool(global_escape_tested),
                 "global_escape_triggered": bool(global_escape_triggered),
+                "outer_beam_challenge_tested": bool(
+                    outer_beam_challenge_tested
+                ),
+                "outer_beam_challenge_accepted": bool(
+                    outer_beam_challenge_accepted
+                ),
                 "local_beam_compatible": bool(local_beam_compatible),
                 "beam_basin_diagnostics": dict(beam_basin_diagnostics),
                 "optimized_basins": basin_payload,
@@ -5043,6 +6259,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             ),
             "adaptive_exact_polish_used": bool(adaptive_polish_used),
             "pre_polish_last_sweep_improvement": float(pre_polish_last_improvement),
+            "adaptive_exact_convergence": dict(adaptive_exact_convergence),
             "charge_stage": (
                 block_result_payload(exact_result)
                 if exact_mode == "charge_only" else None
@@ -5061,9 +6278,13 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "mcs_process": (
                 None if coherent_result is None
                 else (
-                    fast12_profile_payload(coherent_result)
-                    if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
-                    else coherent_fisher_payload(coherent_result)
+                    physics_profile_payload(coherent_result)
+                    if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                    else (
+                        fast12_profile_payload(coherent_result)
+                        if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+                        else coherent_fisher_payload(coherent_result)
+                    )
                 )
             ),
             "initial_t0_profile": (
@@ -5180,7 +6401,17 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)
                 coherent_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
-                if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                _coherent_warmup = coherent_warmup_action(
+                    MCS_COHERENT_IMPLEMENTATION
+                )
+                if _coherent_warmup == "defer_physics_reference":
+                    # The all-PMT physics reference is a complete exact MAP fit,
+                    # not a compile-only kernel.  Running it on this proxy seed
+                    # would duplicate the scientific continuation in every
+                    # worker.  Its kernels are initialized on the first accepted
+                    # real-event straight track instead.
+                    pass
+                elif _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -5204,7 +6435,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         ),
                         numba_threads=MCS_COHERENT_NUMBA_THREADS,
                     )
-                else:
+                elif _coherent_warmup == "legacy_fisher":
                     _ = run_coherent_fisher_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -5221,6 +6452,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         apply_expected_contraction=(
                             MCS_COHERENT_APPLY_EXPECTED_CONTRACTION
                         ),
+                    )
+                else:
+                    raise AssertionError(
+                        f"unreachable coherent warm-up action {_coherent_warmup!r}"
                     )
 
         finally:
@@ -5318,12 +6553,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             emitter.primary_endpoint_model = str(
                 ABSORPTION_PRIMARY_ENDPOINT_MODEL
             )
-        if _UNIFIED_DATA_SOURCE == "wcte":
-            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
-            emitter.global_charge_scale = (
-                None if GLOBAL_CHARGE_SCALE is None
-                else float(GLOBAL_CHARGE_SCALE)
-            )
+        emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+        emitter.global_charge_scale = (
+            None if GLOBAL_CHARGE_SCALE is None
+            else float(GLOBAL_CHARGE_SCALE)
+        )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -5448,6 +6682,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "Coherent MCS controls:",
                 {
                     "implementation": MCS_COHERENT_IMPLEMENTATION,
+                    "global_profile_mode": MCS_COHERENT_GLOBAL_PROFILE_MODE,
                     "modes_per_plane": MCS_PROCESS_MODES_PER_PLANE,
                     "grid": MCS_COHERENT_GRID_POINTS,
                     "timing_quadrature": MCS_COHERENT_TIMING_QUADRATURE_NODES,
@@ -5456,8 +6691,42 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     "trust_box": MCS_COHERENT_TRUST_BOX,
                     "apply_expected_contraction": MCS_COHERENT_APPLY_EXPECTED_CONTRACTION,
                     "latent_max_iterations": MCS_COHERENT_LATENT_MAX_ITERATIONS,
+                    "latent_solver": MCS_COHERENT_LATENT_SOLVER,
+                    "latent_exact_max_evaluations": (
+                        MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS
+                    ),
+                    "latent_exact_final_trust_radius": (
+                        MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS
+                    ),
+                    "latent_exact_max_restarts": (
+                        MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS
+                    ),
+                    "physics_response_grid": MCS_PHYSICS_RESPONSE_GRID_POINTS,
+                    "physics_response_trusts": (
+                        MCS_PHYSICS_RESPONSE_PRIMARY_TRUST,
+                        MCS_PHYSICS_RESPONSE_SECONDARY_TRUST,
+                    ),
+                    "physics_response_probe_iterations": (
+                        MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS
+                    ),
+                    "physics_response_proposal_iterations": (
+                        MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS
+                    ),
+                    "physics_response_correction_iterations": (
+                        MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS
+                    ),
+                    "physics_response_fallback_to_exact": (
+                        MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT
+                    ),
                     "candidate_latent_max_iterations": (
                         MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS
+                    ),
+                    "joint_max_cycles": MCS_COHERENT_JOINT_MAX_CYCLES,
+                    "joint_final_global_trust_radius": (
+                        MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS
+                    ),
+                    "joint_global_max_restarts": (
+                        MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS
                     ),
                     "profile_cycles": MCS_COHERENT_PROFILE_CYCLES,
                     "numba_threads": MCS_COHERENT_NUMBA_THREADS,
@@ -5546,7 +6815,40 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         PMT_MODEL.first_arrival_prompt_min_ns = prompt_lo
         PMT_MODEL.first_arrival_prompt_max_ns = prompt_hi
 
-        result = fit_event(OBS_PES_ALL[index], OBS_TS_ALL[index])
+        event_wall0 = time.perf_counter()
+        try:
+            result = fit_event(OBS_PES_ALL[index], OBS_TS_ALL[index])
+        except Exception as exc:
+            # Validation runs must preserve successful events and make every
+            # failed physics certificate explicit.  Returning a typed failure
+            # record here is not a straight-track fallback and never marks the
+            # event accepted; it only prevents one difficult event from
+            # discarding an otherwise independent ensemble batch.
+            if not _env_bool("MCS_RECORD_EVENT_FAILURES", False):
+                raise
+            import traceback
+            return {
+                "event_index": index,
+                "fit_accepted": False,
+                "values": {
+                    "x0": math.nan, "y0": math.nan, "z0": math.nan,
+                    "cx": math.nan, "cy": math.nan, "cz": math.nan,
+                    "length": math.nan, "visible_length": math.nan,
+                    "full_range": math.nan, "t0": math.nan,
+                },
+                "errors": {},
+                "fval": math.inf,
+                "event_fit_wall_s": float(time.perf_counter() - event_wall0),
+                "total_nfcn": 0,
+                "mcs_process": None,
+                "failure_stage": "event_fit_or_mcs_reference",
+                "failure_type": type(exc).__name__,
+                "failure_message": str(exc),
+                "failure_traceback": traceback.format_exc(),
+                "prompt_time_min_ns": prompt_lo,
+                "prompt_time_max_ns": prompt_hi,
+                "worker_pid": int(os.getpid()),
+            }
         result["event_index"] = index
         result["prompt_time_min_ns"] = prompt_lo
         result["prompt_time_max_ns"] = prompt_hi
@@ -5650,7 +6952,22 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def print_event_result(result, completed, total):
+        if result.get("failure_type"):
+            print(
+                f"event {int(result['event_index'])} ({completed}/{total}): "
+                f"worker={int(result.get('worker_pid', os.getpid()))}, "
+                f"REJECTED {result['failure_type']}: "
+                f"{result.get('failure_message', '')}",
+                flush=True,
+            )
+            return
         values = result["values"]
+        mcs_suffix = (
+            f", MCS FAILED ({result.get('mcs_failure', {}).get('failure_type', '')}); "
+            "straight fit retained"
+            if result.get("mcs_status") == "failed_straight_fallback"
+            else ""
+        )
         print(
             f"event {int(result['event_index'])} ({completed}/{total}): "
             f"worker={int(result.get('worker_pid', os.getpid()))}, "
@@ -5660,7 +6977,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             f"{float(values['y0']):.1f},{float(values['z0']):.1f}), "
             f"dir=({float(values['cx']):.4f},"
             f"{float(values['cy']):.4f},{float(values['cz']):.4f}), "
-            f"L={float(values['length']):.1f}",
+            f"L={float(values['length']):.1f}{mcs_suffix}",
             flush=True,
         )
 
@@ -5676,6 +6993,52 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         """Build the complete output payload in event-index order."""
         ordered = sorted(results, key=lambda item: int(item["event_index"]))
         n_completed = len(ordered)
+        event_failures = [
+            {
+                "event_index": int(result["event_index"]),
+                "failure_stage": str(result.get("failure_stage", "unknown")),
+                "failure_type": str(result.get("failure_type", "")),
+                "failure_message": str(result.get("failure_message", "")),
+                "failure_traceback": str(result.get("failure_traceback", "")),
+                "event_fit_wall_s": float(
+                    result.get("event_fit_wall_s", math.nan)
+                ),
+                "worker_pid": int(result.get("worker_pid", -1)),
+            }
+            for result in ordered
+            if result.get("failure_type")
+        ]
+        mcs_failures = [
+            {
+                "event_index": int(result["event_index"]),
+                "failure_stage": str(
+                    result.get("mcs_failure", {}).get(
+                        "failure_stage", "coherent_mcs"
+                    )
+                ),
+                "failure_type": str(
+                    result.get("mcs_failure", {}).get("failure_type", "")
+                ),
+                "failure_message": str(
+                    result.get("mcs_failure", {}).get("failure_message", "")
+                ),
+                "failure_traceback": str(
+                    result.get("mcs_failure", {}).get("failure_traceback", "")
+                ),
+                "straight_fit_retained": True,
+                "retained_fit_fval": float(result.get("fval", math.nan)),
+                "straight_fit_fval_before_range_profile": float(
+                    result.get("straight_fit_fval", math.nan)
+                ),
+                "event_fit_wall_s": float(
+                    result.get("event_fit_wall_s", math.nan)
+                ),
+                "worker_pid": int(result.get("worker_pid", -1)),
+            }
+            for result in ordered
+            if result.get("mcs_status") == "failed_straight_fallback"
+        ]
+        n_accepted = sum(bool(result.get("fit_accepted", False)) for result in ordered)
         ke0_values = [_result_ke0_mev(result) for result in ordered]
         chosen_seed_fcns = [_chosen_seed_fcn(result) for result in ordered]
         chosen_families = [
@@ -5774,7 +7137,8 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "fit_particle": FIT_PARTICLE,
                 "fit_particle_raw": FIT_PARTICLE_RAW,
                 "energy_true_mev_seed_guidance": float(ENERGY_TRUE),
-                "fit_mode": FIT_MODE,
+                "fit_mode": _PUBLIC_FIT_MODE,
+                "optical_track_end_mode": FIT_MODE,
                 "full_length_semantics": (
                     {
                         "fitted_coordinate": "remaining_csda_range",
@@ -5791,12 +7155,33 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     if FIT_MODE == "full_length" else None
                 ),
                 "likelihood_mode": LIKELIHOOD_MODE,
+                "charge_likelihood_mode": str(CHARGE_LIKELIHOOD_MODE),
+                "pmt_spe_response_model": str(PMT_MODEL.spe_response_model),
+                "pmt_charge_response": _runtime_pmt_charge_response_metadata(
+                    PMT_MODEL
+                ),
+                "charge_normalization_mode": str(
+                    CHARGE_NORMALIZATION_MODE
+                ),
+                "global_charge_scale": (
+                    None if GLOBAL_CHARGE_SCALE is None
+                    else float(GLOBAL_CHARGE_SCALE)
+                ),
+                "global_charge_calibration_id": str(
+                    GLOBAL_CHARGE_CALIBRATION_ID
+                ) or None,
+                "absolute_light_calibration": (
+                    _absolute_light_calibration_metadata("WCSIM")
+                ),
                 "mcs_reconstruction_mode": str(MCS_RECONSTRUCTION_MODE),
                 "coherent_fisher_enabled": bool(USE_COHERENT_FISHER),
                 "fermi_eyges_enabled": bool(USE_FERMI_EYGES),
                 "legacy_mcs_enabled": bool(USE_LEGACY_MCS),
                 "coherent_fisher_configuration": {
                     "implementation": str(MCS_COHERENT_IMPLEMENTATION),
+                    "global_profile_mode": str(
+                        MCS_COHERENT_GLOBAL_PROFILE_MODE
+                    ),
                     "modes_per_plane": int(MCS_PROCESS_MODES_PER_PLANE),
                     "process_grid_points": int(MCS_PROCESS_GRID_POINTS),
                     "coherent_grid_points": int(MCS_COHERENT_GRID_POINTS),
@@ -5812,6 +7197,16 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS
                     ),
                     "profile_cycles": int(MCS_COHERENT_PROFILE_CYCLES),
+                    "joint_max_cycles": int(MCS_COHERENT_JOINT_MAX_CYCLES),
+                    "joint_final_global_trust_radius": float(
+                        MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS
+                    ),
+                    "joint_global_max_restarts": int(
+                        MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS
+                    ),
+                    "joint_model_cache_size": int(
+                        MCS_COHERENT_JOINT_MODEL_CACHE_SIZE
+                    ),
                     "longitudinal_step_mm": float(
                         MCS_COHERENT_LONGITUDINAL_STEP_MM
                     ),
@@ -5843,6 +7238,18 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "table_dir": str(TABLE_DIR),
                 "n_events_requested": int(n_events_requested),
                 "n_events_completed": int(n_completed),
+                "n_events_accepted": int(n_accepted),
+                "n_events_failed": int(len(event_failures)),
+                "n_mcs_applied": int(
+                    sum(bool(result.get("mcs_applied", False)) for result in ordered)
+                ),
+                "n_mcs_failed_straight_retained": int(len(mcs_failures)),
+                "record_event_failures": bool(
+                    _env_bool("MCS_RECORD_EVENT_FAILURES", False)
+                ),
+                "retain_straight_on_mcs_failure": bool(
+                    _env_bool("MCS_RETAIN_STRAIGHT_ON_FAILURE", True)
+                ),
                 "n_initial_seeds": int(len(SEEDS)),
                 "n_seed_directions": int(SEED_DIRECTION_COUNT),
                 "seed_grid": dict(SEED_GRID_METADATA),
@@ -5909,6 +7316,23 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
                 ),
                 "adaptive_exact_polish_sweeps": int(ADAPTIVE_EXACT_POLISH_SWEEPS),
+                "adaptive_exact_polish_max_total_sweeps": int(
+                    ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS
+                ),
+                "adaptive_exact_polish_legacy_extra_sweeps_override": (
+                    None
+                    if ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS is None
+                    else int(ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS)
+                ),
+                "adaptive_exact_polish_backend": str(
+                    ADAPTIVE_EXACT_POLISH_BACKEND
+                ),
+                "adaptive_exact_cobyqa_max_evaluations_per_attempt": int(
+                    ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS
+                ),
+                "adaptive_exact_cobyqa_max_restarts": int(
+                    ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS
+                ),
                 "timing_sweeps": int(TIMING_SWEEPS),
                 # Parallel wall time measures throughput. Intrinsic event_fit_wall_s
                 # remains the single-worker latency metric used for the <1 s target.
@@ -5938,6 +7362,18 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "x": [result["values"]["x0"] for result in ordered],
             "y": [result["values"]["y0"] for result in ordered],
             "z": [result["values"]["z0"] for result in ordered],
+            "raw_x": [
+                float(result.get("raw_values", result["values"])["x0"])
+                for result in ordered
+            ],
+            "raw_y": [
+                float(result.get("raw_values", result["values"])["y0"])
+                for result in ordered
+            ],
+            "raw_z": [
+                float(result.get("raw_values", result["values"])["z0"])
+                for result in ordered
+            ],
             "cx": [result["values"]["cx"] for result in ordered],
             "cy": [result["values"]["cy"] for result in ordered],
             "cz": [result["values"]["cz"] for result in ordered],
@@ -5974,6 +7410,22 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             ],
             "ke0": ke0_values,
             "t": [result["values"]["t0"] for result in ordered],
+            "raw_t": [
+                float(result.get("raw_values", result["values"])["t0"])
+                for result in ordered
+            ],
+            "longitudinal_gauge_applied": [
+                bool(result.get("longitudinal_gauge", {}).get("applied", False))
+                for result in ordered
+            ],
+            "longitudinal_gauge_translation_mm": [
+                float(
+                    result.get("longitudinal_gauge", {}).get(
+                        "translation_mm", 0.0
+                    )
+                )
+                for result in ordered
+            ],
             "prompt_time_min_ns": [
                 result["prompt_time_min_ns"] for result in ordered
             ],
@@ -5986,7 +7438,31 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 result["event_fit_wall_s"] for result in ordered
             ],
             "total_nfcn": [result["total_nfcn"] for result in ordered],
+            "event_mean_contamination_fraction": [
+                float(result.get("event_mean_contamination_fraction", math.nan))
+                for result in ordered
+            ],
+            "adaptive_exact_convergence": [
+                dict(result.get("adaptive_exact_convergence", {}))
+                for result in ordered
+            ],
+            # Always retain typed failure details even when the much larger
+            # SAVE_DETAILED_EVENT_RESULTS payload is disabled.
+            "event_failures": event_failures,
+            "mcs_failures": mcs_failures,
+            "mcs_status": [
+                str(result.get("mcs_status", "not_requested"))
+                for result in ordered
+            ],
+            "mcs_applied": [
+                bool(result.get("mcs_applied", False)) for result in ordered
+            ],
+            "mcs_fit_accepted": [
+                bool(result.get("mcs_fit_accepted", False))
+                for result in ordered
+            ],
         }
+        _append_event_status_columns(output, ordered)
         if SAVE_DETAILED_EVENT_RESULTS:
             output["results"] = ordered
             output["errors"] = [dict(result.get("errors", {})) for result in ordered]
@@ -6046,8 +7522,16 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         setup_wall0 = time.perf_counter()
         initialize()
         raw = read_sim_data(INPUT_FILE)
-        n_events = min(int(TOT_EVENTS), int(len(raw["digi_hit_time"])))
-        source_event_ids = list(range(n_events))
+        n_available = int(len(raw["digi_hit_time"]))
+        event_window = resolve_event_window(
+            n_available,
+            int(EVENT_START_INDEX),
+            int(TOT_EVENTS),
+            source_label=f"WCSim input {INPUT_FILE}",
+        )
+        source_start = int(event_window.start)
+        n_events = int(event_window.count)
+        source_event_ids = list(event_window.source_indices)
         truth_job = _start_optional_wcsim_truth_load(
             raw=raw,
             source_event_ids=source_event_ids,
@@ -6060,7 +7544,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             placement="design",
         )
         try:
-            prepared = [prepare_event_observables(raw, i) for i in range(n_events)]
+            prepared = [
+                prepare_event_observables(raw, source_event_index)
+                for source_event_index in source_event_ids
+            ]
         except BaseException:
             _cancel_optional_wcsim_truth_load(truth_job)
             raise
@@ -6086,7 +7573,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         setup_wall_s = float(time.perf_counter() - setup_wall0)
 
         print("LicketyFit WCSim batch run")
-        print("  driver release:", DRIVER_RELEASE)
+        print(
+            "  public release:",
+            os.environ.get("LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE),
+        )
+        print("  embedded engine revision:", DRIVER_RELEASE)
         print("  detector mode:", DETECTOR_MODE)
         print("  particle hypothesis:", FIT_PARTICLE)
         print("  true/sample energy [MeV]:", float(ENERGY_TRUE))
@@ -6118,8 +7609,8 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 bool(truth_metadata.get("event_index_cache_hit", False)),
             )
         print("  output:", OUTPUT_FILE)
-        print("  events available / requested / fitted:",
-              len(raw["digi_hit_time"]), int(TOT_EVENTS), int(n_events))
+        print("  events available / source start / requested / fitted:",
+              n_available, source_start, int(TOT_EVENTS), int(n_events))
         print("  event workers / events per batch:", int(NPROC), int(N_EVENTS_PER_BATCH))
         if VERBOSE_SETUP:
             print("  multiprocessing start method:",
@@ -6152,13 +7643,33 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                             total=n_events,
                         )
                         _print_optional_wcsim_truth(
-                            truth_records.get(int(result["event_index"]))
+                            truth_records.get(
+                                event_window.source_index(int(result["event_index"]))
+                            )
                         )
                 if PRINT_BATCH_PROGRESS:
+                    batch_failure_count = sum(
+                        bool(result.get("failure_type"))
+                        for result in batch_results
+                    )
+                    failure_suffix = (
+                        f", {batch_failure_count} rejected event(s) recorded"
+                        if batch_failure_count else ""
+                    )
+                    batch_mcs_fallback_count = sum(
+                        result.get("mcs_status") == "failed_straight_fallback"
+                        for result in batch_results
+                    )
+                    mcs_suffix = (
+                        f", {batch_mcs_fallback_count} MCS failure(s) with "
+                        "straight fits retained"
+                        if batch_mcs_fallback_count else ""
+                    )
                     print(
                         f"  completed batch [{batch_start}, {batch_end}) in "
                         f"{batch_wall_s:.3f} s "
-                        f"({len(batch_results)/max(batch_wall_s,1e-300):.2f} events/s)",
+                        f"({len(batch_results)/max(batch_wall_s,1e-300):.2f} events/s)"
+                        f"{failure_suffix}{mcs_suffix}",
                         flush=True,
                     )
 
@@ -6172,11 +7683,27 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         fit_loop_wall_s=elapsed,
                     )
                     completed_source_ids = [
-                        int(result["event_index"])
+                        event_window.source_index(int(result["event_index"]))
                         for result in sorted(
                             results, key=lambda item: int(item["event_index"])
                         )
                     ]
+                    checkpoint["source_event_index"] = list(completed_source_ids)
+                    for failure in checkpoint.get("event_failures", []):
+                        failure["source_event_index"] = event_window.source_index(
+                            int(failure["event_index"])
+                        )
+                    for failure in checkpoint.get("mcs_failures", []):
+                        failure["source_event_index"] = event_window.source_index(
+                            int(failure["event_index"])
+                        )
+                    if "results" in checkpoint:
+                        for result in checkpoint["results"]:
+                            local_index = int(result["event_index"])
+                            result["local_event_index"] = local_index
+                            result["source_event_index"] = event_window.source_index(
+                                local_index
+                            )
                     _attach_optional_wcsim_truth(
                         checkpoint,
                         source_event_ids=completed_source_ids,
@@ -6184,7 +7711,13 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                         metadata=truth_metadata,
                     )
                     checkpoint["metadata"]["checkpoint"] = bool(batch_end < n_events)
-                    checkpoint["metadata"]["last_completed_event_exclusive"] = int(batch_end)
+                    checkpoint["metadata"]["source_event_start_index"] = source_start
+                    checkpoint["metadata"]["source_event_stop_exclusive"] = int(
+                        event_window.stop
+                    )
+                    checkpoint["metadata"]["last_completed_event_exclusive"] = int(
+                        source_start + batch_end
+                    )
                     save_output(checkpoint)
                     if PRINT_CHECKPOINT_MESSAGES:
                         print(f"  checkpoint saved: {OUTPUT_FILE}", flush=True)
@@ -6201,6 +7734,20 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             warm_wall_s=warm_wall_s,
             fit_loop_wall_s=total_wall,
         )
+        output["source_event_index"] = list(source_event_ids)
+        for failure in output.get("event_failures", []):
+            failure["source_event_index"] = event_window.source_index(
+                int(failure["event_index"])
+            )
+        for failure in output.get("mcs_failures", []):
+            failure["source_event_index"] = event_window.source_index(
+                int(failure["event_index"])
+            )
+        if "results" in output:
+            for result in output["results"]:
+                local_index = int(result["event_index"])
+                result["local_event_index"] = local_index
+                result["source_event_index"] = event_window.source_index(local_index)
         _attach_optional_wcsim_truth(
             output,
             source_event_ids=source_event_ids,
@@ -6208,7 +7755,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             metadata=truth_metadata,
         )
         output["metadata"]["checkpoint"] = False
-        output["metadata"]["last_completed_event_exclusive"] = int(n_events)
+        output["metadata"]["source_event_start_index"] = source_start
+        output["metadata"]["source_event_stop_exclusive"] = int(event_window.stop)
+        output["metadata"]["last_completed_event_exclusive"] = int(event_window.stop)
         save_output(output)
 
         intrinsic = np.asarray(output["event_fit_wall_s"], dtype=np.float64)
@@ -6274,7 +7823,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-04-cosmic-v15-exact-speed-audit-quiet-output-truth-contract"
+    DRIVER_RELEASE = "2026-08-21-cosmic-v18-adaptive-latency"
 
     import hashlib
     import json
@@ -6356,6 +7905,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # LicketyFit/Emitter.py:
     #   DEFAULT_ENABLE_DELTA_E
     #   DEFAULT_ENABLE_PRIMARY_MCS
+    #   DEFAULT_COSMIC_MCS_CONTINUATION
     #   DEFAULT_ENABLE_RAYLEIGH
     #   DEFAULT_ENABLE_BLACKSHEET_REFLECTION
     # The driver prints the resolved process state at startup.
@@ -6430,6 +7980,34 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # Optional fixed prompt window. Leave both as None to use the event peak.
     PROMPT_MIN_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MIN_NS", None)
     PROMPT_MAX_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MAX_NS", None)
+    CHARGE_NORMALIZATION_MODE = os.environ.get(
+        "WCSIM_CHARGE_NORMALIZATION_MODE", "event_mean"
+    ).strip().lower().replace("-", "_")
+    GLOBAL_CHARGE_SCALE = _env_optional_float(
+        "WCSIM_GLOBAL_CHARGE_SCALE", None
+    )
+    GLOBAL_CHARGE_CALIBRATION_ID = os.environ.get(
+        "WCSIM_GLOBAL_CHARGE_CALIBRATION_ID", ""
+    ).strip()
+    if CHARGE_NORMALIZATION_MODE not in {"event_mean", "global_scale"}:
+        raise ValueError(
+            "WCSIM_CHARGE_NORMALIZATION_MODE must be event_mean or global_scale"
+        )
+    if CHARGE_NORMALIZATION_MODE == "global_scale" and (
+        GLOBAL_CHARGE_SCALE is None
+        or not math.isfinite(float(GLOBAL_CHARGE_SCALE))
+        or float(GLOBAL_CHARGE_SCALE) <= 0.0
+    ):
+        raise ValueError(
+            "WCSIM_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
+            "WCSIM_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
+        )
+    CHARGE_LIKELIHOOD_MODE = _validate_charge_likelihood_calibration(
+        normalization_mode=CHARGE_NORMALIZATION_MODE,
+        global_scale=GLOBAL_CHARGE_SCALE,
+        calibration_id=GLOBAL_CHARGE_CALIBRATION_ID,
+        environment_prefix="WCSIM",
+    )
 
     # =============================================================================
     # END ROUTINE USER CONFIGURATION
@@ -6510,9 +8088,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         (0.04, 0.0), (-0.04, 0.0),
         (0.0, 0.04), (0.0, -0.04),
     )
-    # Keep this True for arbitrary-direction WCTE validation. Setting it False gives
-    # the smallest beam-only proxy library.
-    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool("WCTE_INCLUDE_ORIENTATION_GUARD", True)
+    # General mode retains full-sphere fallback coverage around the compact
+    # timing-guided and calibrated seed families.
+    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool(
+        "WCTE_INCLUDE_ORIENTATION_GUARD", True
+    )
     WCTE_GUARD_DIRECTION_FIBONACCI = _env_int("WCTE_GUARD_DIRECTION_FIBONACCI", 14)
     WCTE_GUARD_ENTRY_INSETS_MM = tuple(_env_float_list(
         "WCTE_GUARD_ENTRY_INSETS_MM", (0.5,)
@@ -6778,6 +8358,138 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         "COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS", 2
     ))
 
+    # Detector-safe point-multilateration navigator.  Hybrid is the default:
+    # compact independent timing families are used only when both physical
+    # start hypotheses are covered; otherwise the immutable complete cosmic
+    # bank is restored.
+    # The point-source fit is deliberately used only to nominate detector-safe
+    # track lines; it never changes the production likelihood or supplies a
+    # covariance for the charged-particle fit.
+    COSMIC_MULTILATERATION_SEED_MODE = os.environ.get(
+        "COSMIC_MULTILATERATION_SEED_MODE", "hybrid"
+    ).strip().lower()
+    if COSMIC_MULTILATERATION_SEED_MODE not in {
+        "off", "additive", "primary", "hybrid", "guided"
+    }:
+        raise ValueError(
+            "COSMIC_MULTILATERATION_SEED_MODE must be off, additive, primary, "
+            "hybrid, or guided"
+        )
+    if (
+        LIKELIHOOD_MODE == "charge_only"
+        and COSMIC_MULTILATERATION_SEED_MODE != "off"
+    ):
+        raise ValueError(
+            "Cosmic multilateration/causal seeding uses hit timing and is not "
+            "active in charge_only fits; set "
+            "COSMIC_MULTILATERATION_SEED_MODE=off"
+        )
+    if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+        # Validated compact defaults: one causal candidate per physical start
+        # hypothesis.  Explicit expert environment settings still win.
+        if "COSMIC_CAUSAL_MAX_SEEDS" not in os.environ:
+            COSMIC_CAUSAL_MAX_SEEDS = 2
+        if "COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS" not in os.environ:
+            COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS = 1
+    COSMIC_MULTILATERATION_GROUP_INDEX = _env_float(
+        "COSMIC_MULTILATERATION_GROUP_INDEX", 1.373
+    )
+    COSMIC_MULTILATERATION_MIN_HITS = max(4, _env_int(
+        "COSMIC_MULTILATERATION_MIN_HITS", 8
+    ))
+    COSMIC_MULTILATERATION_MAX_HITS = max(0, _env_int(
+        "COSMIC_MULTILATERATION_MAX_HITS", 0
+    ))
+    COSMIC_MULTILATERATION_MAX_NFEV = max(8, _env_int(
+        "COSMIC_MULTILATERATION_MAX_NFEV", 64
+    ))
+    COSMIC_MULTILATERATION_POOL_SEEDS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_POOL_SEEDS", 16
+    ))
+    COSMIC_MULTILATERATION_MAX_SEEDS = max(0, _env_int(
+        "COSMIC_MULTILATERATION_MAX_SEEDS", 6
+    ))
+    COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS", 4
+    ))
+    COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS", 3
+    ))
+    COSMIC_MULTILATERATION_TOURNAMENT_PROBES = max(2, _env_int(
+        "COSMIC_MULTILATERATION_TOURNAMENT_PROBES", 4
+    ))
+    COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS", 2
+    ))
+    if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+        # Match the independently validated four-start/two-probe policy when a
+        # user selects hybrid mode without expert overrides.  The four starts
+        # are one causal and one multilateration realization for each topology;
+        # only one start per topology enters the ordinary optimizer tournament.
+        if "COSMIC_MULTILATERATION_MAX_SEEDS" not in os.environ:
+            COSMIC_MULTILATERATION_MAX_SEEDS = 2
+        if "COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS" not in os.environ:
+            COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS = 1
+        if "COSMIC_MULTILATERATION_TOURNAMENT_PROBES" not in os.environ:
+            COSMIC_MULTILATERATION_TOURNAMENT_PROBES = 2
+        if "COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS" not in os.environ:
+            COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS = 2
+    COSMIC_MULTILATERATION_INCLUDE_REVERSE = _env_bool(
+        "COSMIC_MULTILATERATION_INCLUDE_REVERSE", False
+    )
+    COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD = max(
+        0.0,
+        _env_float(
+            "COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD", 0.15
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG = min(
+        180.0,
+        max(1.0, _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG", 20.0
+        )),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION = min(
+        1.0,
+        max(1.0e-3, _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION", 0.12
+        )),
+    )
+    COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS = max(
+        4,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS",
+            512,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS", 2
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES",
+            4,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES",
+            2,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER = max(
+        0.0,
+        _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER",
+            1.0,
+        ),
+    )
+
     # Two-anchor exact continuation removes the long-track start/direction
     # correlation without changing the optical likelihood.
     COSMIC_TWO_ANCHOR_REFINEMENT = _env_bool(
@@ -6878,11 +8590,20 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_TOURNAMENT_MAX_PROBES = max(
         1, _env_int("COSMIC_TOURNAMENT_MAX_PROBES", 6)
     )
+    COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL = max(
+        0.0,
+        _env_float(
+            "COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL", 150.0
+        ),
+    )
+    COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY = _env_bool(
+        "COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY", False
+    )
     COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG = _env_float(
         "COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG", 4.0
     )
     COSMIC_TOURNAMENT_MAX_CONTINUATIONS = max(
-        1, _env_int("COSMIC_TOURNAMENT_MAX_CONTINUATIONS", 3)
+        1, _env_int("COSMIC_TOURNAMENT_MAX_CONTINUATIONS", 2)
     )
     COSMIC_TOURNAMENT_PROBE_GATE_NLL = _env_float(
         "COSMIC_TOURNAMENT_PROBE_GATE_NLL", 18.0
@@ -6977,7 +8698,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # the high-resolution default for beam events, while this library guarantees
     # interior-vertex and full-sphere coverage for calibration, validation and IWCD-
     # style topologies.  It is built from detector geometry only.
-    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool("WCTE_INCLUDE_DETECTOR_GLOBAL", True)
+    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool(
+        "WCTE_INCLUDE_DETECTOR_GLOBAL", True
+    )
     WCTE_GLOBAL_VERTEX_SPACING_MM = _env_float("WCTE_GLOBAL_SEED_SPACING_MM", 700.0)
     WCTE_GLOBAL_WALL_MARGIN_MM = _env_float("WCTE_GLOBAL_SEED_WALL_MARGIN_MM", 100.0)
     WCTE_GLOBAL_MAX_SEEDS = _env_int("WCTE_GLOBAL_MAX_SEEDS", 7_000)
@@ -7171,8 +8894,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # use the validated four-thread compiled FALI kernel. In multiprocessing mode
     # explicitly force the generic GNU OpenMP pool to one thread as well; the pool
     # is created before any OpenMP-backed kernel is executed in the parent.
-    os.environ.setdefault(
-        "NUMBA_NUM_THREADS", str(int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED))
+    _MCS_COHERENT_NUMBA_THREADS_REQUESTED = _prepare_numba_thread_budget(
+        _MCS_COHERENT_NUMBA_THREADS_REQUESTED
     )
     if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -7209,28 +8932,125 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # regression tests. The coherent-Fisher controls are numerical quadrature and
     # local trust-region choices, not empirical MCS scales.
     MCS_TIMING_POLICY = os.environ.get("MCS_PROCESS_TIMING_POLICY", "fe_prior_transverse").strip().lower().replace("-", "_")
-    MCS_PROCESS_MODES_PER_PLANE = _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+    _MCS_PROCESS_MODES_PER_PLANE_TEXT = os.environ.get(
+        "MCS_PROCESS_MODES_PER_PLANE", ""
+    ).strip()
     MCS_PROCESS_GRID_POINTS = _env_int("MCS_PROCESS_GRID_POINTS", 41)
     MCS_FD_XYZ_MM = _env_float("MCS_PROCESS_CHARGE_FD_XYZ_MM", 1.0)
     MCS_FD_DIRECTION = _env_float("MCS_PROCESS_CHARGE_FD_DIRECTION", 2.0e-4)
     MCS_FD_LENGTH_MM = _env_float("MCS_PROCESS_CHARGE_FD_LENGTH_MM", 1.0)
     MCS_TIMING_SWEEPS = _env_int("MCS_PROCESS_TIMING_SWEEPS", 2)
 
-    # Cosmic-specific geometry-clipped Fermi--Eyges process continuation.  This
-    # stage keeps the sharp optical mean and adds correlated event-level process
-    # noise only after the four-topology straight fit has closed.
-    COSMIC_FERMI_EYGES_ENABLED = _env_bool(
-        "COSMIC_FERMI_EYGES_ENABLED", False
+    # The cosmic continuation family is selected only by
+    # DEFAULT_COSMIC_MCS_CONTINUATION at the top of LicketyFit/Emitter.py. It is
+    # resolved after importing Emitter below. The remaining values here are
+    # numerical/research controls, not competing model on/off switches.
+    # Controlled monoenergetic physics-validation mode.  Unlike
+    # FIXED_KE0_MEV, this does not convert energy to and then freeze the range:
+    # the coherent continuation fits realized range with the independently
+    # calculated universal-fluctuation straggling prior.
+    COSMIC_COHERENT_FIXED_KE0_MEV = _env_optional_float(
+        "COSMIC_COHERENT_FIXED_KE0_MEV", None
     )
-    COSMIC_COHERENT_PROFILE_ENABLED = _env_bool(
-        "COSMIC_COHERENT_PROFILE_ENABLED", False
+    COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES = max(0, _env_int(
+        "COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES", 0
+    ))
+    COSMIC_JOINT_ENERGY_MIN_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_MIN_MEV", 60.0
     )
-    if COSMIC_FERMI_EYGES_ENABLED and COSMIC_COHERENT_PROFILE_ENABLED:
+    COSMIC_JOINT_ENERGY_MAX_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_MAX_MEV", 650.0
+    )
+    COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV = tuple(_env_float_list(
+        "COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV", []
+    ))
+    COSMIC_JOINT_ENERGY_STRATUM_REPLICATES = max(1, _env_int(
+        "COSMIC_JOINT_ENERGY_STRATUM_REPLICATES", 1
+    ))
+    COSMIC_JOINT_PARTICLES = max(2, _env_int(
+        "COSMIC_JOINT_PARTICLES", 32
+    ))
+    COSMIC_JOINT_RANDOM_SEED = _env_int(
+        "COSMIC_JOINT_RANDOM_SEED", 41873
+    )
+    COSMIC_JOINT_TARGET_ESS_FRACTION = _env_float(
+        "COSMIC_JOINT_TARGET_ESS_FRACTION", 0.80
+    )
+    COSMIC_JOINT_RESAMPLE_ESS_FRACTION = _env_float(
+        "COSMIC_JOINT_RESAMPLE_ESS_FRACTION", 0.55
+    )
+    COSMIC_JOINT_MAX_TEMPERATURES = max(1, _env_int(
+        "COSMIC_JOINT_MAX_TEMPERATURES", 64
+    ))
+    COSMIC_JOINT_REJUVENATION_STEPS = max(0, _env_int(
+        "COSMIC_JOINT_REJUVENATION_STEPS", 3
+    ))
+    COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS = max(0, _env_int(
+        "COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS", 12
+    ))
+    COSMIC_JOINT_ENERGY_RW_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_RW_MEV", 30.0
+    )
+    COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY", 0.15
+    )
+    COSMIC_JOINT_RANGE_PCN_RHO = _env_float(
+        "COSMIC_JOINT_RANGE_PCN_RHO", 0.80
+    )
+    COSMIC_JOINT_PATH_PCN_RHO = _env_float(
+        "COSMIC_JOINT_PATH_PCN_RHO", 0.92
+    )
+    COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC = _env_bool(
+        "COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC", False
+    )
+    COSMIC_MIXED_INFERENCE_ENGINE = os.environ.get(
+        "COSMIC_MIXED_INFERENCE_ENGINE", "smc"
+    ).strip().lower().replace("-", "_")
+    if COSMIC_MIXED_INFERENCE_ENGINE not in {"smc", "importance"}:
         raise ValueError(
-            "Enable only one cosmic MCS continuation: linear FE or nonlinear coherent profile"
+            "COSMIC_MIXED_INFERENCE_ENGINE must be 'smc' or 'importance'"
         )
+    COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED = _env_bool(
+        "COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED", False
+    )
+    COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED = _env_bool(
+        "COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED", False
+    )
+    COSMIC_JOINT_PATH_GUIDE_RHO = _env_float(
+        "COSMIC_JOINT_PATH_GUIDE_RHO", 0.75
+    )
+    COSMIC_JOINT_PATH_GUIDE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_PATH_GUIDE_PROBABILITY", 0.50
+    )
+    COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY", 0.20
+    )
+    COSMIC_JOINT_GUIDE_INITIAL_BETA = _env_float(
+        "COSMIC_JOINT_GUIDE_INITIAL_BETA", 0.0
+    )
+    COSMIC_JOINT_GUIDE_ITERATIONS = max(1, _env_int(
+        "COSMIC_JOINT_GUIDE_ITERATIONS", 80
+    ))
+    COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION = _env_float(
+        "COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION", 4.0
+    )
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS", 128
+    ))
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS", 3
+    ))
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED = _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED", 20260816
+    )
+    COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY", 0.10
+    )
+    COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES", 2
+    ))
     COSMIC_COHERENT_MODES_PER_PLANE = max(1, _env_int(
-        "COSMIC_COHERENT_MODES_PER_PLANE", 4
+        "COSMIC_COHERENT_MODES_PER_PLANE", 12
     ))
     COSMIC_COHERENT_GRID_POINTS = max(17, _env_int(
         "COSMIC_COHERENT_GRID_POINTS", 41
@@ -7247,6 +9067,53 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_COHERENT_TRACK_CYCLES = max(1, _env_int(
         "COSMIC_COHERENT_TRACK_CYCLES", 2
     ))
+    COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM = _env_float(
+        "COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM", 30.0
+    )
+    COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM = _env_float(
+        "COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM", 2.0
+    )
+    COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES = max(1, _env_int(
+        "COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES", 8
+    ))
+    COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS = max(0, _env_int(
+        "COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS", 2
+    ))
+    COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS = max(
+        0,
+        _env_int(
+            "COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS",
+            1,
+        ),
+    )
+    if not (
+        math.isfinite(COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM)
+        and math.isfinite(COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM)
+        and 0.0 < COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+        <= COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+    ):
+        raise ValueError(
+            "coherent joint-timing range steps must be finite, positive, and "
+            "ordered"
+        )
+    COSMIC_COHERENT_TRACK_TRUST = _env_float(
+        "COSMIC_COHERENT_TRACK_TRUST", 1.0
+    )
+    if (
+        not math.isfinite(COSMIC_COHERENT_TRACK_TRUST)
+        or COSMIC_COHERENT_TRACK_TRUST <= 0.0
+    ):
+        raise ValueError("COSMIC_COHERENT_TRACK_TRUST must be positive and finite")
+    COSMIC_COHERENT_SELECTION_OBJECTIVE = os.environ.get(
+        "COSMIC_COHERENT_SELECTION_OBJECTIVE", "laplace_surrogate"
+    ).strip().lower()
+    if COSMIC_COHERENT_SELECTION_OBJECTIVE not in {
+        "posterior", "laplace_surrogate"
+    }:
+        raise ValueError(
+            "COSMIC_COHERENT_SELECTION_OBJECTIVE must be posterior or "
+            "laplace_surrogate"
+        )
     COSMIC_FE_MODES_PER_PLANE = max(1, _env_int(
         "COSMIC_FE_MODES_PER_PLANE", 4
     ))
@@ -7297,10 +9164,18 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     MCS_COHERENT_IMPLEMENTATION = os.environ.get(
         "MCS_COHERENT_IMPLEMENTATION", "fast12_profile"
     ).strip().lower().replace("-", "_")
-    if MCS_COHERENT_IMPLEMENTATION not in {"fast12_profile", "legacy_fisher"}:
+    if MCS_COHERENT_IMPLEMENTATION not in {
+        "physics_reference", "fast12_profile", "legacy_fisher"
+    }:
         raise ValueError(
-            "MCS_COHERENT_IMPLEMENTATION must be fast12_profile or legacy_fisher"
+            "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
+            "fast12_profile, or legacy_fisher"
         )
+    MCS_PROCESS_MODES_PER_PLANE = (
+        _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+        if _MCS_PROCESS_MODES_PER_PLANE_TEXT
+        else default_coherent_modes_per_plane(MCS_COHERENT_IMPLEMENTATION)
+    )
     MCS_COHERENT_LATENT_MAX_ITERATIONS = _env_int(
         "MCS_COHERENT_LATENT_MAX_ITERATIONS", 4
     )
@@ -7392,7 +9267,12 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         run_cosmic_fermi_eyges_update,
     )
     from LicketyFit.cosmic_coherent_mcs import (
+        run_cosmic_coherent_joint_length_update,
+        run_cosmic_joint_energy_range_update,
         run_cosmic_coherent_profile_update,
+    )
+    from LicketyFit.mcs_curved_path import (
+        preload_coherent_charge_numba_kernels,
     )
     from LicketyFit.cosmic_track_fit import (
         BlockOptimizerResult,
@@ -7418,6 +9298,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         seed_values_from_mapping,
         select_diverse_seed_indices,
         track_aligned_block_optimize,
+        two_anchor_stationarity_probe,
         two_anchor_block_optimize,
     )
     from LicketyFit.cosmic_navigation import (
@@ -7425,6 +9306,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         range_stratum_from_ratio,
         select_range_stratified_positions,
         select_range_stratified_seed_indices,
+        select_cosmic_topology_primary_positions,
         select_cosmic_tournament_positions,
         select_cosmic_continuation_positions,
         validate_range_ratio_edges,
@@ -7434,6 +9316,15 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         build_tangent_direction_fan,
         pivot_reference_for_direction_fan,
         refine_local_causal_timing_lines,
+    )
+    from LicketyFit.multilateration_seeding import (
+        build_multilateration_timing_seed_guard,
+        fit_point_multilateration,
+        rank_multilateration_seed_bank,
+        select_guided_seed_bank_indices,
+    )
+    from LicketyFit.wcsim_range_convention import (
+        load_wcsim_visible_range_convention,
     )
     from LicketyFit.detector_geometry import (
         DetectorGeometrySummary,
@@ -7478,19 +9369,98 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     reset_rel_eff_mode()
 
     FIT_PARTICLE = canonical_particle_name(FIT_PARTICLE_RAW)
+    _WCSIM_VISIBLE_RANGE_CONVENTION_PATH = os.environ.get(
+        "WCSIM_VISIBLE_RANGE_CONVENTION_MANIFEST", ""
+    ).strip()
+    WCSIM_VISIBLE_RANGE_CONVENTION = (
+        load_wcsim_visible_range_convention(
+            _WCSIM_VISIBLE_RANGE_CONVENTION_PATH
+        )
+        if _WCSIM_VISIBLE_RANGE_CONVENTION_PATH else None
+    )
+    if WCSIM_VISIBLE_RANGE_CONVENTION is not None and FIT_PARTICLE != "muon":
+        raise ValueError(
+            "WCSim visible-range convention is currently calibrated for muons"
+        )
     BOUNDARY_CLIPPED_TRACK = False
     AUTO_CLIPPED_TRACK = bool(_AUTO_CLIPPED_MODE_REQUESTED)
     if not AUTO_CLIPPED_TRACK:
         raise ValueError(
-            "The cosmic engine only accepts FIT_MODE=cosmic. "
+            "The general engine only accepts FIT_MODE=general. "
             "Historical aliases auto_clipped, range_clipped and universal are "
             "accepted for compatibility."
         )
+    _EMITTER_SWITCHES = emitter_switch_summary_from_env()
+    _COSMIC_MODEL_SWITCHES = _cosmic_model_switches_from_emitter(
+        _EMITTER_SWITCHES
+    )
+    COSMIC_MCS_CONTINUATION = str(_COSMIC_MODEL_SWITCHES["model"])
+    COSMIC_FERMI_EYGES_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["linear_fermi_eyges"]
+    )
+    COSMIC_COHERENT_PROFILE_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["coherent_fermi_eyges"]
+    )
+    COSMIC_JOINT_ENERGY_RANGE_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["joint_energy_range"]
+    )
+    COHERENT_NUMBA_PRELOAD = (
+        preload_coherent_charge_numba_kernels()
+        if (
+            COSMIC_COHERENT_PROFILE_ENABLED
+            or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+        )
+        else {"enabled": False, "reason": "coherent continuation disabled"}
+    )
+    if (
+        bool(_EMITTER_SWITCHES["enable_primary_mcs"])
+        and COSMIC_MCS_CONTINUATION != "off"
+    ):
+        raise ValueError(
+            "A cosmic MCS continuation is selected while "
+            "DEFAULT_ENABLE_PRIMARY_MCS=True. Set it to False in Emitter.py "
+            "to prevent double-counting primary MCS."
+        )
+    if (
+        COSMIC_COHERENT_FIXED_KE0_MEV is not None
+        and not COSMIC_COHERENT_PROFILE_ENABLED
+    ):
+        raise ValueError(
+            "COSMIC_COHERENT_FIXED_KE0_MEV requires a coherent cosmic "
+            "continuation selected in Emitter.py"
+        )
+    if (
+        COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES > 0
+        and not (
+            COSMIC_COHERENT_PROFILE_ENABLED
+            and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+        )
+    ):
+        raise ValueError(
+            "COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES requires "
+            "DEFAULT_COSMIC_MCS_CONTINUATION="
+            "'coherent_then_joint_k0_range_gaussian_fe'"
+        )
+    if COSMIC_JOINT_ENERGY_RANGE_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The joint K0/range/path continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
+    if COSMIC_COHERENT_PROFILE_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The coherent FE path continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
+    if COSMIC_FERMI_EYGES_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The linear FE continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
     # The internal optical coordinate is the CSDA range to Cherenkov threshold.
-    # The public mode label remains cosmic and the visible segment is derived by
+    # The public mode label is general and the visible segment is derived by
     # clipping the finite-range track to the detector water boundary.
     FIT_MODE = "full_length"
-    FIT_MODE_LABEL = "cosmic"
+    FIT_MODE_LABEL = "general"
     if LIKELIHOOD_MODE not in {"charge_only", "charge_time", "timing_only"}:
         raise ValueError("LIKELIHOOD_MODE must be charge_only, charge_time, or timing_only")
     if PROXY_GROUP_MODE not in {"mpmt", "pmt"}:
@@ -7544,6 +9514,13 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     USE_COHERENT_FISHER = MCS_RECONSTRUCTION_MODE == "coherent_fisher"
     USE_FERMI_EYGES = MCS_RECONSTRUCTION_MODE == "fermi_eyges_process"
     USE_LEGACY_MCS = MCS_RECONSTRUCTION_MODE == "legacy"
+    if USE_COHERENT_FISHER:
+        MCS_COHERENT_IMPLEMENTATION = validate_coherent_configuration(
+            MCS_COHERENT_IMPLEMENTATION,
+            MCS_PROCESS_MODES_PER_PLANE,
+            MCS_PROCESS_GRID_POINTS,
+            MCS_COHERENT_GRID_POINTS,
+        )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and FIT_MODE != "full_length":
         raise ValueError("Fermi--Eyges reconstruction currently requires full_length mode")
     if AUTO_CLIPPED_TRACK and (USE_FERMI_EYGES or USE_COHERENT_FISHER):
@@ -8327,6 +10304,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 fixed_direction=FIXED_DIRECTION,
                 full_range_limits=full_range_limits,
                 allow_boundary_clipping=bool(AUTO_CLIPPED_TRACK),
+                prevalidated=True,
             )
             auto_boundary_seeds: list[dict[str, object]] = []
             if AUTO_CLIPPED_TRACK:
@@ -8415,6 +10393,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             fixed_direction=FIXED_DIRECTION,
             full_range_limits=full_range_limits,
             allow_boundary_clipping=bool(AUTO_CLIPPED_TRACK),
+            prevalidated=True,
         )
         auto_boundary_seeds: list[dict[str, object]] = []
         if AUTO_CLIPPED_TRACK:
@@ -10156,6 +12135,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 LICKETYFIT_DIR / "track_parameterization.py",
                 LICKETYFIT_DIR / "fast_track_fit.py",
                 LICKETYFIT_DIR / "cosmic_track_fit.py",
+                LICKETYFIT_DIR / "cosmic_navigation.py",
                 LICKETYFIT_DIR / "detector_geometry.py",
                 LICKETYFIT_DIR / "Emitter.py",
                 LICKETYFIT_DIR / "particle_cherenkov_model.py",
@@ -10175,7 +12155,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 "proxy_disable_delta": bool(PROXY_DISABLE_DELTA),
                 "proxy_disable_photon_scatter": bool(PROXY_DISABLE_PHOTON_SCATTER),
                 "proxy_optimize_length": bool(PROXY_OPTIMIZE_LENGTH),
-                "seed_grid_metadata": dict(SEED_GRID_METADATA),
+                "seed_grid_metadata": dict(proxy_seed_grid_metadata),
                 "seed_start_hypotheses_sha256": hashlib.sha256(
                     "\n".join(_seed_start_hypothesis(seed) for seed in SEEDS).encode(
                         "utf-8"
@@ -10819,8 +12799,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         if (
             not ADAPTIVE_EXACT_POLISH
             or int(ADAPTIVE_EXACT_POLISH_SWEEPS) <= 0
-            or len(result.history) < 2
         ):
+            return result, False, math.nan
+        if len(result.history) < 2:
             return result, False, math.nan
         previous = float(result.history[-2]["fval"])
         current_fval = float(result.history[-1]["fval"])
@@ -11212,6 +13193,27 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         }
         causal_timing_wall_s = 0.0
         causal_timing_failure = None
+        multilateration_seed_records = []
+        multilateration_line_records = []
+        multilateration_point_record = None
+        multilateration_point_fit = None
+        multilateration_pool_count = 0
+        multilateration_prefilter_nfcn = 0
+        multilateration_prefilter_wall_s = 0.0
+        multilateration_prefilter_failures = []
+        cosmic_multilateration_indices_by_hypothesis = {
+            "internal_start": set(), "boundary_entry": set()
+        }
+        multilateration_wall_s = 0.0
+        multilateration_failure = None
+        multilateration_primary_fallback_used = False
+        multilateration_primary_fallback_reason = None
+        multilateration_guided_full_bank_fallback = False
+        multilateration_guided_bank_records = []
+        multilateration_guided_bank_neighbourhood_count = 0
+        multilateration_guided_proxy_quantization_uncertainty_nll = 0.0
+        multilateration_guided_bank_wall_s = 0.0
+        multilateration_guided_bank_failure = None
         boundary_primary_indices = []
         cosmic_baseline_indices_by_hypothesis = {
             "internal_start": set(), "boundary_entry": set()
@@ -11311,9 +13313,91 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             global_candidate_indices = []
             candidate_indices = [int(x) for x in local_candidate_indices]
 
+        # In primary mode, retain a complete but dormant copy of the established
+        # candidate selection.  The event-specific multilateration family is the
+        # only family evaluated when its navigation succeeds; a numerical,
+        # geometry, or hit-count failure restores this exact incumbent selection.
+        # This fail-safe is truth-blind and does not mix a partial challenger with
+        # a partially deleted baseline bank.
+        multilateration_primary_fallback_indices = list(candidate_indices)
+        multilateration_primary_fallback_baseline_sets = {
+            hypothesis: set(indices)
+            for hypothesis, indices
+            in cosmic_baseline_indices_by_hypothesis.items()
+        }
+        multilateration_primary_fallback_range_sets = {
+            hypothesis: set(indices)
+            for hypothesis, indices
+            in cosmic_range_guard_indices_by_hypothesis.items()
+        }
+        if COSMIC_MULTILATERATION_SEED_MODE in {
+            "primary", "hybrid", "guided"
+        }:
+            candidate_indices = []
+            cosmic_baseline_indices_by_hypothesis = {
+                "internal_start": set(), "boundary_entry": set()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                "internal_start": set(), "boundary_entry": set()
+            }
+
+        causal_timing_lazy_beam_skip = False
+        causal_timing_lazy_beam_diagnostics = {}
+        causal_lazy_beam_dominance_nll = max(
+            0.0,
+            _env_float(
+                "COSMIC_CAUSAL_LAZY_BEAM_DOMINANCE_NLL",
+                0.0,
+            ),
+        )
+        if (
+            AUTO_CLIPPED_TRACK
+            and WCTE
+            and causal_lazy_beam_dominance_nll > 0.0
+            and internal_candidate_indices
+            and boundary_candidate_indices
+        ):
+            best_internal_index = min(
+                internal_candidate_indices,
+                key=lambda index: float(scores[int(index)]),
+            )
+            best_boundary_index = min(
+                boundary_candidate_indices,
+                key=lambda index: float(scores[int(index)]),
+            )
+            best_internal_score = float(scores[int(best_internal_index)])
+            best_boundary_score = float(scores[int(best_boundary_index)])
+            proxy_dominance = best_boundary_score - best_internal_score
+            best_internal_family = str(
+                event_seeds[int(best_internal_index)].get("seed_family", "")
+            )
+            causal_timing_lazy_beam_skip = bool(
+                best_internal_family == "wcte_beam_cluster"
+                and math.isfinite(proxy_dominance)
+                and proxy_dominance >= causal_lazy_beam_dominance_nll
+            )
+            causal_timing_lazy_beam_diagnostics = {
+                "enabled": True,
+                "threshold_nll": float(causal_lazy_beam_dominance_nll),
+                "best_internal_seed_index": int(best_internal_index),
+                "best_internal_seed_family": best_internal_family,
+                "best_internal_proxy_nll": best_internal_score,
+                "best_boundary_seed_index": int(best_boundary_index),
+                "best_boundary_proxy_nll": best_boundary_score,
+                "internal_dominance_nll": float(proxy_dominance),
+                "causal_guard_skipped": bool(causal_timing_lazy_beam_skip),
+            }
+
         if (
             AUTO_CLIPPED_TRACK
             and COSMIC_CAUSAL_TIMING_GUARD
+            # Guided bank restriction inherits the established truth-blind
+            # causal certificate.  Certified nominal events still skip this
+            # work; ambiguous events retain the independent timing topology
+            # guard additively.  Direct analytic-primary mode remains isolated;
+            # hybrid mode intentionally retains this independent line estimator.
+            and COSMIC_MULTILATERATION_SEED_MODE != "primary"
+            and not causal_timing_lazy_beam_skip
             and int(COSMIC_CAUSAL_MAX_SEEDS) > 0
             and LIKELIHOOD_MODE != "charge_only"
             and int(np.count_nonzero(np.isfinite(obs_ts) & (np.asarray(obs_pes) > 0.0))) >= 8
@@ -11414,36 +13498,97 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     current = best_by_line_hypothesis.get(key)
                     if current is None or row[:2] < current[:2]:
                         best_by_line_hypothesis[key] = row
-                causal_selected_rows = sorted(
-                    best_by_line_hypothesis.values(),
-                    key=lambda row: (float(row[0]), float(row[1]), int(row[2]), str(row[3])),
-                )
-                selected_signatures = {
-                    (int(row[2]), str(row[3]), float(row[4].start_fraction),
-                     float(row[4].end_fraction))
-                    for row in causal_selected_rows
-                }
-                if len(causal_selected_rows) < int(COSMIC_CAUSAL_MAX_SEEDS):
-                    for row in sorted(
-                        causal_scored,
-                        key=lambda item: (
-                            float(item[0]), float(item[1]), int(item[2]), str(item[3])
+                if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+                    # Hybrid navigation requires both independent estimators to
+                    # cover both physical start hypotheses.  Allocate the small
+                    # causal family symmetrically before ranking within a
+                    # hypothesis; a global NLL truncation can otherwise spend
+                    # every slot on boundary entry and trigger an avoidable full-
+                    # bank fallback.  This changes hybrid mode only and leaves the
+                    # established cosmic seed policy byte-for-byte equivalent.
+                    maximum_selected = int(COSMIC_CAUSAL_MAX_SEEDS)
+                    topology_quota = {
+                        "internal_start": (maximum_selected + 1) // 2,
+                        "boundary_entry": maximum_selected // 2,
+                    }
+                    causal_selected_rows = []
+                    selected_signatures = set()
+                    for hypothesis in ("internal_start", "boundary_entry"):
+                        quota = int(topology_quota[hypothesis])
+                        if quota <= 0:
+                            continue
+                        hypothesis_rows = sorted(
+                            (
+                                row for row in causal_scored
+                                if str(row[3]) == hypothesis
+                            ),
+                            key=lambda item: (
+                                float(item[0]), float(item[1]), int(item[2])
+                            ),
+                        )
+                        best_by_line = {}
+                        for row in hypothesis_rows:
+                            best_by_line.setdefault(int(row[2]), row)
+                        prioritized = sorted(
+                            best_by_line.values(),
+                            key=lambda item: (
+                                float(item[0]), float(item[1]), int(item[2])
+                            ),
+                        ) + hypothesis_rows
+                        retained = 0
+                        for row in prioritized:
+                            signature = (
+                                int(row[2]), str(row[3]),
+                                float(row[4].start_fraction),
+                                float(row[4].end_fraction),
+                            )
+                            if signature in selected_signatures:
+                                continue
+                            selected_signatures.add(signature)
+                            causal_selected_rows.append(row)
+                            retained += 1
+                            if retained >= quota:
+                                break
+                else:
+                    causal_selected_rows = sorted(
+                        best_by_line_hypothesis.values(),
+                        key=lambda row: (
+                            float(row[0]), float(row[1]), int(row[2]), str(row[3])
                         ),
-                    ):
-                        signature = (
+                    )
+                    selected_signatures = {
+                        (
                             int(row[2]), str(row[3]),
                             float(row[4].start_fraction),
                             float(row[4].end_fraction),
                         )
-                        if signature in selected_signatures:
-                            continue
-                        selected_signatures.add(signature)
-                        causal_selected_rows.append(row)
-                        if len(causal_selected_rows) >= int(COSMIC_CAUSAL_MAX_SEEDS):
-                            break
-                causal_selected_rows = causal_selected_rows[
-                    : int(COSMIC_CAUSAL_MAX_SEEDS)
-                ]
+                        for row in causal_selected_rows
+                    }
+                    if len(causal_selected_rows) < int(COSMIC_CAUSAL_MAX_SEEDS):
+                        for row in sorted(
+                            causal_scored,
+                            key=lambda item: (
+                                float(item[0]), float(item[1]),
+                                int(item[2]), str(item[3])
+                            ),
+                        ):
+                            signature = (
+                                int(row[2]), str(row[3]),
+                                float(row[4].start_fraction),
+                                float(row[4].end_fraction),
+                            )
+                            if signature in selected_signatures:
+                                continue
+                            selected_signatures.add(signature)
+                            causal_selected_rows.append(row)
+                            if (
+                                len(causal_selected_rows)
+                                >= int(COSMIC_CAUSAL_MAX_SEEDS)
+                            ):
+                                break
+                    causal_selected_rows = causal_selected_rows[
+                        : int(COSMIC_CAUSAL_MAX_SEEDS)
+                    ]
 
                 for charge_score, _, _, _, candidate, seed in causal_selected_rows:
                     index = int(len(event_seeds))
@@ -11465,6 +13610,518 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 }
             causal_timing_wall_s = float(time.perf_counter() - causal_start)
 
+        # The full immutable proxy bank supplies an independent, already
+        # validated certificate for when the nominal internal-start family
+        # decisively dominates the boundary family.  A failed certificate is
+        # evidence that the point-source restriction is not safe, not merely a
+        # reason to add another narrow timing family.  Restore the complete
+        # incumbent bank in that case and retain any causal seeds additively.
+        # This rule has no truth, beam direction, or energy input.  Detectors
+        # without the WCTE-specific certificate therefore fall back safely.
+        multilateration_guided_full_bank_fallback = bool(
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not causal_timing_lazy_beam_skip
+        )
+        if multilateration_guided_full_bank_fallback:
+            causal_navigation_indices = list(candidate_indices)
+            candidate_indices = []
+            fallback_seen = set()
+            for index in (
+                list(multilateration_primary_fallback_indices)
+                + causal_navigation_indices
+            ):
+                if int(index) not in fallback_seen:
+                    fallback_seen.add(int(index))
+                    candidate_indices.append(int(index))
+            cosmic_baseline_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_baseline_sets.items()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_range_sets.items()
+            }
+            multilateration_primary_fallback_used = True
+            multilateration_primary_fallback_reason = (
+                "guided_full_bank_certificate_failed"
+            )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE != "off"
+            and not multilateration_guided_full_bank_fallback
+            and int(COSMIC_MULTILATERATION_MAX_SEEDS) > 0
+            and LIKELIHOOD_MODE != "charge_only"
+            and int(np.count_nonzero(
+                np.isfinite(obs_ts) & (np.asarray(obs_pes) > 0.0)
+            )) >= int(COSMIC_MULTILATERATION_MIN_HITS)
+            and FIXED_DIRECTION is None
+        ):
+            multilateration_start = time.perf_counter()
+            try:
+                if COSMIC_MULTILATERATION_SEED_MODE == "guided":
+                    # Guided mode uses the point solution only to restrict the
+                    # immutable calibrated seed bank.  Building finite-track
+                    # segment hypotheses and charge-scoring them here cannot
+                    # affect that bank, so doing so would be pure event-time
+                    # overhead.  Additive/direct-primary modes still construct
+                    # the full analytic pool below.
+                    point_fit = fit_point_multilateration(
+                        DETECTOR,
+                        P_LOCATIONS,
+                        np.asarray(obs_pes, dtype=np.float64),
+                        np.asarray(obs_ts, dtype=np.float64),
+                        timing_sigma_ns=float(
+                            getattr(PMT_MODEL, "single_pe_time_std", 1.0)
+                        ),
+                        group_refractive_index=float(
+                            COSMIC_MULTILATERATION_GROUP_INDEX
+                        ),
+                        minimum_hits=int(COSMIC_MULTILATERATION_MIN_HITS),
+                        maximum_hits=(
+                            None
+                            if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                            else int(COSMIC_MULTILATERATION_MAX_HITS)
+                        ),
+                        maximum_nfev=int(COSMIC_MULTILATERATION_MAX_NFEV),
+                    )
+                    multilateration_pool = []
+                    multilateration_lines = []
+                else:
+                    multilateration_pool, multilateration_lines, point_fit = (
+                        build_multilateration_timing_seed_guard(
+                            DETECTOR,
+                            P_LOCATIONS,
+                            np.asarray(obs_pes, dtype=np.float64),
+                            np.asarray(obs_ts, dtype=np.float64),
+                            timing_sigma_ns=float(
+                                getattr(PMT_MODEL, "single_pe_time_std", 1.0)
+                            ),
+                            group_refractive_index=float(
+                                COSMIC_MULTILATERATION_GROUP_INDEX
+                            ),
+                            phase_refractive_index=float(
+                                getattr(EMITTER_TEMPLATE, "n", 1.344)
+                            ),
+                            maximum_full_range_mm=float(
+                                RANGE_LOOKUP.overall_distances_mm[-1]
+                            ),
+                            boundary_inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            minimum_hits=int(COSMIC_MULTILATERATION_MIN_HITS),
+                            maximum_hits=(
+                                None
+                                if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                                else int(COSMIC_MULTILATERATION_MAX_HITS)
+                            ),
+                            maximum_nfev=int(COSMIC_MULTILATERATION_MAX_NFEV),
+                            include_reverse_directions=bool(
+                                COSMIC_MULTILATERATION_INCLUDE_REVERSE
+                            ),
+                            reverse_if_resultant_below=float(
+                                COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD
+                            ),
+                            maximum_per_line_hypothesis=int(
+                                COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS
+                            ),
+                            maximum_pool_seeds=int(
+                                COSMIC_MULTILATERATION_POOL_SEEDS
+                            ),
+                        )
+                    )
+                multilateration_point_record = point_fit.metadata()
+                multilateration_point_fit = point_fit
+                multilateration_pool_count = int(len(multilateration_pool))
+                multilateration_line_records = [
+                    {
+                        "score": float(line.score),
+                        "t0_ns": float(line.t0_ns),
+                        "reference_mm": np.asarray(line.reference_mm).tolist(),
+                        "direction": np.asarray(line.direction).tolist(),
+                        "entry_mm": np.asarray(line.entry_mm).tolist(),
+                        "exit_mm": np.asarray(line.exit_mm).tolist(),
+                        "chord_length_mm": float(line.chord_length_mm),
+                        "n_hits": int(line.n_hits),
+                        "n_inliers": int(line.n_inliers),
+                    }
+                    for line in multilateration_lines
+                ]
+
+                # Point timing is weak along the track.  Retain several causal
+                # longitudinal/range realizations, score each once with the same
+                # direct-primary proxy used by the incumbent timing guard, and
+                # keep the best realization for each line/start hypothesis.
+                prefilter_start = time.perf_counter()
+                multilateration_scored = []
+                for candidate in multilateration_pool:
+                    seed = dict(candidate.seed)
+                    hypothesis = str(candidate.track_start_hypothesis)
+                    try:
+                        seed_values, seed_chart = seed_values_and_chart_for_fit(
+                            seed
+                        )
+                        for name, value in FIXED_PARAMS.items():
+                            if name != "direction" and name in seed_values:
+                                seed_values[name] = float(value)
+                        proxy_charge_objective = make_objective(
+                            obs_pes,
+                            obs_ts,
+                            seed_chart,
+                            "charge_only",
+                            proxy=True,
+                            start_hypothesis=hypothesis,
+                        )
+                        charge_score = float(
+                            proxy_charge_objective(seed_values)
+                        )
+                        multilateration_prefilter_nfcn += int(
+                            proxy_charge_objective.evaluations
+                        )
+                        if not math.isfinite(charge_score):
+                            raise RuntimeError(
+                                "non-finite multilateration charge prefilter"
+                            )
+                        seed["multilateration_proxy_charge_nll"] = float(
+                            charge_score
+                        )
+                        multilateration_scored.append((
+                            float(charge_score),
+                            float(candidate.score),
+                            int(candidate.line_rank),
+                            str(hypothesis),
+                            candidate,
+                            seed,
+                        ))
+                    except Exception as exc:
+                        multilateration_prefilter_failures.append({
+                            "line_rank": int(candidate.line_rank),
+                            "track_start_hypothesis": str(hypothesis),
+                            "topology": str(candidate.topology),
+                            "start_fraction": float(candidate.start_fraction),
+                            "end_fraction": float(candidate.end_fraction),
+                            "error": repr(exc),
+                        })
+                multilateration_prefilter_wall_s = float(
+                    time.perf_counter() - prefilter_start
+                )
+
+                # Allocate the compact final pool symmetrically between the two
+                # physical start hypotheses.  Within each hypothesis preserve one
+                # seed per independent line, then spend any remaining slot on a
+                # distinct longitudinal/range realization selected by charge.
+                # This is the intended "small set along the track" rather than a
+                # direction-only contest that accidentally deletes longitudinal
+                # uncertainty.
+                maximum_selected = int(COSMIC_MULTILATERATION_MAX_SEEDS)
+                topology_quota = {
+                    "internal_start": (maximum_selected + 1) // 2,
+                    "boundary_entry": maximum_selected // 2,
+                }
+                multilateration_selected_rows = []
+                selected_signatures = set()
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    hypothesis_rows = sorted(
+                        (
+                            row for row in multilateration_scored
+                            if str(row[3]) == hypothesis
+                        ),
+                        key=lambda item: (
+                            float(item[0]), float(item[1]), int(item[2])
+                        ),
+                    )
+                    best_by_line = {}
+                    for row in hypothesis_rows:
+                        best_by_line.setdefault(int(row[2]), row)
+                    prioritized = sorted(
+                        best_by_line.values(),
+                        key=lambda item: (
+                            float(item[0]), float(item[1]), int(item[2])
+                        ),
+                    ) + hypothesis_rows
+                    retained = 0
+                    for row in prioritized:
+                        signature = (
+                            int(row[2]), str(row[3]),
+                            float(row[4].start_fraction),
+                            float(row[4].end_fraction),
+                        )
+                        if signature in selected_signatures:
+                            continue
+                        selected_signatures.add(signature)
+                        multilateration_selected_rows.append(row)
+                        retained += 1
+                        if retained >= int(topology_quota[hypothesis]):
+                            break
+                if len(multilateration_selected_rows) < maximum_selected:
+                    for row in sorted(
+                        multilateration_scored,
+                        key=lambda item: (
+                            float(item[0]), float(item[1]),
+                            int(item[2]), str(item[3])
+                        ),
+                    ):
+                        signature = (
+                            int(row[2]), str(row[3]),
+                            float(row[4].start_fraction),
+                            float(row[4].end_fraction),
+                        )
+                        if signature in selected_signatures:
+                            continue
+                        selected_signatures.add(signature)
+                        multilateration_selected_rows.append(row)
+                        if len(multilateration_selected_rows) >= maximum_selected:
+                            break
+
+                for (
+                    charge_score, _, _, _, candidate, seed
+                ) in multilateration_selected_rows:
+                    if COSMIC_MULTILATERATION_SEED_MODE == "guided":
+                        metadata = candidate.metadata()
+                        metadata["seed"] = dict(seed)
+                        multilateration_seed_records.append({
+                            "seed_index": None,
+                            "evaluated_as_track_candidate": False,
+                            "multilateration_proxy_charge_nll": float(
+                                charge_score
+                            ),
+                            **metadata,
+                        })
+                        continue
+                    index = int(len(event_seeds))
+                    event_seeds.append(dict(seed))
+                    candidate_indices.append(index)
+                    hypothesis = str(candidate.track_start_hypothesis)
+                    cosmic_multilateration_indices_by_hypothesis[
+                        hypothesis
+                    ].add(index)
+                    metadata = candidate.metadata()
+                    metadata["seed"] = dict(seed)
+                    multilateration_seed_records.append({
+                        "seed_index": index,
+                        "evaluated_as_track_candidate": True,
+                        "multilateration_proxy_charge_nll": float(
+                            charge_score
+                        ),
+                        **metadata,
+                    })
+            except Exception as exc:
+                multilateration_failure = {
+                    "stage": "multilateration_navigation",
+                    "error": repr(exc),
+                }
+            multilateration_wall_s = float(
+                time.perf_counter() - multilateration_start
+            )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not multilateration_guided_full_bank_fallback
+            and multilateration_point_fit is not None
+        ):
+            guided_start = time.perf_counter()
+            try:
+                detector_diagonal_mm = float(np.linalg.norm(
+                    np.asarray(DETECTOR.axis_hi, dtype=np.float64)
+                    - np.asarray(DETECTOR.axis_lo, dtype=np.float64)
+                ))
+                maximum_transverse_mm = float(
+                    COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION
+                    * detector_diagonal_mm
+                )
+                guided_neighbourhood = rank_multilateration_seed_bank(
+                    PROXY_LIBRARY.seed_matrix,
+                    [_seed_start_hypothesis(seed) for seed in SEEDS],
+                    multilateration_point_fit,
+                    maximum_angle_deg=float(
+                        COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG
+                    ),
+                    maximum_transverse_distance_mm=maximum_transverse_mm,
+                    maximum_per_hypothesis=int(
+                        COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS
+                    ),
+                )
+                multilateration_guided_bank_neighbourhood_count = int(
+                    len(guided_neighbourhood)
+                )
+                by_index = {
+                    int(row.seed_index): row for row in guided_neighbourhood
+                }
+                proxy_group_index = np.asarray(
+                    PROXY_LIBRARY.group_index, dtype=np.int64
+                )
+                proxy_observed_charge = np.asarray(
+                    obs_pes, dtype=np.float64
+                )
+                proxy_valid = (
+                    (proxy_group_index >= 0)
+                    & np.isfinite(proxy_observed_charge)
+                )
+                proxy_grouped_charge = np.bincount(
+                    proxy_group_index[proxy_valid],
+                    weights=proxy_observed_charge[proxy_valid],
+                    minlength=int(PROXY_LIBRARY.group_counts.size),
+                ).astype(np.float64, copy=False)
+                proxy_quantized_charge = float(np.sum(
+                    proxy_grouped_charge[proxy_grouped_charge > 0.0]
+                ))
+                # Each stored log shape is uncertain by at most half a code
+                # spacing.  A difference of two proxy scores is consequently
+                # unresolved within delta_log * sum(q).  Retain a few distinct
+                # geometries inside that analytic bound for exact screening.
+                multilateration_guided_proxy_quantization_uncertainty_nll = (
+                    float(PROXY_LIBRARY.log_scale)
+                    * proxy_quantized_charge
+                    * float(
+                        COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER
+                    )
+                )
+                selected_by_hypothesis = {}
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    eligible = [
+                        int(row.seed_index)
+                        for row in guided_neighbourhood
+                        if row.track_start_hypothesis == hypothesis
+                    ]
+                    if not eligible:
+                        raise RuntimeError(
+                            "guided seed bank has no " + hypothesis + " candidates"
+                        )
+                    selected = select_guided_seed_bank_indices(
+                        guided_neighbourhood,
+                        np.asarray(scores, dtype=np.float64),
+                        SEEDS,
+                        COSMIC_SEED_RANGE_CLASSIFICATION.strata,
+                        start_hypothesis=hypothesis,
+                        range_representatives=min(
+                            int(
+                                COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS
+                            ),
+                            len(eligible),
+                        ),
+                        proxy_geometry_representatives=int(
+                            COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES
+                        ),
+                        maximum_proxy_geometry_gap_nll=float(
+                            COSMIC_TOURNAMENT_BASELINE_START_GATE_NLL
+                        ),
+                        maximum_quantization_tie_representatives=int(
+                            COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES
+                        ),
+                        proxy_quantization_uncertainty_nll=float(
+                            multilateration_guided_proxy_quantization_uncertainty_nll
+                        ),
+                    )
+                    if not selected:
+                        raise RuntimeError(
+                            "guided charge ranking selected no "
+                            + hypothesis + " candidates"
+                        )
+                    selected_by_hypothesis[hypothesis] = [
+                        int(index) for index in selected
+                    ]
+
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    selected = selected_by_hypothesis[hypothesis]
+                    for rank, index in enumerate(selected):
+                        if int(index) not in candidate_indices:
+                            candidate_indices.append(int(index))
+                        cosmic_baseline_indices_by_hypothesis[hypothesis].add(
+                            int(index)
+                        )
+                        if rank > 0:
+                            cosmic_range_guard_indices_by_hypothesis[
+                                hypothesis
+                            ].add(int(index))
+                        row = by_index[int(index)]
+                        multilateration_guided_bank_records.append({
+                            **row.metadata(),
+                            "proxy_charge_score": float(scores[int(index)]),
+                            "seed_family": str(
+                                SEEDS[int(index)].get("seed_family", "")
+                            ),
+                            "range_stratum": int(
+                                COSMIC_SEED_RANGE_CLASSIFICATION.strata[
+                                    int(index)
+                                ]
+                            ),
+                        })
+            except Exception as exc:
+                candidate_indices = []
+                cosmic_baseline_indices_by_hypothesis = {
+                    "internal_start": set(), "boundary_entry": set()
+                }
+                cosmic_range_guard_indices_by_hypothesis = {
+                    "internal_start": set(), "boundary_entry": set()
+                }
+                multilateration_guided_bank_records = []
+                multilateration_guided_bank_failure = {
+                    "stage": "multilateration_guided_seed_bank",
+                    "error": repr(exc),
+                }
+            multilateration_guided_bank_wall_s = float(
+                time.perf_counter() - guided_start
+            )
+
+        guided_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not multilateration_guided_full_bank_fallback
+            and not multilateration_guided_bank_records
+        )
+        primary_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "primary"
+            and not candidate_indices
+        )
+        hybrid_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "hybrid"
+            and any(
+                not cosmic_timing_guard_indices_by_hypothesis[hypothesis]
+                or not cosmic_multilateration_indices_by_hypothesis[hypothesis]
+                for hypothesis in ("internal_start", "boundary_entry")
+            )
+        )
+        if guided_bank_missing or primary_bank_missing or hybrid_bank_missing:
+            multilateration_primary_fallback_used = True
+            multilateration_primary_fallback_reason = (
+                "guided_bank_failure"
+                if multilateration_guided_bank_failure is not None
+                else "hybrid_independent_navigation_incomplete"
+                if hybrid_bank_missing
+                else "navigation_failure"
+                if multilateration_failure is not None
+                else "no_valid_prefiltered_seeds"
+            )
+            additive_navigation_indices = (
+                list(candidate_indices)
+                if COSMIC_MULTILATERATION_SEED_MODE == "guided"
+                else []
+            )
+            candidate_indices = []
+            fallback_seen = set()
+            for index in (
+                list(multilateration_primary_fallback_indices)
+                + additive_navigation_indices
+            ):
+                if int(index) not in fallback_seen:
+                    fallback_seen.add(int(index))
+                    candidate_indices.append(int(index))
+            cosmic_baseline_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_baseline_sets.items()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_range_sets.items()
+            }
+        hybrid_navigation_active = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "hybrid"
+            and not hybrid_bank_missing
+        )
+
         length_limits = track_length_limits()
         full_range_limits = (
             (1.0, float(RANGE_LOOKUP.overall_distances_mm[-1]))
@@ -11475,6 +14132,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         candidate_failures = []
         if causal_timing_failure is not None:
             candidate_failures.append(dict(causal_timing_failure))
+        if multilateration_failure is not None:
+            candidate_failures.append(dict(multilateration_failure))
+        if multilateration_guided_bank_failure is not None:
+            candidate_failures.append(dict(multilateration_guided_bank_failure))
         proxy_nfcn = 0
         exact_rerank_nfcn = 0
         joint_candidate_range_diagnostics = []
@@ -11502,7 +14163,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         and not BOUNDARY_CLIPPED_TRACK
                         and start_hypothesis == "internal_start"
                         and WCTE_SKIP_BROAD_PROXY_OPTIMIZATION
-                        and seed_family != "wcte_detector_global"
+                        and seed_family not in {
+                            "wcte_detector_global", "multilateration_timing"
+                        }
                     )
                 )
                 if skip_broad:
@@ -11609,6 +14272,45 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             if row is not None:
                 candidate_rows.append(row)
 
+        if hybrid_navigation_active:
+            successful_hypotheses = {
+                _seed_start_hypothesis(event_seeds[int(row[1])])
+                for row in candidate_rows
+            }
+            missing_hypotheses = {
+                "internal_start", "boundary_entry"
+            }.difference(successful_hypotheses)
+            if missing_hypotheses:
+                # Construction-time coverage is not enough: a compact seed can
+                # still fail its first exact evaluation. Restore the dormant
+                # immutable bank before topology arbitration in that case.
+                multilateration_primary_fallback_used = True
+                multilateration_primary_fallback_reason = (
+                    "hybrid_exact_candidate_incomplete"
+                )
+                hybrid_navigation_active = False
+                cosmic_baseline_indices_by_hypothesis = {
+                    hypothesis: set(indices)
+                    for hypothesis, indices
+                    in multilateration_primary_fallback_baseline_sets.items()
+                }
+                cosmic_range_guard_indices_by_hypothesis = {
+                    hypothesis: set(indices)
+                    for hypothesis, indices
+                    in multilateration_primary_fallback_range_sets.items()
+                }
+                evaluated_indices = {int(row[1]) for row in candidate_rows}
+                for index in multilateration_primary_fallback_indices:
+                    index = int(index)
+                    if index in evaluated_indices:
+                        continue
+                    if index not in candidate_indices:
+                        candidate_indices.append(index)
+                    row = evaluate_candidate(index)
+                    if row is not None:
+                        candidate_rows.append(row)
+                        evaluated_indices.add(index)
+
         if AUTO_CLIPPED_TRACK and exact_mode != "charge_only" and candidate_rows:
             # Charge determines the coarse geometric basin. Profiling t0 for every
             # diverse proxy candidate is unnecessarily expensive, especially for
@@ -11655,14 +14357,38 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             )
                     row_ratios.append(float(ratio))
                     row_strata.append(int(stratum))
-                range_positions = select_range_stratified_positions(
-                    [float(row[0]) for row in rows],
-                    row_strata,
-                    n_keep=min(
-                        int(AUTO_EXACT_RERANK_PER_TOPOLOGY), len(rows)
-                    ),
-                    raw_top=2,
+                multilateration_set = (
+                    cosmic_multilateration_indices_by_hypothesis[hypothesis]
                 )
+                # Preserve the exact incumbent range-stratified selection when
+                # the additive challenger is enabled.  Multilateration rows are
+                # closed separately below and therefore cannot consume one of
+                # the established cosmic candidate slots.
+                incumbent_positions = [
+                    int(position) for position, row in enumerate(rows)
+                    if int(row[1]) not in multilateration_set
+                ]
+                range_positions = []
+                if incumbent_positions:
+                    incumbent_range_positions = select_range_stratified_positions(
+                        [
+                            float(rows[position][0])
+                            for position in incumbent_positions
+                        ],
+                        [
+                            int(row_strata[position])
+                            for position in incumbent_positions
+                        ],
+                        n_keep=min(
+                            int(AUTO_EXACT_RERANK_PER_TOPOLOGY),
+                            len(incumbent_positions),
+                        ),
+                        raw_top=2,
+                    )
+                    range_positions = [
+                        int(incumbent_positions[int(position)])
+                        for position in incumbent_range_positions
+                    ]
                 baseline_set = cosmic_baseline_indices_by_hypothesis[hypothesis]
                 baseline_positions = [
                     int(position) for position, row in enumerate(rows)
@@ -11688,13 +14414,31 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 timing_positions = timing_positions_all[
                     : int(COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS)
                 ]
+                multilateration_positions_all = [
+                    int(position) for position, row in enumerate(rows)
+                    if int(row[1]) in multilateration_set
+                ]
+                multilateration_positions_all.sort(key=lambda position: (
+                    float(rows[int(position)][0]),
+                    int(event_seeds[int(rows[int(position)][1])].get(
+                        "multilateration_line_rank", 10**9
+                    )),
+                ))
+                multilateration_positions = multilateration_positions_all[
+                    : int(COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS)
+                ]
                 # Exact-joint close the complete candidate budget used by the
                 # pre-range-guard cosmic fitter, then add the geometry/range and
                 # causal-timing guards.  Every extra family is additive rather than
                 # substitutive, so a successful charge basin cannot be deleted.
                 positions = []
                 seen_positions = set()
-                for position in baseline_positions + list(range_positions) + timing_positions:
+                for position in (
+                    baseline_positions
+                    + list(range_positions)
+                    + timing_positions
+                    + multilateration_positions
+                ):
                     position = int(position)
                     if position not in seen_positions:
                         seen_positions.add(position)
@@ -11717,6 +14461,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     "baseline_positions": [int(x) for x in baseline_positions],
                     "range_guard_positions": [int(x) for x in range_positions],
                     "causal_timing_positions": [int(x) for x in timing_positions],
+                    "multilateration_positions": [
+                        int(x) for x in multilateration_positions
+                    ],
                     "selected_origins": [
                         {
                             "baseline": bool(int(rows[int(position)][1]) in baseline_set),
@@ -11727,13 +14474,17 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             "causal_timing": bool(
                                 int(rows[int(position)][1]) in timing_set
                             ),
+                            "multilateration": bool(
+                                int(rows[int(position)][1])
+                                in multilateration_set
+                            ),
                         }
                         for position in positions
                     ],
                 })
 
-            joint_rows = []
-            for row in selected_for_joint:
+            def close_joint_candidate(row, *, stage):
+                nonlocal exact_rerank_nfcn
                 _, index, proxy_result, start_values, start_chart, _ = row
                 hypothesis = _seed_start_hypothesis(event_seeds[int(index)])
                 try:
@@ -11786,14 +14537,14 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     exact_rerank_nfcn += int(joint_objective.evaluations)
                     if not math.isfinite(joint_fval):
                         raise RuntimeError("non-finite exact joint candidate NLL")
-                    joint_rows.append((
+                    return (
                         joint_fval,
                         int(index),
                         proxy_result,
                         closed_values,
                         start_chart,
                         profiled,
-                    ))
+                    )
                 except Exception as exc:
                     candidate_failures.append({
                         "seed_index": int(index),
@@ -11801,9 +14552,73 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             event_seeds[int(index)].get("seed_family", "")
                         ),
                         "track_start_hypothesis": str(hypothesis),
-                        "stage": "auto_exact_joint_rerank",
+                        "stage": str(stage),
                         "error": repr(exc),
                     })
+                    return None
+
+            joint_rows = []
+            for row in selected_for_joint:
+                closed_row = close_joint_candidate(
+                    row, stage="auto_exact_joint_rerank"
+                )
+                if closed_row is not None:
+                    joint_rows.append(closed_row)
+
+            if hybrid_navigation_active:
+                successful_hypotheses = {
+                    _seed_start_hypothesis(event_seeds[int(row[1])])
+                    for row in joint_rows
+                }
+                missing_hypotheses = {
+                    "internal_start", "boundary_entry"
+                }.difference(successful_hypotheses)
+                if missing_hypotheses:
+                    # A compact candidate may pass charge closure and still fail
+                    # the exact joint likelihood.  Retry the missing topology from
+                    # the dormant full cosmic bank before accepting arbitration.
+                    multilateration_primary_fallback_used = True
+                    multilateration_primary_fallback_reason = (
+                        "hybrid_exact_joint_closure_incomplete"
+                    )
+                    hybrid_navigation_active = False
+                    cosmic_baseline_indices_by_hypothesis = {
+                        hypothesis: set(indices)
+                        for hypothesis, indices
+                        in multilateration_primary_fallback_baseline_sets.items()
+                    }
+                    cosmic_range_guard_indices_by_hypothesis = {
+                        hypothesis: set(indices)
+                        for hypothesis, indices
+                        in multilateration_primary_fallback_range_sets.items()
+                    }
+                    charge_rows_by_index = {
+                        int(row[1]): row for row in charge_rows
+                    }
+                    closed_indices = {int(row[1]) for row in joint_rows}
+                    for index in multilateration_primary_fallback_indices:
+                        index = int(index)
+                        hypothesis = _seed_start_hypothesis(event_seeds[index])
+                        if (
+                            hypothesis not in missing_hypotheses
+                            or index in closed_indices
+                        ):
+                            continue
+                        fallback_row = charge_rows_by_index.get(index)
+                        if fallback_row is None:
+                            fallback_row = evaluate_candidate(index)
+                        if fallback_row is None:
+                            continue
+                        closed_row = close_joint_candidate(
+                            fallback_row,
+                            stage="hybrid_full_bank_exact_joint_fallback",
+                        )
+                        if closed_row is not None:
+                            joint_rows.append(closed_row)
+                            closed_indices.add(index)
+                            missing_hypotheses.discard(hypothesis)
+                            if not missing_hypotheses:
+                                break
             candidate_rows = joint_rows
 
         if not candidate_rows:
@@ -11837,6 +14652,33 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             two_anchor_gain_nll = 0.0
             two_anchor_sweeps = 0
             two_anchor_error = None
+            tournament_probe_gain = float(
+                fit_payload.get("tournament_anchor_probe_gain_nll", math.inf)
+            )
+            tournament_continuation_gain = float(
+                fit_payload.get("tournament_continuation_gain_nll", math.inf)
+            )
+            two_anchor_skipped_by_probe_certificate = bool(
+                allow_adaptive
+                and _env_bool("COSMIC_TWO_ANCHOR_LAZY_PROBE_CERTIFICATE", False)
+                and fit_payload.get("tournament_anchor_probe_used", False)
+                and math.isfinite(tournament_probe_gain)
+                and math.isfinite(tournament_continuation_gain)
+                and tournament_probe_gain
+                < max(
+                    0.0,
+                    _env_float(
+                        "COSMIC_TWO_ANCHOR_LAZY_MAX_PROBE_GAIN_NLL", 0.75
+                    ),
+                )
+                and tournament_continuation_gain
+                < max(
+                    0.0,
+                    _env_float(
+                        "COSMIC_TWO_ANCHOR_LAZY_MAX_CONTINUATION_GAIN_NLL", 8.0
+                    ),
+                )
+            )
 
             # For a long oblique track the physical start and direction are almost
             # singular in the ordinary local chart.  Refine the selected basin in
@@ -11872,6 +14714,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         inset_mm=float(BOUNDARY_CLIP_INSET_MM),
                     )
             if (
+                not two_anchor_skipped_by_probe_certificate
+                and
                 anchor_resolved is not None
                 and float(anchor_resolved.visible_length_mm)
                 >= float(COSMIC_TWO_ANCHOR_MIN_VISIBLE_MM)
@@ -11939,7 +14783,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             **_adaptive_optimizer_topology_options(start_hypothesis),
                         )
                     )
-            elif allow_adaptive:
+            elif allow_adaptive and not two_anchor_skipped_by_probe_certificate:
                 exact_result, adaptive_polish_used, pre_polish_last_improvement = (
                     _maybe_continue_exact_optimizer(
                         exact_objective,
@@ -11985,6 +14829,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             fit_payload["two_anchor_gain_nll"] = float(two_anchor_gain_nll)
             fit_payload["two_anchor_sweeps"] = int(two_anchor_sweeps)
             fit_payload["two_anchor_error"] = two_anchor_error
+            fit_payload["two_anchor_skipped_by_probe_certificate"] = bool(
+                two_anchor_skipped_by_probe_certificate
+            )
             fit_payload["final_t0_profile"] = final_t0_profile
             return fit_payload
 
@@ -12069,7 +14916,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 continuation_row,
                 sweeps_override=sweeps,
                 full_cross_override=(
-                    1 if exact_mode == "charge_only"
+                    1
+                    if exact_mode == "charge_only"
                     else min(sweeps, max(1, int(JOINT_FULL_CROSS_SWEEPS)))
                 ),
                 allow_adaptive=False,
@@ -12111,6 +14959,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             if (
                 not AUTO_CLIPPED_TRACK
                 or not COSMIC_TWO_ANCHOR_REFINEMENT
+                or not _env_bool("COSMIC_TOURNAMENT_ANCHOR_PROBE", True)
             ):
                 return fit_payload
             start_hypothesis = str(fit_payload["track_start_hypothesis"])
@@ -12151,6 +15000,51 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 full_range_mm=max(80.0, continuation_steps.full_range_mm),
                 t0_ns=max(0.08, continuation_steps.t0_ns),
             )
+            if _env_bool("COSMIC_TWO_ANCHOR_STATIONARITY_PROBE", True):
+                try:
+                    stationarity = two_anchor_stationarity_probe(
+                        fit_payload["objective"],
+                        source.values,
+                        fixed_params=fixed_for_candidate,
+                        initial_steps=anchor_steps,
+                        length_limits=length_limits,
+                    )
+                except Exception as exc:
+                    fit_payload["tournament_anchor_stationarity_error"] = repr(exc)
+                else:
+                    source.nfcn += int(stationarity.nfcn)
+                    source.wall_s += float(stationarity.wall_s)
+                    source.invalid_evaluations += int(
+                        stationarity.invalid_evaluations
+                    )
+                    fit_payload["tournament_anchor_stationarity_probe_used"] = True
+                    fit_payload[
+                        "tournament_anchor_stationarity_predicted_gain_nll"
+                    ] = float(stationarity.predicted_gain_nll)
+                    fit_payload[
+                        "tournament_anchor_stationarity_observed_gain_nll"
+                    ] = float(stationarity.observed_gain_nll)
+                    fit_payload["tournament_anchor_stationarity_nfcn"] = int(
+                        stationarity.nfcn
+                    )
+                    fit_payload["tournament_anchor_stationarity_directions"] = [
+                        dict(row) for row in stationarity.directions
+                    ]
+                    certificate_limit = max(
+                        0.0,
+                        _env_float(
+                            "COSMIC_TWO_ANCHOR_STATIONARITY_MAX_GAIN_NLL",
+                            0.05,
+                        ),
+                    )
+                    if (
+                        math.isfinite(stationarity.predicted_gain_nll)
+                        and stationarity.predicted_gain_nll < certificate_limit
+                    ):
+                        fit_payload[
+                            "tournament_anchor_probe_skipped_converged"
+                        ] = True
+                        return fit_payload
             try:
                 probe = two_anchor_block_optimize(
                     fit_payload["objective"],
@@ -13583,10 +16477,31 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 for row in auto_rows[hypothesis]
             ]
             tournament_records = []
+            causal_primary_substitutions = ()
+            certified_internal_only = False
             same_topology_challenges = 0
             same_topology_improvements = 0
             topology_probe_used = False
             topology_probe_continued = False
+            hybrid_boundary_fairness_triggered = False
+            hybrid_boundary_alternate_probed = False
+            hybrid_boundary_equalized = False
+            max_tournament_probes = int(
+                COSMIC_MULTILATERATION_TOURNAMENT_PROBES
+                if (
+                    COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                    or hybrid_navigation_active
+                )
+                else COSMIC_TOURNAMENT_MAX_PROBES
+            )
+            max_tournament_continuations = int(
+                COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS
+                if (
+                    COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                    or hybrid_navigation_active
+                )
+                else COSMIC_TOURNAMENT_MAX_CONTINUATIONS
+            )
 
             if COSMIC_TOURNAMENT_ENABLED:
                 adjusted_start_scores = [auto_row_score(row) for row in all_auto_rows]
@@ -13594,9 +16509,38 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     _seed_start_hypothesis(event_seeds[int(row[1])])
                     for row in all_auto_rows
                 ]
-                baseline_flags = [
+                bank_baseline_flags = [
                     int(row[1]) in cosmic_baseline_indices_by_hypothesis[hypotheses[i]]
                     for i, row in enumerate(all_auto_rows)
+                ]
+                multilateration_flags = [
+                    int(row[1])
+                    in cosmic_multilateration_indices_by_hypothesis[hypotheses[i]]
+                    for i, row in enumerate(all_auto_rows)
+                ]
+                # A successful primary-mode multilateration family is the active
+                # navigation baseline for the ordinary symmetric tournament.  In
+                # additive mode, only the immutable charge-bank candidates retain
+                # baseline status, so challengers cannot evict an incumbent slot.
+                baseline_flags = [
+                    bool(
+                        bank_baseline_flags[i]
+                        or (
+                            COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                            and multilateration_flags[i]
+                        )
+                        or (
+                            hybrid_navigation_active
+                            and (
+                                multilateration_flags[i]
+                                or int(all_auto_rows[i][1])
+                                in cosmic_timing_guard_indices_by_hypothesis[
+                                    hypotheses[i]
+                                ]
+                            )
+                        )
+                    )
+                    for i in range(len(bank_baseline_flags))
                 ]
                 range_guard_flags = [
                     int(row[1]) in cosmic_range_guard_indices_by_hypothesis[hypotheses[i]]
@@ -13619,34 +16563,42 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 # prediction-seeded t0 gives a lower unoptimized joint NLL.  Keep
                 # one actual charge-bank baseline from each start hypothesis, then
                 # add at most one directionally distinct causal line per hypothesis.
-                max_tournament_probes = int(COSMIC_TOURNAMENT_MAX_PROBES)
                 tournament_positions = []
                 selected_positions = set()
-                primary_by_hypothesis = {}
+                (
+                    primary_by_hypothesis,
+                    causal_primary_substitutions,
+                ) = select_cosmic_topology_primary_positions(
+                    adjusted_start_scores,
+                    hypotheses,
+                    baseline_flags,
+                    causal_timing_flags,
+                    max_probes=max_tournament_probes,
+                    strong_causal_gain_nll=float(
+                        COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL
+                    ),
+                )
 
-                for hypothesis in sorted(set(hypotheses)):
-                    positions = [
-                        i for i, value in enumerate(hypotheses)
-                        if value == hypothesis
-                    ]
-                    baseline_positions_for_hypothesis = [
-                        i for i in positions if baseline_flags[i]
-                    ]
-                    noncausal_positions = [
-                        i for i in positions if not causal_timing_flags[i]
-                    ]
-                    pool = (
-                        baseline_positions_for_hypothesis
-                        or noncausal_positions
-                        or positions
-                    )
-                    if not pool:
-                        continue
-                    position = min(
-                        pool,
-                        key=lambda i: (float(adjusted_start_scores[i]), int(i)),
-                    )
-                    primary_by_hypothesis[hypothesis] = int(position)
+                # The same strong, truth-blind proxy certificate that makes the
+                # causal timing guard redundant also certifies the internal-start
+                # topology.  On those nominal beam-like events, avoid paying for
+                # a boundary-entry probe that cannot be continued.  Ambiguous
+                # events retain the complete two-topology tournament; notably,
+                # the recovered long-z-tail event does not satisfy this gate.
+                certified_internal_only = bool(
+                    COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY
+                    and COSMIC_MULTILATERATION_SEED_MODE != "primary"
+                    and not hybrid_navigation_active
+                    and causal_timing_lazy_beam_skip
+                    and "internal_start" in primary_by_hypothesis
+                )
+                if certified_internal_only:
+                    max_tournament_probes = 1
+                    primary_by_hypothesis = {
+                        "internal_start": int(
+                            primary_by_hypothesis["internal_start"]
+                        )
+                    }
 
                 for position in sorted(
                     primary_by_hypothesis.values(),
@@ -13656,6 +16608,59 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         break
                     tournament_positions.append(int(position))
                     selected_positions.add(int(position))
+
+                if COSMIC_MULTILATERATION_SEED_MODE == "primary":
+                    # Probe one additional longitudinal/range realization in
+                    # each topology before spending any leftover budget.  A point
+                    # source is intrinsically weak along the particle line, so
+                    # ranking all such starts solely by their unoptimized NLL
+                    # would defeat the purpose of retaining longitudinal seeds.
+                    for hypothesis in ("internal_start", "boundary_entry"):
+                        alternatives = sorted(
+                            (
+                                int(position)
+                                for position, is_multilateration
+                                in enumerate(multilateration_flags)
+                                if (
+                                    is_multilateration
+                                    and hypotheses[position] == hypothesis
+                                    and position not in selected_positions
+                                )
+                            ),
+                            key=lambda position: (
+                                float(adjusted_start_scores[position]),
+                                int(position),
+                            ),
+                        )
+                        if (
+                            alternatives
+                            and len(tournament_positions) < max_tournament_probes
+                        ):
+                            position = int(alternatives[0])
+                            selected_positions.add(position)
+                            tournament_positions.append(position)
+                    if len(tournament_positions) < max_tournament_probes:
+                        remaining_multilateration = sorted(
+                            (
+                                int(position)
+                                for position, is_multilateration
+                                in enumerate(multilateration_flags)
+                                if is_multilateration
+                                and position not in selected_positions
+                            ),
+                            key=lambda position: (
+                                float(adjusted_start_scores[position]),
+                                int(position),
+                            ),
+                        )
+                        for position in remaining_multilateration:
+                            selected_positions.add(int(position))
+                            tournament_positions.append(int(position))
+                            if (
+                                len(tournament_positions)
+                                >= max_tournament_probes
+                            ):
+                                break
 
                 def _seed_direction_for_position(position):
                     seed = event_seeds[int(all_auto_rows[int(position)][1])]
@@ -13699,8 +16704,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             separation = math.degrees(math.acos(float(np.clip(
                                 np.dot(primary_direction, direction), -1.0, 1.0
                             ))))
-                        if separation < float(
-                            COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
+                        if (
+                            not hybrid_navigation_active
+                            and separation < float(
+                                COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
+                            )
                         ):
                             continue
                         seed = event_seeds[int(all_auto_rows[position][1])]
@@ -13756,6 +16764,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         origin_parts.append("range_guard")
                     if is_causal:
                         origin_parts.append("causal_timing")
+                    if multilateration_flags[int(position)]:
+                        origin_parts.append("multilateration")
                     origin = (
                         "_and_".join(origin_parts)
                         if origin_parts else "diverse_exact_candidate"
@@ -13793,6 +16803,98 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     terminal_payloads[int(all_auto_rows[pos][1])]
                     for pos in tournament_positions
                 ]
+
+                # The internal-start model contains one additional longitudinal
+                # coordinate.  In compact hybrid mode it may therefore be
+                # accepted only after the nested boundary-entry model has been
+                # given equivalent basin diversity and optimization depth.  If
+                # the first probe leader is internal, probe the untested boundary
+                # seed from the other independent timing navigator.  This costs
+                # nothing on clear boundary events and uses no event truth,
+                # detector axis, or assumed energy.
+                probe_payloads.sort(key=auto_payload_score)
+                if (
+                    hybrid_navigation_active
+                    and probe_payloads
+                    and str(probe_payloads[0]["track_start_hypothesis"])
+                    == "internal_start"
+                ):
+                    hybrid_boundary_fairness_triggered = True
+                    unprobed_boundary_positions = sorted(
+                        (
+                            int(position)
+                            for position, row in enumerate(all_auto_rows)
+                            if hypotheses[position] == "boundary_entry"
+                            and int(row[1]) not in terminal_payloads
+                            and (
+                                bool(causal_timing_flags[position])
+                                or bool(multilateration_flags[position])
+                            )
+                        ),
+                        key=lambda position: (
+                            float(auto_row_score(all_auto_rows[position])),
+                            int(position),
+                        ),
+                    )
+                    if unprobed_boundary_positions:
+                        position = int(unprobed_boundary_positions[0])
+                        row = all_auto_rows[position]
+                        seed_index = int(row[1])
+                        is_causal = bool(causal_timing_flags[position])
+                        is_multilateration = bool(
+                            multilateration_flags[position]
+                        )
+                        origin_parts = ["hybrid_boundary_fairness"]
+                        if is_causal:
+                            origin_parts.append("causal_timing")
+                        if is_multilateration:
+                            origin_parts.append("multilateration")
+                        origin = "_and_".join(origin_parts)
+                        probe = optimize_candidate_row(
+                            row,
+                            sweeps_override=int(
+                                COSMIC_TOURNAMENT_PROBE_SWEEPS
+                            ),
+                            full_cross_override=1,
+                            allow_adaptive=False,
+                            run_final_t0_profile=False,
+                        )
+                        probe["basin_kind"] = (
+                            "cosmic_tournament_hybrid_boundary_fairness_probe"
+                        )
+                        probe["tournament_origin"] = origin
+                        probe["tournament_probe_fval"] = float(
+                            probe["result"].fval
+                        )
+                        probe["tournament_probe_model_score"] = (
+                            auto_payload_score(probe)
+                        )
+                        probe["tournament_probe_descent_nll"] = float(
+                            row[0] - probe["result"].fval
+                        )
+                        terminal_payloads[seed_index] = probe
+                        probe_payloads.append(probe)
+                        tournament_records.append({
+                            "seed_index": seed_index,
+                            "track_start_hypothesis": "boundary_entry",
+                            "origin": origin,
+                            "exact_start_fval": float(row[0]),
+                            "exact_start_model_score": float(
+                                auto_row_score(row)
+                            ),
+                            "probe_fval": float(probe["result"].fval),
+                            "probe_model_score": float(
+                                auto_payload_score(probe)
+                            ),
+                            "probe_descent_nll": float(
+                                row[0] - probe["result"].fval
+                            ),
+                            "continued": False,
+                            "finalized": False,
+                            "selected_winner": False,
+                        })
+                        hybrid_boundary_alternate_probed = True
+
                 total_scheduled_sweeps = int(
                     EXACT_CHARGE_SWEEPS
                     if exact_mode == "charge_only" else JOINT_EXACT_SWEEPS
@@ -13854,14 +16956,58 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     # ordered first, followed by large projected descents.  Every
                     # continuation still uses the unchanged exact likelihood.
                     continuation_slots = max(
-                        0, int(COSMIC_TOURNAMENT_MAX_CONTINUATIONS) - 1
+                        0, int(max_tournament_continuations) - 1
                     )
-                    for challenger_row in challenger_rows[:continuation_slots]:
+                    selected_challenger_rows = list(
+                        challenger_rows[:continuation_slots]
+                    )
+                    if (
+                        hybrid_navigation_active
+                        and str(best_probe["track_start_hypothesis"])
+                        == "internal_start"
+                    ):
+                        boundary_payloads = sorted(
+                            (
+                                payload for payload in probe_payloads[1:]
+                                if str(payload["track_start_hypothesis"])
+                                == "boundary_entry"
+                            ),
+                            key=lambda payload: (
+                                float(auto_payload_score(payload)),
+                                int(payload["seed_index"]),
+                            ),
+                        )
+                        if boundary_payloads:
+                            forced_payload = boundary_payloads[0]
+                            if all(
+                                int(row[-1]["seed_index"])
+                                != int(forced_payload["seed_index"])
+                                for row in selected_challenger_rows
+                            ):
+                                selected_challenger_rows.append((
+                                    -1,
+                                    float(auto_payload_score(forced_payload)),
+                                    0.0,
+                                    float(auto_payload_score(forced_payload)),
+                                    int(forced_payload["seed_index"]),
+                                    forced_payload,
+                                ))
+                            hybrid_boundary_equalized = True
+                    for challenger_row in selected_challenger_rows:
                         challenger_payload = challenger_row[-1]
                         challenger = continue_candidate_payload(
                             challenger_payload,
                             sweeps=remaining_sweeps,
                             basin_kind=(
+                                "cosmic_tournament_hybrid_boundary_fairness_continuation"
+                                if (
+                                    hybrid_navigation_active
+                                    and hybrid_boundary_equalized
+                                    and str(challenger_payload[
+                                        "track_start_hypothesis"
+                                    ]) == "boundary_entry"
+                                )
+                                else
                                 "cosmic_tournament_causal_direction_continuation"
                                 if "causal_timing" in str(
                                     challenger_payload.get("tournament_origin", "")
@@ -13899,6 +17045,54 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         )
                         record["tournament_anchor_probe_gain_nll"] = float(
                             payload.get("tournament_anchor_probe_gain_nll", 0.0)
+                        )
+                        record["tournament_anchor_stationarity_probe_used"] = bool(
+                            payload.get(
+                                "tournament_anchor_stationarity_probe_used", False
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_predicted_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_predicted_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_observed_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_observed_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record["tournament_anchor_stationarity_nfcn"] = int(
+                            payload.get("tournament_anchor_stationarity_nfcn", 0)
+                        )
+                        record["tournament_anchor_stationarity_probe_used"] = bool(
+                            payload.get(
+                                "tournament_anchor_stationarity_probe_used", False
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_predicted_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_predicted_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_observed_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_observed_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record["tournament_anchor_stationarity_nfcn"] = int(
+                            payload.get("tournament_anchor_stationarity_nfcn", 0)
                         )
 
                 scheduled_payloads = list(terminal_payloads.values())
@@ -14025,13 +17219,32 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 "topology_probe_continued": bool(topology_probe_continued),
                 "same_topology_challenges": int(same_topology_challenges),
                 "same_topology_improvements": int(same_topology_improvements),
+                "hybrid_boundary_fairness_triggered": bool(
+                    hybrid_boundary_fairness_triggered
+                ),
+                "hybrid_boundary_alternate_probed": bool(
+                    hybrid_boundary_alternate_probed
+                ),
+                "hybrid_boundary_equalized": bool(
+                    hybrid_boundary_equalized
+                ),
                 "tournament_probe_sweeps": int(COSMIC_TOURNAMENT_PROBE_SWEEPS),
                 "tournament_max_probes": int(COSMIC_TOURNAMENT_MAX_PROBES),
+                "tournament_effective_max_probes": int(max_tournament_probes),
+                "tournament_certified_internal_only": bool(
+                    certified_internal_only
+                ),
+                "tournament_causal_substitution_gain_nll": float(
+                    COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL
+                ),
+                "tournament_causal_primary_substitutions": [
+                    dict(record) for record in causal_primary_substitutions
+                ],
                 "tournament_causal_direction_separation_deg": float(
                     COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
                 ),
                 "tournament_max_continuations": int(
-                    COSMIC_TOURNAMENT_MAX_CONTINUATIONS
+                    max_tournament_continuations
                 ),
                 "tournament_probe_gate_nll": float(
                     COSMIC_TOURNAMENT_PROBE_GATE_NLL
@@ -14181,6 +17394,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         auto_topology_range_closure_invalid = 0
         auto_topology_range_closure_challenges = 0
         auto_topology_range_closure_improvements = 0
+        auto_topology_reusable_profile = None
+        auto_topology_reusable_payload = None
         if (
             AUTO_CLIPPED_TRACK
             and AUTO_ENABLE_RANGE_PROFILE
@@ -14324,8 +17539,22 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 chosen_fit = min(
                     topology_finalists.values(), key=auto_payload_score
                 )
+                selected_hypothesis = str(
+                    chosen_fit["track_start_hypothesis"]
+                )
+                selected_record = topology_records[selected_hypothesis]
+                if not bool(selected_record.get("challenge_used", False)):
+                    # The ordinary post-tournament range profile below asks the
+                    # same fixed-line stop/exit question.  Reuse this exact
+                    # profile when no later stage replaces the finalist; doing
+                    # the identical 20-point charge/time bracket twice cost
+                    # roughly 200 objective evaluations per event.
+                    auto_topology_reusable_profile = dict(
+                        selected_record["profile"]
+                    )
+                    auto_topology_reusable_payload = chosen_fit
                 chosen_fit["auto_topology_penalty_nll"] = auto_topology_penalty(
-                    str(chosen_fit["track_start_hypothesis"])
+                    selected_hypothesis
                 )
                 chosen_fit["auto_topology_model_score"] = auto_payload_score(
                     chosen_fit
@@ -14478,9 +17707,18 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             auto_range_profile_nfcn = 0
             auto_range_profile_invalid = 0
 
-            cycle_profile, cycle_nfcn, cycle_invalid = profile_auto_full_range(
-                chosen_fit
-            )
+            if (
+                auto_topology_reusable_profile is not None
+                and chosen_fit is auto_topology_reusable_payload
+            ):
+                cycle_profile = dict(auto_topology_reusable_profile)
+                cycle_profile["reused_from_topology_range_closure"] = True
+                cycle_nfcn = 0
+                cycle_invalid = 0
+            else:
+                cycle_profile, cycle_nfcn, cycle_invalid = (
+                    profile_auto_full_range(chosen_fit)
+                )
             cycle_profile = dict(cycle_profile)
             cycle_profile["cycle_index"] = 0
             cycle_profile["source_fval"] = float(chosen_fit["result"].fval)
@@ -14574,52 +17812,150 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         cosmic_coherent_result = None
         cosmic_coherent_charge_result = None
         cosmic_coherent_timing_result = None
+        cosmic_coherent_joint_length_result = None
         cosmic_coherent_post_stage_nfcn = 0
+        cosmic_joint_energy_range_result = None
+        cosmic_joint_global_feedback_history = []
 
-        if AUTO_CLIPPED_TRACK and COSMIC_COHERENT_PROFILE_ENABLED:
-            # Nonlinear coherent path continuation for geometry-clipped tracks.
-            # The ordinary topology tournament remains authoritative.  Within
-            # the selected smooth topology branch, charge is first closed with
-            # the sharp mean, then a coherent FE path and nearby global track
-            # are profiled with the Fisher--Laplace objective.  Timing is
-            # conditional on that charge solution and may refine only transverse
-            # line placement, direction and t0.
-            charge_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                exact_result.chart,
-                "charge_only",
-                proxy=False,
+        # Select any explicit mPMT entry/exit subclass on the accepted straight
+        # topology before an MCS continuation.  The discrete geometry class is
+        # then held fixed while the curved FE path and global track are fitted;
+        # its local non-negative charge fractions are reprofiled inside every
+        # coherent prediction.  This preserves the ordinary water-only MCS
+        # model exactly at zero hardware fraction and prevents a later straight
+        # hardware fit from overwriting an MCS result.
+        mpmt_boundary_winner = None
+        mpmt_boundary_summary = {
+            "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
+            "used": False,
+            "accepted": False,
+            "reason": "not_run",
+            "nfcn": 0,
+            "invalid_evaluations": 0,
+            "wall_s": 0.0,
+        }
+        active_mpmt_boundary_model = None
+        mcs_obs_ts = np.asarray(obs_ts, dtype=np.float64)
+        mcs_continuation_requested = bool(
+            COSMIC_COHERENT_PROFILE_ENABLED
+            or COSMIC_FERMI_EYGES_ENABLED
+            or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            or USE_COHERENT_FISHER
+        )
+        if AUTO_CLIPPED_TRACK:
+            try:
+                mpmt_boundary_winner, mpmt_boundary_summary = (
+                    _run_mpmt_boundary_challenge(
+                        obs_pes=obs_pes,
+                        obs_ts=obs_ts,
+                        baseline_result=exact_result,
+                        baseline_start_hypothesis=chosen_start_hypothesis,
+                        topology_penalty=auto_topology_penalty,
+                        length_limits=length_limits,
+                        # MCS performs the final charge-time continuation.  Its
+                        # crossed-module timestamps are masked below, so avoid a
+                        # redundant straight-path timing polish here.
+                        requested_mode=(
+                            "charge_only"
+                            if mcs_continuation_requested
+                            else LIKELIHOOD_MODE
+                        ),
+                    )
+                )
+            except Exception as exc:
+                # One malformed optional hardware hypothesis must never abort
+                # the established water-only production fit.
+                mpmt_boundary_winner = None
+                mpmt_boundary_summary = {
+                    "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
+                    "used": False,
+                    "accepted": False,
+                    "reason": "challenge_exception",
+                    "error": repr(exc),
+                    "nfcn": 0,
+                    "invalid_evaluations": 0,
+                    "wall_s": 0.0,
+                }
+
+        if mpmt_boundary_winner is not None:
+            exact_result = mpmt_boundary_winner["result"]
+            chosen_start_hypothesis = str(
+                mpmt_boundary_winner["start_hypothesis"]
+            )
+            active_mpmt_boundary_model = mpmt_boundary_winner["model"]
+            if (
+                COSMIC_FERMI_EYGES_ENABLED
+                or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+                or USE_COHERENT_FISHER
+            ):
+                raise RuntimeError(
+                    "an explicit mPMT-hardware winner requires the default "
+                    "coherent_fermi_eyges continuation; legacy linear-FE, "
+                    "legacy coherent-Fisher, and joint K0/range continuations "
+                    "do not yet expose the nested hardware nuisance profile"
+                )
+            selected_slots = [
+                int(interface.slot)
+                for interface in mpmt_boundary_winner.get("interfaces", ())
+            ]
+            if (
+                LIKELIHOOD_MODE != "charge_only"
+                and str(COSMIC_MPMT_TIMING_POLICY) == "mask_module"
+            ):
+                mcs_obs_ts = masked_module_times(
+                    obs_ts, PMT_SLOTS, selected_slots
+                )
+            errors = _materialize_output_errors(
+                exact_result.errors,
                 start_hypothesis=chosen_start_hypothesis,
             )
-            topology_options = _optimizer_topology_options(
-                chosen_start_hypothesis
-            )
-            cosmic_coherent_charge_result = track_aligned_block_optimize(
-                charge_objective,
+            final_values = _materialize_output_values(
                 exact_result.values,
-                fixed_params=_optimizer_fixed_params(
-                    chosen_start_hypothesis
-                ),
-                sweeps=max(1, int(COSMIC_FE_CHARGE_SWEEPS)),
-                initial_steps=EXACT_STEPS,
-                length_limits=length_limits,
-                full_range_limits=None,
-                full_cross_sweeps=1,
-                allow_longitudinal=bool(
-                    topology_options["allow_longitudinal"]
-                ),
-                project_vertex_steps=bool(
-                    topology_options["project_vertex_steps"]
-                ),
+                exact_result.chart,
+                start_hypothesis=chosen_start_hypothesis,
             )
-            coherent_values, coherent_chart = reanchor_result(
-                cosmic_coherent_charge_result
-            )
-            cosmic_coherent_result = run_cosmic_coherent_profile_update(
+            final_fval = float(exact_result.fval)
+            if bool(
+                mpmt_boundary_winner.get("timing_metadata", {}).get(
+                    "accepted", False
+                )
+            ):
+                fval_definition = (
+                    "explicit geometry-constrained mPMT boundary subclass; "
+                    "class selected by penalized common charge likelihood and "
+                    "final charge-plus-time NLL uses timestamps outside the "
+                    "crossed module"
+                )
+            else:
+                fval_definition = (
+                    "explicit geometry-constrained mPMT boundary subclass; "
+                    "penalized common charge likelihood with locally profiled "
+                    "nonnegative hardware-light modes"
+                )
+            mpmt_boundary_summary["mcs_compatibility"] = {
+                "continuation_requested": bool(mcs_continuation_requested),
+                "nested_profile_enabled": bool(mcs_continuation_requested),
+                "timing_policy": str(COSMIC_MPMT_TIMING_POLICY),
+                "masked_slots": selected_slots,
+                "masked_pmt_count": int(np.count_nonzero(np.isin(
+                    np.asarray(PMT_SLOTS, dtype=np.int64), selected_slots
+                ))),
+            }
+
+        def _run_joint_energy_range_stage(
+            stage_values,
+            stage_chart,
+            *,
+            initial_path_coefficients=None,
+        ):
+            """Run the exact joint posterior on a supplied fitted line geometry."""
+            return run_cosmic_joint_energy_range_update(
                 EMITTER_TEMPLATE,
-                values=coherent_values,
-                chart=coherent_chart,
+                inference_method=str(
+                    _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                ),
+                values=stage_values,
+                chart=stage_chart,
                 detector=DETECTOR,
                 range_lookup=RANGE_LOOKUP,
                 wcd=WCD,
@@ -14631,129 +17967,882 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 starts_at_boundary=(
                     chosen_start_hypothesis == "boundary_entry"
                 ),
+                kinetic_energy_bounds_mev=(
+                    float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                    float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                ),
+                mixed_energy_stratum_edges_mev=(
+                    COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                ),
+                mixed_energy_stratum_replicates=int(
+                    COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                ),
+                random_seed=int(COSMIC_JOINT_RANDOM_SEED),
                 mpmt_types=None,
                 inset_mm=float(BOUNDARY_CLIP_INSET_MM),
                 range_limits=length_limits,
                 t0_limits=T0_LIMITS,
+                charge_only=(LIKELIHOOD_MODE == "charge_only"),
                 modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
                 grid_points=int(COSMIC_COHERENT_GRID_POINTS),
-                latent_fd=float(COSMIC_COHERENT_LATENT_FD),
-                latent_max_iterations=int(
-                    COSMIC_COHERENT_LATENT_ITERATIONS
+                particles=int(COSMIC_JOINT_PARTICLES),
+                target_ess_fraction=float(
+                    COSMIC_JOINT_TARGET_ESS_FRACTION
                 ),
-                candidate_latent_max_iterations=int(
-                    COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                resample_ess_fraction=float(
+                    COSMIC_JOINT_RESAMPLE_ESS_FRACTION
                 ),
-                track_cycles=int(COSMIC_COHERENT_TRACK_CYCLES),
-                transverse_step_mm=12.0,
-                longitudinal_step_mm=12.0,
-                direction_step=0.010,
-                range_step_mm=30.0,
-                latent_trust_max_component=1.0,
-                track_trust_max_scaled_component=1.0,
-                sparse_neighbor_radius_mm=100.0,
+                max_temperatures=int(COSMIC_JOINT_MAX_TEMPERATURES),
+                rejuvenation_steps=int(
+                    COSMIC_JOINT_REJUVENATION_STEPS
+                ),
+                posterior_rejuvenation_steps=int(
+                    COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS
+                ),
+                energy_random_walk_mev=float(
+                    COSMIC_JOINT_ENERGY_RW_MEV
+                ),
+                energy_independence_probability=float(
+                    COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY
+                ),
+                range_pcn_rho=float(COSMIC_JOINT_RANGE_PCN_RHO),
+                path_pcn_rho=float(COSMIC_JOINT_PATH_PCN_RHO),
+                mixed_allow_underpowered_diagnostic=bool(
+                    COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                ),
+                mixed_inference_engine=str(
+                    COSMIC_MIXED_INFERENCE_ENGINE
+                ),
+                mixed_global_precondition_enabled=bool(
+                    COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                ),
+                joint_global_precondition_enabled=bool(
+                    COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                ),
+                path_guide_rho=float(COSMIC_JOINT_PATH_GUIDE_RHO),
+                path_guide_probability=float(
+                    COSMIC_JOINT_PATH_GUIDE_PROBABILITY
+                ),
+                joint_guide_prior_mixture_probability=float(
+                    COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY
+                ),
+                joint_guide_initial_beta=float(
+                    COSMIC_JOINT_GUIDE_INITIAL_BETA
+                ),
+                guide_latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                guide_latent_iterations=int(
+                    COSMIC_JOINT_GUIDE_ITERATIONS
+                ),
+                guide_covariance_inflation=float(
+                    COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION
+                ),
+                guide_prior_screen_draws=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS
+                ),
+                guide_prior_screen_refits=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS
+                ),
+                guide_prior_screen_random_seed=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED
+                ),
+                guide_laplace_uniform_mixture_probability=float(
+                    COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY
+                ),
+                guide_range_profile_cycles=int(
+                    COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES
+                ),
+                sparse_neighbor_radius_mm=float(
+                    MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                ),
+                initial_path_coefficients=initial_path_coefficients,
             )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            and not COSMIC_COHERENT_PROFILE_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
+            # Truth-blind configured-data posterior in the non-centred physical
+            # state (K0, z_R, coherent FE path). The current controlled gate
+            # conditions on the input line geometry.  With the measured beam
+            # coordinates fixed in FIXED_PARAMS, no event-truth quantity enters
+            # either the target or its proposal guide.
+            joint_values, joint_chart = reanchor_result(exact_result)
+            cosmic_joint_energy_range_result = (
+                run_cosmic_joint_energy_range_update(
+                    EMITTER_TEMPLATE,
+                    inference_method=str(
+                        _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                    ),
+                    values=joint_values,
+                    chart=joint_chart,
+                    detector=DETECTOR,
+                    range_lookup=RANGE_LOOKUP,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    obs_ts=obs_ts,
+                    starts_at_boundary=(
+                        chosen_start_hypothesis == "boundary_entry"
+                    ),
+                    kinetic_energy_bounds_mev=(
+                        float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                        float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                    ),
+                    mixed_energy_stratum_edges_mev=(
+                        COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                    ),
+                    mixed_energy_stratum_replicates=int(
+                        COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                    ),
+                    random_seed=int(COSMIC_JOINT_RANDOM_SEED),
+                    mpmt_types=None,
+                    inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                    range_limits=length_limits,
+                    t0_limits=T0_LIMITS,
+                    charge_only=(LIKELIHOOD_MODE == "charge_only"),
+                    modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
+                    grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                    particles=int(COSMIC_JOINT_PARTICLES),
+                    target_ess_fraction=float(
+                        COSMIC_JOINT_TARGET_ESS_FRACTION
+                    ),
+                    resample_ess_fraction=float(
+                        COSMIC_JOINT_RESAMPLE_ESS_FRACTION
+                    ),
+                    max_temperatures=int(COSMIC_JOINT_MAX_TEMPERATURES),
+                    rejuvenation_steps=int(
+                        COSMIC_JOINT_REJUVENATION_STEPS
+                    ),
+                    posterior_rejuvenation_steps=int(
+                        COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS
+                    ),
+                    energy_random_walk_mev=float(
+                        COSMIC_JOINT_ENERGY_RW_MEV
+                    ),
+                    energy_independence_probability=float(
+                        COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY
+                    ),
+                    range_pcn_rho=float(COSMIC_JOINT_RANGE_PCN_RHO),
+                    path_pcn_rho=float(COSMIC_JOINT_PATH_PCN_RHO),
+                    mixed_allow_underpowered_diagnostic=bool(
+                        COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                    ),
+                    mixed_inference_engine=str(
+                        COSMIC_MIXED_INFERENCE_ENGINE
+                    ),
+                    mixed_global_precondition_enabled=bool(
+                        COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    joint_global_precondition_enabled=bool(
+                        COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    path_guide_rho=float(COSMIC_JOINT_PATH_GUIDE_RHO),
+                    path_guide_probability=float(
+                        COSMIC_JOINT_PATH_GUIDE_PROBABILITY
+                    ),
+                    joint_guide_prior_mixture_probability=float(
+                        COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY
+                    ),
+                    joint_guide_initial_beta=float(
+                        COSMIC_JOINT_GUIDE_INITIAL_BETA
+                    ),
+                    guide_latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                    guide_latent_iterations=int(
+                        COSMIC_JOINT_GUIDE_ITERATIONS
+                    ),
+                    guide_covariance_inflation=float(
+                        COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION
+                    ),
+                    guide_prior_screen_draws=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS
+                    ),
+                    guide_prior_screen_refits=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS
+                    ),
+                    guide_prior_screen_random_seed=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED
+                    ),
+                    guide_laplace_uniform_mixture_probability=float(
+                        COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY
+                    ),
+                    guide_range_profile_cycles=int(
+                        COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES
+                    ),
+                    sparse_neighbor_radius_mm=float(
+                        MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                    ),
+                )
+            )
+            joint_summary = cosmic_joint_energy_range_result.summary()
+            final_values = _materialize_output_values(
+                cosmic_joint_energy_range_result.updated_values,
+                cosmic_joint_energy_range_result.updated_chart,
+                start_hypothesis=chosen_start_hypothesis,
+            )
+            # Keep the old deterministic inverse-range energy explicitly as a
+            # diagnostic.  It is not the fitted physical K0 estimate.
+            final_values["range_equivalent_ke_mev"] = float(
+                final_values.get("fit_onset_ke_mev", math.nan)
+            )
+            final_values["initial_kinetic_energy_mev"] = float(
+                joint_summary["initial_kinetic_energy_mev_mean"]
+            )
+            final_values["z_range"] = float(joint_summary["z_range_mean"])
+            errors = dict(straight_errors)
+            errors.update({
+                "full_range": float(joint_summary["realized_range_mm_sd"]),
+                "initial_kinetic_energy_mev": float(
+                    joint_summary["initial_kinetic_energy_mev_sd"]
+                ),
+                "z_range": float(joint_summary["z_range_sd"]),
+            })
+            final_fval = float(
+                cosmic_joint_energy_range_result.map_charge_nll
+            )
+            fval_definition = (
+                "exact configured data NLL at the highest-posterior sampled "
+                "continuous (K0,z_R,FE-path) state; reported K0 and range are "
+                "separately marginalized posterior means; "
+                + (
+                    "no timing"
+                    if LIKELIHOOD_MODE == "charge_only"
+                    else "includes prompt first-arrival timing"
+                )
+            )
+
+        elif (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_COHERENT_PROFILE_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
+            # Nonlinear coherent path continuation for geometry-clipped tracks.
+            # The ordinary topology tournament remains authoritative.  Within
+            # the selected smooth topology branch, charge is first closed with
+            # the sharp mean, then a coherent FE path and nearby global track
+            # are profiled with the Fisher--Laplace objective.  In charge_time
+            # mode the selected charge line seeds an exact coherent profile of
+            # the global line, range, FE path, and t0 under the complete
+            # configured data likelihood. Timing can therefore move geometry
+            # and range without discarding charge.
+            topology_options = _optimizer_topology_options(
+                chosen_start_hypothesis
+            )
+            coherent_basin_count = max(1, _env_int(
+                "COSMIC_COHERENT_BASIN_CANDIDATES", 2
+            ))
+            coherent_basin_gate_nll = _env_float(
+                "COSMIC_COHERENT_BASIN_GATE_NLL", 1.0
+            )
+            if active_mpmt_boundary_model is not None:
+                # The selected hardware subclass is a discrete topology.  Do
+                # not compare it to water-only basins inside the continuous FE
+                # continuation; that penalized comparison has already been
+                # made by the hardware challenge above.
+                hardware_source_fit = dict(chosen_fit)
+                hardware_source_fit.update({
+                    "result": exact_result,
+                    "track_start_hypothesis": chosen_start_hypothesis,
+                    "seed_family": (
+                        str(chosen_fit.get("seed_family", "accepted"))
+                        + "+mpmt_hardware"
+                    ),
+                })
+                coherent_basin_payloads = [hardware_source_fit]
+            else:
+                coherent_basin_payloads = select_coherent_basin_payloads(
+                    optimized_basins,
+                    chosen_fit,
+                    start_hypothesis=chosen_start_hypothesis,
+                    score=auto_payload_score,
+                    max_candidates=coherent_basin_count,
+                    gate_nll=coherent_basin_gate_nll,
+                )
+            coherent_basin_trials = []
+            coherent_basin_failures = []
+            for coherent_source_fit in coherent_basin_payloads:
+                coherent_source_result = coherent_source_fit["result"]
+                try:
+                    charge_objective = make_objective(
+                        obs_pes,
+                        mcs_obs_ts,
+                        coherent_source_result.chart,
+                        "charge_only",
+                        proxy=False,
+                        start_hypothesis=chosen_start_hypothesis,
+                        boundary_interface_model=active_mpmt_boundary_model,
+                        boundary_interface_timing_policy="baseline",
+                    )
+                    candidate_charge_result = track_aligned_block_optimize(
+                        charge_objective,
+                        coherent_source_result.values,
+                        fixed_params=_optimizer_fixed_params(
+                            chosen_start_hypothesis
+                        ),
+                        sweeps=max(1, int(COSMIC_FE_CHARGE_SWEEPS)),
+                        initial_steps=EXACT_STEPS,
+                        length_limits=length_limits,
+                        full_range_limits=None,
+                        full_cross_sweeps=1,
+                        allow_longitudinal=bool(
+                            topology_options["allow_longitudinal"]
+                        ),
+                        project_vertex_steps=bool(
+                            topology_options["project_vertex_steps"]
+                        ),
+                    )
+                    candidate_values, candidate_chart = reanchor_result(
+                        candidate_charge_result
+                    )
+                    candidate_coherent_result = (
+                        run_cosmic_coherent_profile_update(
+                            EMITTER_TEMPLATE,
+                            values=candidate_values,
+                            chart=candidate_chart,
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=mcs_obs_ts,
+                            starts_at_boundary=(
+                                chosen_start_hypothesis == "boundary_entry"
+                            ),
+                            mpmt_types=None,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=length_limits,
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                            latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            track_cycles=int(COSMIC_COHERENT_TRACK_CYCLES),
+                            adaptive_track_max_cycles=max(
+                                int(COSMIC_COHERENT_TRACK_CYCLES),
+                                _env_int(
+                                    "COSMIC_COHERENT_ADAPTIVE_MAX_CYCLES",
+                                    max(
+                                        12,
+                                        int(COSMIC_COHERENT_TRACK_CYCLES),
+                                    ),
+                                ),
+                            ),
+                            adaptive_track_trigger_gain_nll=_env_float(
+                                "COSMIC_COHERENT_ADAPTIVE_TRIGGER_GAIN_NLL",
+                                5.0,
+                            ),
+                            adaptive_track_stop_gain_nll=_env_float(
+                                "COSMIC_COHERENT_ADAPTIVE_STOP_GAIN_NLL",
+                                0.5,
+                            ),
+                            adaptive_track_stop_patience=max(
+                                1,
+                                _env_int(
+                                    "COSMIC_COHERENT_ADAPTIVE_STOP_PATIENCE",
+                                    2,
+                                ),
+                            ),
+                            transverse_step_mm=12.0,
+                            longitudinal_step_mm=12.0,
+                            direction_step=0.010,
+                            range_step_mm=30.0,
+                            latent_trust_max_component=1.0,
+                            track_trust_max_scaled_component=float(
+                                COSMIC_COHERENT_TRACK_TRUST
+                            ),
+                            sparse_neighbor_radius_mm=100.0,
+                            fixed_initial_kinetic_energy_mev=(
+                                None
+                                if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                                else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                            ),
+                            profile_selection_objective=str(
+                                COSMIC_COHERENT_SELECTION_OBJECTIVE
+                            ),
+                            track_one_sided_half_step=_env_bool(
+                                "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP",
+                                False,
+                            ),
+                            boundary_interface_model=(
+                                active_mpmt_boundary_model
+                            ),
+                            boundary_interface_timing_policy="mask_module",
+                        )
+                    )
+                except Exception as exc:
+                    coherent_basin_failures.append({
+                        "seed_index": int(
+                            coherent_source_fit.get("seed_index", -1)
+                        ),
+                        "error": repr(exc),
+                    })
+                    continue
+                coherent_model_score = float(
+                    candidate_coherent_result.selection_nll
+                    + auto_topology_penalty(chosen_start_hypothesis)
+                )
+                coherent_basin_trials.append({
+                    "source_fit": coherent_source_fit,
+                    "source_result": coherent_source_result,
+                    "charge_result": candidate_charge_result,
+                    "coherent_result": candidate_coherent_result,
+                    "model_score": coherent_model_score,
+                })
+            if not coherent_basin_trials:
+                raise _CosmicMCSContinuationFailure(
+                    "all MCS-aware coherent basin continuations failed: "
+                    f"{coherent_basin_failures!r}"
+                )
+            coherent_basin_trials.sort(key=lambda row: (
+                float(row["model_score"]),
+                int(row["source_fit"].get("seed_index", -1)),
+            ))
+            coherent_basin_winner = coherent_basin_trials[0]
+            cosmic_coherent_charge_result = coherent_basin_winner[
+                "charge_result"
+            ]
+            cosmic_coherent_result = coherent_basin_winner[
+                "coherent_result"
+            ]
+            coherent_source_result = coherent_basin_winner["source_result"]
+            basin_rows = []
+            for trial in coherent_basin_trials:
+                source_fit = trial["source_fit"]
+                source_result = trial["source_result"]
+                candidate_result = trial["coherent_result"]
+                basin_rows.append({
+                    "seed_index": int(source_fit.get("seed_index", -1)),
+                    "seed_family": str(source_fit.get("seed_family", "")),
+                    "straight_nll": float(source_result.fval),
+                    "straight_model_score": float(
+                        auto_payload_score(source_fit)
+                    ),
+                    "coherent_selection_nll": float(
+                        candidate_result.selection_nll
+                    ),
+                    "coherent_model_score": float(trial["model_score"]),
+                    "coherent_length_mm": float(
+                        candidate_result.updated_values["length"]
+                    ),
+                    "coherent_wall_s": float(candidate_result.wall_s),
+                    "selected": bool(trial is coherent_basin_winner),
+                })
+            cosmic_coherent_result.diagnostics[
+                "global_basin_arbitration"
+            ] = {
+                "enabled": bool(coherent_basin_count > 1),
+                "maximum_candidates": int(coherent_basin_count),
+                "straight_model_gate_nll": float(
+                    coherent_basin_gate_nll
+                ),
+                "line_geometry_marginalized": False,
+                "line_geometry_profiled_over_discrete_basins": bool(
+                    len(coherent_basin_trials) > 1
+                ),
+                "candidate_rows": basin_rows,
+                "failures": coherent_basin_failures,
+                "selected_seed_index": int(
+                    coherent_basin_winner["source_fit"].get(
+                        "seed_index", -1
+                    )
+                ),
+            }
             coherent_values = dict(cosmic_coherent_result.updated_values)
             coherent_chart = cosmic_coherent_result.updated_chart
             coherent_values["t0"] = float(
-                exact_result.values.get("t0", 0.0)
+                coherent_source_result.values.get("t0", 0.0)
             )
-            timing_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                coherent_chart,
-                "timing_only",
-                proxy=False,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            timing_fixed = _optimizer_fixed_params(
-                chosen_start_hypothesis
-            )
-            timing_fixed["length"] = float(coherent_values["length"])
-            if "t0" not in timing_fixed:
-                profiled = profile_t0(
-                    timing_objective,
+            if (
+                LIKELIHOOD_MODE == "charge_only"
+                and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            ):
+                # The coherent MAP stage supplies a data-derived global line
+                # geometry only.  Report energy and realized range from the
+                # subsequent exact continuous posterior, which retains the
+                # full declared K0 support and normalized proposal bridge.
+                cosmic_joint_energy_range_result = (
+                    _run_joint_energy_range_stage(
+                        coherent_values,
+                        coherent_chart,
+                        initial_path_coefficients=(
+                            cosmic_coherent_result.coefficients_mean
+                        ),
+                    )
+                )
+                for feedback_cycle in range(
+                    int(COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES)
+                ):
+                    feedback_summary = (
+                        cosmic_joint_energy_range_result.summary()
+                    )
+                    feedback_energy = float(
+                        feedback_summary[
+                            "initial_kinetic_energy_mev_mean"
+                        ]
+                    )
+                    feedback_coherent = (
+                        run_cosmic_coherent_profile_update(
+                            EMITTER_TEMPLATE,
+                            values=(
+                                cosmic_joint_energy_range_result
+                                .updated_values
+                            ),
+                            chart=(
+                                cosmic_joint_energy_range_result
+                                .updated_chart
+                            ),
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=mcs_obs_ts,
+                            starts_at_boundary=(
+                                chosen_start_hypothesis
+                                == "boundary_entry"
+                            ),
+                            mpmt_types=None,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=length_limits,
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(
+                                COSMIC_COHERENT_GRID_POINTS
+                            ),
+                            latent_fd=float(
+                                COSMIC_COHERENT_LATENT_FD
+                            ),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            track_cycles=int(
+                                COSMIC_COHERENT_TRACK_CYCLES
+                            ),
+                            transverse_step_mm=12.0,
+                            longitudinal_step_mm=12.0,
+                            direction_step=0.010,
+                            range_step_mm=30.0,
+                            latent_trust_max_component=1.0,
+                            track_trust_max_scaled_component=float(
+                                COSMIC_COHERENT_TRACK_TRUST
+                            ),
+                            sparse_neighbor_radius_mm=100.0,
+                            fixed_initial_kinetic_energy_mev=(
+                                feedback_energy
+                            ),
+                            profile_selection_objective=str(
+                                COSMIC_COHERENT_SELECTION_OBJECTIVE
+                            ),
+                            initial_path_coefficients=(
+                                cosmic_joint_energy_range_result
+                                .coefficients_mean
+                            ),
+                            track_one_sided_half_step=_env_bool(
+                                "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP",
+                                False,
+                            ),
+                            boundary_interface_model=(
+                                active_mpmt_boundary_model
+                            ),
+                            boundary_interface_timing_policy="mask_module",
+                        )
+                    )
+                    cosmic_joint_global_feedback_history.append({
+                        "cycle": int(feedback_cycle),
+                        "conditional_energy_mev": feedback_energy,
+                        "range_before_mm": float(
+                            feedback_summary[
+                                "realized_range_mm_mean"
+                            ]
+                        ),
+                        "range_after_global_mm": float(
+                            feedback_coherent.updated_values["length"]
+                        ),
+                        "posterior_nll_after_global": float(
+                            feedback_coherent.posterior_nll
+                        ),
+                        "accepted_global_steps": int(sum(
+                            bool(row.accepted)
+                            for row in feedback_coherent.iterations
+                        )),
+                    })
+                    cosmic_coherent_result = feedback_coherent
+                    cosmic_joint_energy_range_result = (
+                        _run_joint_energy_range_stage(
+                            feedback_coherent.updated_values,
+                            feedback_coherent.updated_chart,
+                            initial_path_coefficients=(
+                                feedback_coherent.coefficients_mean
+                            ),
+                        )
+                    )
+                joint_summary = cosmic_joint_energy_range_result.summary()
+                final_values = _materialize_output_values(
+                    cosmic_joint_energy_range_result.updated_values,
+                    cosmic_joint_energy_range_result.updated_chart,
+                    start_hypothesis=chosen_start_hypothesis,
+                )
+                final_values["range_equivalent_ke_mev"] = float(
+                    final_values.get("fit_onset_ke_mev", math.nan)
+                )
+                final_values["initial_kinetic_energy_mev"] = float(
+                    joint_summary["initial_kinetic_energy_mev_mean"]
+                )
+                final_values["z_range"] = float(
+                    joint_summary["z_range_mean"]
+                )
+                errors = dict(straight_errors)
+                errors.update({
+                    "full_range": float(
+                        joint_summary["realized_range_mm_sd"]
+                    ),
+                    "initial_kinetic_energy_mev": float(
+                        joint_summary["initial_kinetic_energy_mev_sd"]
+                    ),
+                    "z_range": float(joint_summary["z_range_sd"]),
+                })
+                final_fval = float(
+                    cosmic_joint_energy_range_result.map_charge_nll
+                )
+                fval_definition = (
+                    "exact configured data NLL at the highest-posterior "
+                    "sampled continuous (K0,z_R,FE-path) state after a "
+                    "coherent global-geometry update; reported K0 and range "
+                    "are separately marginalized posterior means; "
+                    + (
+                        "no timing"
+                        if LIKELIHOOD_MODE == "charge_only"
+                        else "includes prompt first-arrival timing"
+                    )
+                )
+            elif LIKELIHOOD_MODE == "charge_only":
+                final_values = _materialize_output_values(
                     coherent_values,
-                    limits=T0_LIMITS,
-                    coarse_step_ns=T0_PROFILE_COARSE_STEP_NS,
-                    refine_levels=T0_PROFILE_REFINE_LEVELS,
-                    refine_factor=T0_PROFILE_REFINE_FACTOR,
-                    max_global_points=T0_PROFILE_MAX_GLOBAL_POINTS,
-                    seed_half_width_ns=T0_PROFILE_SEED_HALF_WIDTH_NS,
+                    coherent_chart,
+                    start_hypothesis=chosen_start_hypothesis,
                 )
-                coherent_values = dict(profiled.values)
+                errors = dict(straight_errors)
+                final_fval = float(cosmic_coherent_result.selection_nll)
+                fval_definition = (
+                    "charge-only nonlinear coherent FE exact compound-SPE "
+                    "joint posterior NLL with physical FE/range priors; no timing"
+                    if COSMIC_COHERENT_SELECTION_OBJECTIVE == "posterior"
+                    else
+                    "charge-only nonlinear coherent FE Poisson-information "
+                    "Laplace-surrogate NLL; no timing"
+                )
+            else:
+                coherent_fixed = _optimizer_fixed_params(
+                    chosen_start_hypothesis
+                )
+                coherent_joint_geometry_policy = os.environ.get(
+                    "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_GEOMETRY_POLICY",
+                    "straight_conditioned",
+                ).strip().lower()
+                if coherent_joint_geometry_policy not in {
+                    "straight_conditioned", "free"
+                }:
+                    raise ValueError(
+                        "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_GEOMETRY_POLICY "
+                        "must be straight_conditioned or free"
+                    )
+                coherent_joint_line_is_conditioned = (
+                    coherent_joint_geometry_policy == "straight_conditioned"
+                )
+                if coherent_joint_line_is_conditioned:
+                    coherent_joint_values, coherent_joint_chart = (
+                        reanchor_result(exact_result)
+                    )
+                    # Keep the charge-informed range seed while retaining the
+                    # sharply localized charge-time entrance line.  The common
+                    # posterior below remains free to update range, FE path,
+                    # and t0 together.
+                    coherent_joint_values["length"] = float(
+                        coherent_values["length"]
+                    )
+                else:
+                    coherent_joint_values = coherent_values
+                    coherent_joint_chart = coherent_chart
+                if "t0" in coherent_fixed:
+                    coherent_joint_values["t0"] = float(coherent_fixed["t0"])
+                coherent_track_controller = (
+                    cosmic_coherent_result.diagnostics.get(
+                        "track_cycle_controller", {}
+                    )
+                )
+                coherent_hard_event = bool(
+                    coherent_track_controller.get(
+                        "adaptive_extension_triggered", False
+                    )
+                )
+                coherent_joint_latent_iterations = int(
+                    COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                ) + (
+                    max(
+                        0,
+                        _env_int(
+                            "COSMIC_COHERENT_JOINT_TIMING_HARD_LATENT_BONUS",
+                            1,
+                        ),
+                    )
+                    if coherent_hard_event
+                    else 0
+                )
+                coherent_range_limits = length_limits
+                if "length" in coherent_fixed:
+                    fixed_length = float(coherent_fixed["length"])
+                    coherent_range_limits = (fixed_length, fixed_length)
+                cosmic_coherent_joint_length_result = (
+                    run_cosmic_coherent_joint_length_update(
+                        EMITTER_TEMPLATE,
+                        values=coherent_joint_values,
+                        chart=coherent_joint_chart,
+                        detector=DETECTOR,
+                        range_lookup=RANGE_LOOKUP,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        obs_ts=mcs_obs_ts,
+                        starts_at_boundary=(
+                            chosen_start_hypothesis == "boundary_entry"
+                        ),
+                        initial_path_coefficients=(
+                            cosmic_coherent_result.coefficients_mean
+                        ),
+                        mpmt_types=None,
+                        inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                        range_limits=coherent_range_limits,
+                        t0_limits=T0_LIMITS,
+                        modes_per_plane=int(
+                            COSMIC_COHERENT_MODES_PER_PLANE
+                        ),
+                        grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                        response_fd_step=float(COSMIC_COHERENT_LATENT_FD),
+                        latent_max_iterations=int(
+                            coherent_joint_latent_iterations
+                        ),
+                        final_latent_max_iterations=max(
+                            0,
+                            _env_int(
+                                "COSMIC_COHERENT_JOINT_TIMING_FINAL_LATENT_ITERATIONS",
+                                int(coherent_joint_latent_iterations),
+                            ),
+                        ),
+                        candidate_latent_max_iterations=int(
+                            COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS
+                        ),
+                        range_step_mm=float(
+                            COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+                        ),
+                        minimum_range_step_mm=float(
+                            COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+                        ),
+                        maximum_range_cycles=int(
+                            COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES
+                        ),
+                        maximum_global_cycles=max(
+                            1,
+                            _env_int(
+                                "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_CYCLES",
+                                4,
+                            ),
+                        ),
+                        transverse_step_mm=12.0,
+                        minimum_transverse_step_mm=1.0,
+                        longitudinal_step_mm=12.0,
+                        minimum_longitudinal_step_mm=1.0,
+                        direction_step=0.010,
+                        minimum_direction_step=5.0e-4,
+                        allow_longitudinal=bool(
+                            topology_options["allow_longitudinal"]
+                            and not coherent_joint_line_is_conditioned
+                        ),
+                        allow_transverse=not coherent_joint_line_is_conditioned,
+                        allow_direction=not coherent_joint_line_is_conditioned,
+                        fixed_parameter_names=tuple(coherent_fixed),
+                        path_trust_max_component=1.0,
+                        sparse_neighbor_radius_mm=float(
+                            MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                        ),
+                        fixed_initial_kinetic_energy_mev=(
+                            None
+                            if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                            else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                        ),
+                        profile_t0=("t0" not in coherent_fixed),
+                        t0_profile_coarse_step_ns=float(
+                            T0_PROFILE_COARSE_STEP_NS
+                        ),
+                        t0_profile_refine_levels=int(
+                            T0_PROFILE_REFINE_LEVELS
+                        ),
+                        t0_profile_global_points=int(
+                            T0_PROFILE_MAX_GLOBAL_POINTS
+                        ),
+                        t0_profile_seed_half_width_ns=float(
+                            T0_PROFILE_SEED_HALF_WIDTH_NS
+                        ),
+                        boundary_interface_model=(
+                            active_mpmt_boundary_model
+                        ),
+                        boundary_interface_timing_policy="mask_module",
+                    )
+                )
+                cosmic_coherent_joint_length_result.diagnostics[
+                    "global_geometry_policy"
+                ] = coherent_joint_geometry_policy
+                joint_values = dict(
+                    cosmic_coherent_joint_length_result.updated_values
+                )
+                final_values = _materialize_output_values(
+                    joint_values,
+                    cosmic_coherent_joint_length_result.updated_chart,
+                    start_hypothesis=chosen_start_hypothesis,
+                )
+                # The local joint profile supplies a conditional path/range
+                # covariance, not a validated all-global-coordinate covariance.
+                errors = dict(straight_errors)
                 cosmic_coherent_post_stage_nfcn += int(
-                    profiled.nll_evaluations
+                    cosmic_coherent_joint_length_result.diagnostics[
+                        "objective_evaluations"
+                    ]
                 )
-            cosmic_coherent_timing_result = track_aligned_block_optimize(
-                timing_objective,
-                coherent_values,
-                fixed_params=timing_fixed,
-                sweeps=max(1, int(COSMIC_FE_TIMING_SWEEPS)),
-                initial_steps=TIMING_STEPS,
-                length_limits=length_limits,
-                full_range_limits=None,
-                full_cross_sweeps=1,
-                allow_longitudinal=False,
-                allow_transverse=True,
-                allow_direction=True,
-                project_vertex_steps=bool(
-                    topology_options["project_vertex_steps"]
-                ),
-            )
-            timing_values = dict(cosmic_coherent_timing_result.values)
-            if "t0" not in timing_fixed:
-                profiled = profile_t0(
-                    timing_objective,
-                    timing_values,
-                    limits=T0_LIMITS,
-                    coarse_step_ns=T0_PROFILE_COARSE_STEP_NS,
-                    refine_levels=T0_PROFILE_REFINE_LEVELS,
-                    refine_factor=T0_PROFILE_REFINE_FACTOR,
-                    max_global_points=T0_PROFILE_MAX_GLOBAL_POINTS,
-                    seed_half_width_ns=T0_PROFILE_SEED_HALF_WIDTH_NS,
+                final_fval = float(
+                    cosmic_coherent_joint_length_result.data_nll
                 )
-                timing_values = dict(profiled.values)
-                cosmic_coherent_timing_result.values = timing_values
-                cosmic_coherent_timing_result.fval = float(profiled.fval)
-                cosmic_coherent_timing_result.nfcn += int(
-                    profiled.nll_evaluations
+                fval_definition = (
+                    "exact configured charge-plus-first-arrival data NLL at "
+                    "the geometry-clipped coherent FE path/range MAP; t0 is "
+                    "profiled for every continuous-state candidate and "
+                    "physical FE/range priors are stored separately"
                 )
-                cosmic_coherent_timing_result.wall_s += float(
-                    profiled.wall_s
-                )
-                cosmic_coherent_post_stage_nfcn += int(
-                    profiled.nll_evaluations
-                )
-            final_values = _materialize_output_values(
-                timing_values,
-                cosmic_coherent_timing_result.chart,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            # The coherent Laplace stage does not yet deliver a validated global
-            # covariance for the final conditional-timing geometry.  Preserve
-            # the accepted straight-fit errors rather than inventing one.
-            errors = dict(straight_errors)
-            final_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                cosmic_coherent_timing_result.chart,
-                LIKELIHOOD_MODE,
-                proxy=False,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            final_fval = float(final_objective(timing_values))
-            cosmic_coherent_post_stage_nfcn += int(
-                final_objective.evaluations
-            )
-            fval_definition = (
-                "ordinary production charge-plus-time NLL evaluated at the "
-                "geometry-clipped nonlinear coherent FE charge-profile estimate "
-                "after conditional first-arrival timing; coherent Fisher-Laplace "
-                "NLL stored separately"
-            )
 
-        elif AUTO_CLIPPED_TRACK and COSMIC_FERMI_EYGES_ENABLED:
+        elif (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_FERMI_EYGES_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
             # Preserve the topology selected by the complete joint navigation,
             # but reconstruct the coherent stochastic trajectory using the
             # statistically correct staged estimator: sharp charge closure,
@@ -14928,7 +19017,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 "first-arrival timing; FE quasi-NLL stored separately"
             )
 
-        if USE_COHERENT_FISHER:
+        if USE_COHERENT_FISHER and not _event_mcs_straight_fallback_active():
             if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
                 coherent_result = run_fast12_coherent_update(
                     EMITTER_TEMPLATE,
@@ -14973,7 +19062,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
                     "modes per transverse plane; straight-fit errors retained"
                 )
-            else:
+            elif MCS_COHERENT_IMPLEMENTATION == "legacy_fisher":
                 coherent_result = run_coherent_fisher_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
@@ -15017,88 +19106,46 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     "accepted joint fit"
                 )
 
-        # ------------------------------------------------------------------
-        # Explicit mPMT-boundary subclasses.  This is deliberately a guarded
-        # post-tournament challenge: the validated ordinary cosmic solution is
-        # retained and can only be replaced by an independently optimized
-        # geometry-constrained mPMT entry/exit model that wins a penalized common
-        # charge-likelihood comparison.  Cosmic MCS continuations are currently
-        # forbidden above, so no latent-path result is bypassed here.
-        # ------------------------------------------------------------------
-        mpmt_boundary_winner = None
-        mpmt_boundary_summary = {
-            "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
-            "used": False,
-            "accepted": False,
-            "reason": "not_run",
-            "nfcn": 0,
-            "invalid_evaluations": 0,
-            "wall_s": 0.0,
-        }
+        # Attach the final nested hardware profile to the existing auditable
+        # challenge summary.  The coherent objective owns the final MCS result;
+        # the straight hardware fit above is only its discrete-topology seed.
+        if mpmt_boundary_winner is not None and mcs_continuation_requested:
+            mcs_hardware_diagnostics = None
+            if cosmic_coherent_joint_length_result is not None:
+                mcs_hardware_diagnostics = (
+                    cosmic_coherent_joint_length_result.diagnostics.get(
+                        "mpmt_hardware"
+                    )
+                )
+            elif cosmic_coherent_result is not None:
+                mcs_hardware_diagnostics = (
+                    cosmic_coherent_result.diagnostics.get("mpmt_hardware")
+                )
+            compatibility = mpmt_boundary_summary.setdefault(
+                "mcs_compatibility", {}
+            )
+            compatibility.update({
+                "continuation_completed": bool(
+                    cosmic_coherent_result is not None
+                    or cosmic_fe_result is not None
+                    or cosmic_joint_energy_range_result is not None
+                    or coherent_result is not None
+                ),
+                "coherent_nested_profile": mcs_hardware_diagnostics,
+            })
+            fval_definition = (
+                str(fval_definition)
+                + "; includes a nested explicit mPMT-hardware charge profile "
+                "with crossed-module timestamps masked"
+            )
+
         if (
             AUTO_CLIPPED_TRACK
             and cosmic_fe_result is None
             and cosmic_coherent_result is None
+            and cosmic_joint_energy_range_result is None
             and coherent_result is None
         ):
-            try:
-                mpmt_boundary_winner, mpmt_boundary_summary = (
-                    _run_mpmt_boundary_challenge(
-                        obs_pes=obs_pes,
-                        obs_ts=obs_ts,
-                        baseline_result=exact_result,
-                        baseline_start_hypothesis=chosen_start_hypothesis,
-                        topology_penalty=auto_topology_penalty,
-                        length_limits=length_limits,
-                        requested_mode=LIKELIHOOD_MODE,
-                    )
-                )
-            except Exception as exc:
-                # The ordinary topology result remains authoritative if the
-                # optional challenge encounters an event-specific numerical
-                # failure.  Record the failure rather than allowing one malformed
-                # module hypothesis to abort a production batch.
-                mpmt_boundary_winner = None
-                mpmt_boundary_summary = {
-                    "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
-                    "used": False,
-                    "accepted": False,
-                    "reason": "challenge_exception",
-                    "error": repr(exc),
-                    "nfcn": 0,
-                    "invalid_evaluations": 0,
-                    "wall_s": 0.0,
-                }
-
-        if mpmt_boundary_winner is not None:
-            exact_result = mpmt_boundary_winner["result"]
-            chosen_start_hypothesis = str(
-                mpmt_boundary_winner["start_hypothesis"]
-            )
-            errors = _materialize_output_errors(
-                exact_result.errors,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            final_fval = float(exact_result.fval)
-            if bool(
-                mpmt_boundary_winner.get("timing_metadata", {}).get(
-                    "accepted", False
-                )
-            ):
-                fval_definition = (
-                    "explicit geometry-constrained mPMT boundary subclass; "
-                    "class selected by penalized common charge likelihood and "
-                    "final charge-plus-time NLL uses timestamps outside the "
-                    "crossed module"
-                )
-            else:
-                fval_definition = (
-                    "explicit geometry-constrained mPMT boundary subclass; "
-                    "penalized common charge likelihood with locally profiled "
-                    "nonnegative hardware-light modes"
-                )
-
-        if AUTO_CLIPPED_TRACK and cosmic_fe_result is None:
             final_values = _materialize_output_values(
                 exact_result.values,
                 exact_result.chart,
@@ -15108,11 +19155,46 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             final_values = _materialize_output_values(
                 exact_result.values, exact_result.chart
             )
-        elif FIT_MODE == "full_length":
+        elif FIT_MODE == "full_length" and not AUTO_CLIPPED_TRACK:
             final_values["visible_length"] = float(final_values["length"])
             final_values["full_range"] = float(final_values["length"])
         else:
             final_values["length"] = float(final_values["visible_length"])
+
+        # Every cosmic result exposes the same energy contract. Joint models
+        # carry an independently inferred K0; deterministic models use the
+        # inverse-range value for both fields rather than emitting a misleading
+        # NaN in ``initial_kinetic_energy_mev``.
+        range_equivalent_ke_mev = float(
+            RANGE_LOOKUP.range_mm_to_energy(final_values["full_range"])
+        )
+        final_values.setdefault(
+            "range_equivalent_ke_mev", range_equivalent_ke_mev
+        )
+        final_values.setdefault(
+            "initial_kinetic_energy_mev", range_equivalent_ke_mev
+        )
+        errors.setdefault(
+            "full_range", float(errors.get("length", math.nan))
+        )
+        full_range_error = float(errors.get("full_range", math.nan))
+        if (
+            "initial_kinetic_energy_mev" not in errors
+            and math.isfinite(full_range_error)
+            and full_range_error >= 0.0
+        ):
+            range_value = float(final_values["full_range"])
+            range_low = max(0.0, range_value - full_range_error)
+            range_high = min(
+                float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                range_value + full_range_error,
+            )
+            energy_low = float(RANGE_LOOKUP.range_mm_to_energy(range_low))
+            energy_high = float(RANGE_LOOKUP.range_mm_to_energy(range_high))
+            errors["initial_kinetic_energy_mev"] = max(
+                abs(range_equivalent_ke_mev - energy_low),
+                abs(energy_high - range_equivalent_ke_mev),
+            )
 
         # Record the selected interface subclass independently for entry and
         # exit.  Ordinary contained/clean-boundary events remain exactly in the
@@ -15142,6 +19224,14 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "boundary_exit_mpmt_slot": int(selected_exit_slot),
             "mpmt_boundary_selected": bool(mpmt_boundary_winner is not None),
         })
+        final_values, raw_values, longitudinal_gauge = (
+            _apply_internal_start_longitudinal_gauge(
+                final_values,
+                start_hypothesis=chosen_start_hypothesis,
+                refractive_index=float(getattr(EMITTER_TEMPLATE, "n", 1.344)),
+                range_lookup=RANGE_LOOKUP,
+            )
+        )
 
         exact_fit_nfcn = int(sum(item["result"].nfcn for item in optimized_basins))
         total_nfcn = int(
@@ -15156,6 +19246,14 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             + (0 if cosmic_fe_charge_result is None else int(cosmic_fe_charge_result.nfcn))
             + (0 if cosmic_fe_timing_result is None else int(cosmic_fe_timing_result.nfcn))
             + int(cosmic_fe_post_stage_nfcn)
+            + int(cosmic_coherent_post_stage_nfcn)
+            + (
+                0
+                if cosmic_joint_energy_range_result is None
+                else int(
+                    cosmic_joint_energy_range_result.smc.likelihood_evaluations
+                )
+            )
             + int(mpmt_boundary_summary.get("nfcn", 0))
         )
         basin_payload = [
@@ -15189,6 +19287,8 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "optimizer": "track_aligned_exact_joint_block_quadratic",
             "parameterization": "seed-centred normalized tangent chart",
             "values": final_values,
+            "raw_values": raw_values,
+            "longitudinal_gauge": longitudinal_gauge,
             "errors": errors,
             "fval": float(final_fval),
             "fval_definition": str(fval_definition),
@@ -15210,6 +19310,27 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "straight_fit_values": dict(straight_values),
             "straight_fit_errors": dict(straight_errors),
             "fit_accepted": bool(np.isfinite(final_fval)),
+            "mcs_status": (
+                "straight_fallback_retry"
+                if _event_mcs_straight_fallback_active()
+                else (
+                    "applied"
+                    if any(stage is not None for stage in (
+                        cosmic_fe_result,
+                        cosmic_coherent_result,
+                        cosmic_joint_energy_range_result,
+                        coherent_result,
+                    ))
+                    else (
+                        "not_requested"
+                        if not mcs_continuation_requested else "not_applied"
+                    )
+                )
+            ),
+            "mcs_failure": None,
+            "multilateration_guided_full_bank_fallback": bool(
+                multilateration_guided_full_bank_fallback
+            ),
             "chosen_seed_index": int(chosen_index),
             "chosen_seed": dict(event_seeds[chosen_index]),
             "chosen_track_start_hypothesis": str(chosen_start_hypothesis),
@@ -15232,9 +19353,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 )
             ),
             "proxy_candidate_indices": [int(x) for x in candidate_indices],
-            # Event-specific causal seeds do not belong to the immutable quantized
-            # proxy library. Store NaN for those entries rather than indexing past
-            # the fixed score vector.
+            # Event-specific timing-navigation seeds do not belong to the
+            # immutable quantized proxy library. Store NaN for those entries
+            # rather than indexing past the fixed score vector.
             "proxy_scores": [
                 float(scores[x]) if 0 <= int(x) < int(len(scores)) else math.nan
                 for x in candidate_indices
@@ -15253,13 +19374,77 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 ),
                 "seed_count": int(len(causal_timing_seed_records)),
                 "line_count": int(len(causal_timing_line_records)),
+                "lazy_beam_gate": dict(
+                    causal_timing_lazy_beam_diagnostics
+                ),
                 "selected_seed_was_causal": bool(
-                    int(chosen_index) >= int(len(SEEDS))
-                    or str(event_seeds[int(chosen_index)].get("seed_family", ""))
+                    str(event_seeds[int(chosen_index)].get("seed_family", ""))
                     == "causal_timing_guard"
                 ),
                 "seeds": causal_timing_seed_records if SAVE_DETAILED_EVENT_RESULTS else [],
                 "lines": causal_timing_line_records if SAVE_DETAILED_EVENT_RESULTS else [],
+            },
+            "multilateration_seed_guard": {
+                "mode": str(COSMIC_MULTILATERATION_SEED_MODE),
+                "enabled": bool(
+                    COSMIC_MULTILATERATION_SEED_MODE != "off"
+                ),
+                "used": bool(multilateration_seed_records),
+                "wall_s": float(multilateration_wall_s),
+                "failure": multilateration_failure,
+                "primary_fallback_used": bool(
+                    multilateration_primary_fallback_used
+                ),
+                "primary_fallback_reason": (
+                    multilateration_primary_fallback_reason
+                ),
+                "guided_full_bank_fallback": bool(
+                    multilateration_guided_full_bank_fallback
+                ),
+                "point_fit": multilateration_point_record,
+                "guided_bank": {
+                    "enabled": bool(
+                        COSMIC_MULTILATERATION_SEED_MODE == "guided"
+                    ),
+                    "wall_s": float(multilateration_guided_bank_wall_s),
+                    "failure": multilateration_guided_bank_failure,
+                    "neighbourhood_count": int(
+                        multilateration_guided_bank_neighbourhood_count
+                    ),
+                    "proxy_quantization_uncertainty_nll": float(
+                        multilateration_guided_proxy_quantization_uncertainty_nll
+                    ),
+                    "selected_count": int(
+                        len(multilateration_guided_bank_records)
+                    ),
+                    "selected": (
+                        multilateration_guided_bank_records
+                        if SAVE_DETAILED_EVENT_RESULTS else []
+                    ),
+                },
+                "pool_seed_count": int(multilateration_pool_count),
+                "prefilter_nfcn": int(multilateration_prefilter_nfcn),
+                "prefilter_wall_s": float(
+                    multilateration_prefilter_wall_s
+                ),
+                "prefilter_failures": (
+                    multilateration_prefilter_failures
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
+                "seed_count": int(len(multilateration_seed_records)),
+                "line_count": int(len(multilateration_line_records)),
+                "selected_seed_was_multilateration": bool(
+                    str(event_seeds[int(chosen_index)].get("seed_family", ""))
+                    == "multilateration_timing"
+                ),
+                "seeds": (
+                    multilateration_seed_records
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
+                "lines": (
+                    multilateration_line_records
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
             },
             "proxy_results": [
                 {
@@ -15392,20 +19577,301 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     else coherent_fisher_payload(coherent_result)
                 )
             ),
+            "cosmic_joint_energy_range": (
+                None
+                if cosmic_joint_energy_range_result is None
+                else {
+                    "enabled": True,
+                    "estimator": (
+                        (
+                            "charge-only"
+                            if LIKELIHOOD_MODE == "charge_only"
+                            else "charge-plus-time"
+                        )
+                        + " annealed SMC over continuous "
+                        "(K0,z_R,soft-Wentzel-FE,hard-Wentzel-marks)"
+                        if str(_EMITTER_SWITCHES[
+                            "cosmic_mcs_continuation"
+                        ]) == "joint_k0_range_mixed_mcs"
+                        else (
+                            (
+                                "charge-only"
+                                if LIKELIHOOD_MODE == "charge_only"
+                                else "charge-plus-time"
+                            )
+                            + " annealed SMC over continuous "
+                            "(K0,z_R,coherent-FE-path)"
+                            if str(_EMITTER_SWITCHES[
+                                "cosmic_joint_inference_method"
+                            ]) == "reference_smc"
+                            else (
+                                "charge-only"
+                                if LIKELIHOOD_MODE == "charge_only"
+                                else "charge-plus-time"
+                            )
+                            + " deterministic Laplace/Gauss-Hermite "
+                            "cubature over continuous (K0,z_R,coherent-FE-path)"
+                        )
+                    ),
+                    "posterior": cosmic_joint_energy_range_result.summary(),
+                    "global_feedback": list(
+                        cosmic_joint_global_feedback_history
+                    ),
+                    "guide": dict(
+                        cosmic_joint_energy_range_result.guide_diagnostics
+                    ),
+                    "coefficients_mean": (
+                        cosmic_joint_energy_range_result.coefficients_mean.tolist()
+                    ),
+                    "coefficients_covariance": (
+                        cosmic_joint_energy_range_result
+                        .coefficients_covariance.tolist()
+                    ),
+                    "temperature_stages": [
+                        {
+                            "beta_before": float(row.beta_before),
+                            "beta_after": float(row.beta_after),
+                            "ess_before_resampling": float(
+                                row.ess_before_resampling
+                            ),
+                            "resampled": bool(row.resampled),
+                            "energy_acceptance": float(row.energy_acceptance),
+                            "event_time_acceptance": float(
+                                getattr(row, "event_time_acceptance", 0.0)
+                            ),
+                            "range_acceptance": float(row.range_acceptance),
+                            "path_acceptance": float(row.path_acceptance),
+                            "guide_acceptance": float(row.guide_acceptance),
+                            "hard_acceptance": (
+                                None
+                                if not hasattr(row, "hard_acceptance")
+                                else float(row.hard_acceptance)
+                            ),
+                            "hard_local_acceptance": (
+                                None
+                                if not hasattr(row, "hard_local_acceptance")
+                                else float(row.hard_local_acceptance)
+                            ),
+                            "soft_pcn_attempts": int(
+                                getattr(row, "soft_pcn_attempts", 0)
+                            ),
+                            "soft_pcn_finite_proposals": int(
+                                getattr(row, "soft_pcn_finite_proposals", 0)
+                            ),
+                            "soft_pcn_jump_norm_median": float(
+                                getattr(row, "soft_pcn_jump_norm_median", math.nan)
+                            ),
+                            "soft_pcn_loglike_delta_median": float(
+                                getattr(
+                                    row,
+                                    "soft_pcn_loglike_delta_median",
+                                    math.nan,
+                                )
+                            ),
+                            "soft_pcn_log_ratio_median": float(
+                                getattr(row, "soft_pcn_log_ratio_median", math.nan)
+                            ),
+                            "soft_pcn_log_ratio_max": float(
+                                getattr(row, "soft_pcn_log_ratio_max", math.nan)
+                            ),
+                            "conditional_guide_attempts": int(
+                                getattr(row, "conditional_guide_attempts", 0)
+                            ),
+                            "conditional_guide_finite_proposals": int(
+                                getattr(
+                                    row,
+                                    "conditional_guide_finite_proposals",
+                                    0,
+                                )
+                            ),
+                            "conditional_guide_jump_norm_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_jump_norm_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_loglike_delta_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_loglike_delta_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_log_ratio_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_log_ratio_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_log_ratio_max": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_log_ratio_max",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_effective_probability": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_effective_probability",
+                                    math.nan,
+                                )
+                            ),
+                        }
+                        for row in cosmic_joint_energy_range_result.smc.stages
+                    ],
+                    "samples": (
+                        {
+                            "initial_kinetic_energy_mev": (
+                                cosmic_joint_energy_range_result.smc
+                                .kinetic_energy_mev.tolist()
+                            ),
+                            "z_range": (
+                                cosmic_joint_energy_range_result.smc.z_range.tolist()
+                            ),
+                            "event_time_ns": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "event_time_ns",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .event_time_ns.tolist()
+                            ),
+                            "realized_range_mm": (
+                                cosmic_joint_energy_range_result.smc
+                                .realized_range_mm.tolist()
+                            ),
+                            "coefficients": (
+                                cosmic_joint_energy_range_result.smc
+                                .coefficients.tolist()
+                            ),
+                            "initial_lineage": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "initial_lineage",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .initial_lineage.tolist()
+                            ),
+                            "hard_scatters": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "latents",
+                                )
+                                else [
+                                    [
+                                        {
+                                            "s_mm": float(mark.s_mm),
+                                            "theta_rad": float(mark.theta_rad),
+                                            "azimuth_rad": float(mark.azimuth_rad),
+                                            "atomic_number": int(mark.atomic_number),
+                                            "target": str(mark.target),
+                                        }
+                                        for mark in latent.hard_scatters
+                                    ]
+                                    for latent in cosmic_joint_energy_range_result.smc.latents
+                                ]
+                            ),
+                            "log_likelihood": (
+                                cosmic_joint_energy_range_result.smc
+                                .log_likelihood.tolist()
+                            ),
+                            "log_prior_density": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "log_prior_density",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .log_prior_density.tolist()
+                            ),
+                            "weights": (
+                                cosmic_joint_energy_range_result.smc.weights.tolist()
+                            ),
+                        }
+                        if SAVE_DETAILED_EVENT_RESULTS else None
+                    ),
+                    "diagnostics": dict(
+                        cosmic_joint_energy_range_result.diagnostics
+                    ),
+                    "wall_s": float(
+                        cosmic_joint_energy_range_result.wall_s
+                    ),
+                    "updated_values": (
+                        cosmic_joint_energy_range_result.output_values()
+                    ),
+                }
+            ),
             "cosmic_coherent_fermi_eyges_profile": (
                 None if cosmic_coherent_result is None else {
                     "enabled": True,
-                    "estimator": "sharp_charge_then_clipped_nonlinear_FE_profile_then_conditional_timing",
+                    "estimator": (
+                        "sharp_charge_then_clipped_nonlinear_FE_profile"
+                        if cosmic_coherent_joint_length_result is None
+                        else (
+                            "sharp_charge_time_line_then_exact_coherent_"
+                            "path_range_time_profile"
+                            if coherent_joint_line_is_conditioned
+                            else "sharp_charge_then_exact_coherent_joint_"
+                            "global_charge_time_profile"
+                        )
+                    ),
                     "charge_stage": (None if cosmic_coherent_charge_result is None else block_result_payload(cosmic_coherent_charge_result)),
                     "timing_stage": (None if cosmic_coherent_timing_result is None else block_result_payload(cosmic_coherent_timing_result)),
+                    "joint_charge_time_range_stage": (
+                        None
+                        if cosmic_coherent_joint_length_result is None
+                        else {
+                            "updated_values": cosmic_coherent_joint_length_result.output_values(),
+                            "data_nll": float(cosmic_coherent_joint_length_result.data_nll),
+                            "path_prior_nll": float(cosmic_coherent_joint_length_result.path_prior_nll),
+                            "range_prior_nll": float(cosmic_coherent_joint_length_result.range_prior_nll),
+                            "posterior_nll": float(cosmic_coherent_joint_length_result.posterior_nll),
+                            "profiled_t0_ns": float(cosmic_coherent_joint_length_result.profiled_t0_ns),
+                            "coefficients_mean": cosmic_coherent_joint_length_result.coefficients_mean.tolist(),
+                            "coefficients_covariance": cosmic_coherent_joint_length_result.coefficients_covariance.tolist(),
+                            "converged": bool(cosmic_coherent_joint_length_result.converged),
+                            "iterations": [
+                                {
+                                    "cycle": int(row.cycle),
+                                    "step_mm": float(row.step_mm),
+                                    "length_before_mm": float(row.length_before_mm),
+                                    "posterior_before": float(row.posterior_before),
+                                    "candidate_lengths_mm": list(row.candidate_lengths_mm),
+                                    "candidate_posteriors": list(row.candidate_posteriors),
+                                    "length_after_mm": float(row.length_after_mm),
+                                    "posterior_after": float(row.posterior_after),
+                                    "accepted": bool(row.accepted),
+                                }
+                                for row in cosmic_coherent_joint_length_result.iterations
+                            ],
+                            "diagnostics": dict(cosmic_coherent_joint_length_result.diagnostics),
+                            "wall_s": float(cosmic_coherent_joint_length_result.wall_s),
+                        }
+                    ),
                     "post_stage_validation_nfcn": int(cosmic_coherent_post_stage_nfcn),
                     "initial_topology": str(cosmic_coherent_result.initial_resolved.topology),
                     "final_topology": str(cosmic_coherent_result.updated_resolved.topology),
                     "charge_nll": float(cosmic_coherent_result.charge_nll),
                     "posterior_nll": float(cosmic_coherent_result.posterior_nll),
                     "laplace_nll": float(cosmic_coherent_result.laplace_nll),
-                    "coefficients_mean": cosmic_coherent_result.coefficients_mean.tolist(),
-                    "coefficients_covariance": cosmic_coherent_result.coefficients_covariance.tolist(),
+                    "selection_nll": float(cosmic_coherent_result.selection_nll),
+                    "converged": bool(cosmic_coherent_result.converged),
+                    "coefficients_mean": (
+                        cosmic_coherent_result.coefficients_mean.tolist()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.coefficients_mean.tolist()
+                    ),
+                    "coefficients_covariance": (
+                        cosmic_coherent_result.coefficients_covariance.tolist()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.coefficients_covariance.tolist()
+                    ),
                     "profile_iterations": [
                         {
                             "cycle": int(row.cycle),
@@ -15421,7 +19887,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     ],
                     "diagnostics": dict(cosmic_coherent_result.diagnostics),
                     "wall_s": float(cosmic_coherent_result.wall_s),
-                    "updated_values": cosmic_coherent_result.output_values(),
+                    "updated_values": (
+                        cosmic_coherent_result.output_values()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.output_values()
+                    ),
                 }
             ),
             "cosmic_fermi_eyges_process": (
@@ -15471,9 +19941,26 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 + sum(item["result"].invalid_evaluations for item in optimized_basins)
                 + int(cosmic_direction_fan_invalid)
                 + int(cosmic_boundary_causal_polish_invalid)
+                + (
+                    0
+                    if cosmic_joint_energy_range_result is None
+                    else int(
+                        cosmic_joint_energy_range_result.smc
+                        .invalid_likelihood_evaluations
+                    )
+                )
                 + int(auto_topology_range_closure_invalid)
                 + int(boundary_range_profile_invalid)
                 + int(auto_range_profile_invalid)
+                + (
+                    0
+                    if cosmic_coherent_joint_length_result is None
+                    else int(
+                        cosmic_coherent_joint_length_result.diagnostics[
+                            "invalid_candidate_count"
+                        ]
+                    )
+                )
                 + int(mpmt_boundary_summary.get("invalid_evaluations", 0))
             ),
             "quadratic_skip_count": int(
@@ -15595,7 +20082,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)
                 coherent_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
-                if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                _coherent_warmup = coherent_warmup_action(
+                    MCS_COHERENT_IMPLEMENTATION
+                )
+                if _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -15619,7 +20109,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         ),
                         numba_threads=MCS_COHERENT_NUMBA_THREADS,
                     )
-                else:
+                elif _coherent_warmup == "legacy_fisher":
                     _ = run_coherent_fisher_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -15637,6 +20127,152 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                             MCS_COHERENT_APPLY_EXPECTED_CONTRACTION
                         ),
                     )
+                else:
+                    raise AssertionError(
+                        f"unsupported coherent warm-up action {_coherent_warmup!r} "
+                        "in this engine"
+                    )
+
+            # The cosmic coherent continuation is enabled independently of the
+            # contained-track coherent-Fisher switch above.  Warm one bounded
+            # profile/range cycle here so Numba compilation is charged to setup,
+            # never to the first event's reported fit latency.
+            if (
+                AUTO_CLIPPED_TRACK
+                and COSMIC_COHERENT_PROFILE_ENABLED
+                and _env_bool("LF_COHERENT_PIPELINE_WARMUP", True)
+            ):
+                try:
+                    warm_values = dict(values)
+                    warm_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
+                    warm_profile = run_cosmic_coherent_profile_update(
+                        EMITTER_TEMPLATE,
+                        values=warm_values,
+                        chart=chart,
+                        detector=DETECTOR,
+                        range_lookup=RANGE_LOOKUP,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        obs_ts=obs_ts,
+                        starts_at_boundary=(start_hypothesis == "boundary_entry"),
+                        mpmt_types=None,
+                        inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                        range_limits=track_length_limits(),
+                        t0_limits=T0_LIMITS,
+                        modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
+                        grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                        latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                        latent_max_iterations=int(
+                            COSMIC_COHERENT_LATENT_ITERATIONS
+                        ),
+                        candidate_latent_max_iterations=int(
+                            COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                        ),
+                        track_cycles=1,
+                        adaptive_track_max_cycles=1,
+                        transverse_step_mm=12.0,
+                        longitudinal_step_mm=12.0,
+                        direction_step=0.010,
+                        range_step_mm=30.0,
+                        latent_trust_max_component=1.0,
+                        track_trust_max_scaled_component=float(
+                            COSMIC_COHERENT_TRACK_TRUST
+                        ),
+                        sparse_neighbor_radius_mm=100.0,
+                        fixed_initial_kinetic_energy_mev=(
+                            None
+                            if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                            else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                        ),
+                        profile_selection_objective=str(
+                            COSMIC_COHERENT_SELECTION_OBJECTIVE
+                        ),
+                        track_one_sided_half_step=_env_bool(
+                            "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP", False
+                        ),
+                    )
+                    if LIKELIHOOD_MODE != "charge_only":
+                        warm_fixed = _optimizer_fixed_params(start_hypothesis)
+                        warm_joint_values = dict(warm_profile.updated_values)
+                        warm_joint_values["t0"] = float(
+                            warm_values.get("t0", 0.0)
+                        )
+                        _ = run_cosmic_coherent_joint_length_update(
+                            EMITTER_TEMPLATE,
+                            values=warm_joint_values,
+                            chart=warm_profile.updated_chart,
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=obs_ts,
+                            starts_at_boundary=(
+                                start_hypothesis == "boundary_entry"
+                            ),
+                            initial_path_coefficients=(
+                                warm_profile.coefficients_mean
+                            ),
+                            mpmt_types=None,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=track_length_limits(),
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                            response_fd_step=float(COSMIC_COHERENT_LATENT_FD),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                            ),
+                            final_latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            range_step_mm=float(
+                                COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+                            ),
+                            minimum_range_step_mm=float(
+                                COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+                            ),
+                            maximum_range_cycles=1,
+                            maximum_global_cycles=0,
+                            allow_longitudinal=False,
+                            allow_transverse=False,
+                            allow_direction=False,
+                            fixed_parameter_names=tuple(warm_fixed),
+                            sparse_neighbor_radius_mm=float(
+                                MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                            ),
+                            fixed_initial_kinetic_energy_mev=(
+                                None
+                                if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                                else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                            ),
+                            profile_t0=("t0" not in warm_fixed),
+                            t0_profile_coarse_step_ns=float(
+                                T0_PROFILE_COARSE_STEP_NS
+                            ),
+                            t0_profile_refine_levels=int(
+                                T0_PROFILE_REFINE_LEVELS
+                            ),
+                            t0_profile_global_points=int(
+                                T0_PROFILE_MAX_GLOBAL_POINTS
+                            ),
+                            t0_profile_seed_half_width_ns=float(
+                                T0_PROFILE_SEED_HALF_WIDTH_NS
+                            ),
+                        )
+                except Exception:
+                    if _env_bool("LF_REQUIRE_COHERENT_PIPELINE_WARMUP", False):
+                        raise
 
         finally:
             EMITTER_TEMPLATE.photon_scatter_native_receiver = native_saved
@@ -15737,12 +20373,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 if (FIT_MODE == "absorption" or AUTO_CLIPPED_TRACK) else None
             ),
         )
-        if _UNIFIED_DATA_SOURCE == "wcte":
-            emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
-            emitter.global_charge_scale = (
-                None if GLOBAL_CHARGE_SCALE is None
-                else float(GLOBAL_CHARGE_SCALE)
-            )
+        emitter.charge_normalization_mode = str(CHARGE_NORMALIZATION_MODE)
+        emitter.global_charge_scale = (
+            None if GLOBAL_CHARGE_SCALE is None
+            else float(GLOBAL_CHARGE_SCALE)
+        )
 
         # The Emitter is the single MCS authority. Confirm that the constructed
         # object agrees with the module-level resolution used to choose driver
@@ -15875,7 +20510,14 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         setup_print("Detector volume:", DETECTOR.metadata())
         setup_print("Detector geometry:", DETECTOR_SUMMARY.metadata())
         setup_print("Detector optical configuration:", DETECTOR_OPTICAL_CONFIGURATION)
-        setup_print("MCS reconstruction mode:", MCS_RECONSTRUCTION_MODE)
+        setup_print(
+            "Contained-track primary MCS mode (inactive in cosmic):",
+            MCS_RECONSTRUCTION_MODE,
+        )
+        setup_print(
+            "Cosmic MCS continuation:",
+            _EMITTER_SWITCHES["cosmic_mcs_continuation"],
+        )
         if USE_COHERENT_FISHER:
             setup_print(
                 "Coherent MCS controls:",
@@ -16201,7 +20843,32 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         PMT_MODEL.first_arrival_prompt_min_ns = prompt_lo
         PMT_MODEL.first_arrival_prompt_max_ns = prompt_hi
 
-        result = fit_event(OBS_PES_ALL[index], OBS_TS_ALL[index])
+        profile_index = _env_int("LF_CPROFILE_LOCAL_EVENT_INDEX", -1)
+        profile_path = os.environ.get("LF_CPROFILE_EVENT_PATH", "").strip()
+        if index == profile_index and profile_path:
+            import cProfile
+
+            profiler = cProfile.Profile()
+            profiler.enable()
+            result = _fit_event_with_failure_record(
+                fit_event,
+                OBS_PES_ALL[index],
+                OBS_TS_ALL[index],
+                event_index=index,
+                prompt_time_min_ns=prompt_lo,
+                prompt_time_max_ns=prompt_hi,
+            )
+            profiler.disable()
+            profiler.dump_stats(profile_path)
+        else:
+            result = _fit_event_with_failure_record(
+                fit_event,
+                OBS_PES_ALL[index],
+                OBS_TS_ALL[index],
+                event_index=index,
+                prompt_time_min_ns=prompt_lo,
+                prompt_time_max_ns=prompt_hi,
+            )
         result["event_index"] = index
         result["prompt_time_min_ns"] = prompt_lo
         result["prompt_time_max_ns"] = prompt_hi
@@ -16538,6 +21205,80 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         "exact_rerank_per_topology": int(
                             AUTO_EXACT_RERANK_PER_TOPOLOGY
                         ),
+                        "multilateration_seed_guard": {
+                            "mode": str(COSMIC_MULTILATERATION_SEED_MODE),
+                            "point_source_model_is_navigation_only": True,
+                            "group_refractive_index": float(
+                                COSMIC_MULTILATERATION_GROUP_INDEX
+                            ),
+                            "phase_refractive_index": float(
+                                getattr(EMITTER_TEMPLATE, "n", 1.344)
+                            ),
+                            "minimum_timed_pmts": int(
+                                COSMIC_MULTILATERATION_MIN_HITS
+                            ),
+                            "maximum_timed_pmts": (
+                                None
+                                if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                                else int(COSMIC_MULTILATERATION_MAX_HITS)
+                            ),
+                            "maximum_point_fit_evaluations": int(
+                                COSMIC_MULTILATERATION_MAX_NFEV
+                            ),
+                            "pool_seeds": int(
+                                COSMIC_MULTILATERATION_POOL_SEEDS
+                            ),
+                            "selected_seeds": int(
+                                COSMIC_MULTILATERATION_MAX_SEEDS
+                            ),
+                            "exact_close_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS
+                            ),
+                            "optimizer_tournament_probes": int(
+                                COSMIC_MULTILATERATION_TOURNAMENT_PROBES
+                            ),
+                            "optimizer_tournament_continuations": int(
+                                COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS
+                            ),
+                            "include_reverse_directions": bool(
+                                COSMIC_MULTILATERATION_INCLUDE_REVERSE
+                            ),
+                            "reverse_below_photon_resultant": float(
+                                COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD
+                            ),
+                            "guided_bank_max_angle_deg": float(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG
+                            ),
+                            "guided_bank_max_transverse_detector_diagonal_fraction": float(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION
+                            ),
+                            "guided_bank_neighbourhood_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS
+                            ),
+                            "guided_bank_selected_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS
+                            ),
+                            "guided_bank_max_proxy_quantization_tie_representatives": int(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES
+                            ),
+                            "guided_bank_proxy_geometry_representatives": int(
+                                COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES
+                            ),
+                            "guided_bank_proxy_geometry_gate_nll": float(
+                                COSMIC_TOURNAMENT_BASELINE_START_GATE_NLL
+                            ),
+                            "guided_bank_proxy_quantization_uncertainty_multiplier": float(
+                                COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER
+                            ),
+                            "outside_point_policy": (
+                                "detector-centre ray to exact active-water "
+                                "boundary plus relative inset"
+                            ),
+                            "primary_failure_policy": (
+                                "restore complete incumbent candidate selection"
+                            ),
+                            "uses_event_truth": False,
+                        },
                         "range_diversity_ratio_edges": [
                             float(x) for x in AUTO_RANGE_DIVERSITY_RATIO_EDGES
                         ],
@@ -16713,10 +21454,129 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                     if BOUNDARY_CLIPPED_TRACK else "contained_start_endpoint"
                 ),
                 "likelihood_mode": LIKELIHOOD_MODE,
+                "charge_likelihood_mode": str(CHARGE_LIKELIHOOD_MODE),
+                "pmt_spe_response_model": str(PMT_MODEL.spe_response_model),
+                "pmt_charge_response": _runtime_pmt_charge_response_metadata(
+                    PMT_MODEL
+                ),
                 "mcs_reconstruction_mode": str(MCS_RECONSTRUCTION_MODE),
                 "coherent_fisher_enabled": bool(USE_COHERENT_FISHER),
                 "fermi_eyges_enabled": bool(USE_FERMI_EYGES),
                 "legacy_mcs_enabled": bool(USE_LEGACY_MCS),
+                "charge_normalization_mode": str(
+                    CHARGE_NORMALIZATION_MODE
+                ),
+                "global_charge_scale": (
+                    None if GLOBAL_CHARGE_SCALE is None
+                    else float(GLOBAL_CHARGE_SCALE)
+                ),
+                "global_charge_calibration_id": str(
+                    GLOBAL_CHARGE_CALIBRATION_ID
+                ) or None,
+                "absolute_light_calibration": (
+                    _absolute_light_calibration_metadata("WCSIM")
+                ),
+                "cosmic_mcs_continuation": str(COSMIC_MCS_CONTINUATION),
+                "cosmic_joint_inference_method": str(
+                    _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                ),
+                "coherent_numba_parent_preload": dict(COHERENT_NUMBA_PRELOAD),
+                "cosmic_joint_energy_range_configuration": {
+                    "enabled": bool(COSMIC_JOINT_ENERGY_RANGE_ENABLED),
+                    "path_model": str(COSMIC_MCS_CONTINUATION),
+                    "explicit_hard_scatters": bool(
+                        COSMIC_MCS_CONTINUATION
+                        == "joint_k0_range_mixed_mcs"
+                    ),
+                    "charge_only_required": False,
+                    "supported_likelihood_modes": ["charge_only", "charge_time"],
+                    "line_geometry_conditioned": True,
+                    "mixed_global_line_precondition_enabled": bool(
+                        COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    "joint_global_line_precondition_enabled": bool(
+                        COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    "kinetic_energy_bounds_mev": [
+                        float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                        float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                    ],
+                    "energy_stratum_edges_mev": list(
+                        COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                    ),
+                    "energy_stratum_replicates": int(
+                        COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                    ),
+                    "kinetic_energy_prior": "uniform_on_documented_broad_support",
+                    "range_prior": (
+                        "Geant4_UniversalFluctuation_first_passage_moment"
+                    ),
+                    "particles": int(COSMIC_JOINT_PARTICLES),
+                    "random_seed": int(COSMIC_JOINT_RANDOM_SEED),
+                    "target_ess_fraction": float(
+                        COSMIC_JOINT_TARGET_ESS_FRACTION
+                    ),
+                    "resample_ess_fraction": float(
+                        COSMIC_JOINT_RESAMPLE_ESS_FRACTION
+                    ),
+                    "max_temperatures": int(COSMIC_JOINT_MAX_TEMPERATURES),
+                    "rejuvenation_steps": int(
+                        COSMIC_JOINT_REJUVENATION_STEPS
+                    ),
+                    "posterior_rejuvenation_steps": int(
+                        COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS
+                    ),
+                    "energy_random_walk_mev": float(
+                        COSMIC_JOINT_ENERGY_RW_MEV
+                    ),
+                    "energy_independence_probability": float(
+                        COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY
+                    ),
+                    "range_pcn_rho": float(COSMIC_JOINT_RANGE_PCN_RHO),
+                    "path_pcn_rho": float(COSMIC_JOINT_PATH_PCN_RHO),
+                    "allow_underpowered_diagnostic": bool(
+                        COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                    ),
+                    "mixed_inference_engine": str(
+                        COSMIC_MIXED_INFERENCE_ENGINE
+                    ),
+                    "path_guide_rho": float(COSMIC_JOINT_PATH_GUIDE_RHO),
+                    "path_guide_probability": float(
+                        COSMIC_JOINT_PATH_GUIDE_PROBABILITY
+                    ),
+                    "guide_prior_mixture_probability": float(
+                        COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY
+                    ),
+                    "guide_initial_beta": float(
+                        COSMIC_JOINT_GUIDE_INITIAL_BETA
+                    ),
+                    "guide_iterations": int(COSMIC_JOINT_GUIDE_ITERATIONS),
+                    "guide_covariance_inflation": float(
+                        COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION
+                    ),
+                    "guide_prior_screen_draws": int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS
+                    ),
+                    "guide_prior_screen_refits": int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS
+                    ),
+                    "guide_prior_screen_random_seed": int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED
+                    ),
+                    "guide_laplace_uniform_mixture_probability": float(
+                        COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY
+                    ),
+                    "guide_range_profile_cycles": int(
+                        COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES
+                    ),
+                    "global_feedback_cycles": int(
+                        COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES
+                    ),
+                    "modes_per_plane": int(COSMIC_COHERENT_MODES_PER_PLANE),
+                    "uses_discrete_range_grid": False,
+                    "uses_event_truth": False,
+                    "uses_empirical_mcs_scale": False,
+                },
                 "coherent_fisher_configuration": {
                     "implementation": str(MCS_COHERENT_IMPLEMENTATION),
                     "modes_per_plane": int(MCS_PROCESS_MODES_PER_PLANE),
@@ -16837,6 +21697,18 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "x": [result["values"]["x0"] for result in ordered],
             "y": [result["values"]["y0"] for result in ordered],
             "z": [result["values"]["z0"] for result in ordered],
+            "raw_x": [
+                float(result.get("raw_values", result["values"])["x0"])
+                for result in ordered
+            ],
+            "raw_y": [
+                float(result.get("raw_values", result["values"])["y0"])
+                for result in ordered
+            ],
+            "raw_z": [
+                float(result.get("raw_values", result["values"])["z0"])
+                for result in ordered
+            ],
             "cx": [result["values"]["cx"] for result in ordered],
             "cy": [result["values"]["cy"] for result in ordered],
             "cz": [result["values"]["cz"] for result in ordered],
@@ -16846,6 +21718,27 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             ],
             "full_range": [
                 result["values"]["full_range"] for result in ordered
+            ],
+            "initial_kinetic_energy_mev": [
+                float(result["values"].get(
+                    "initial_kinetic_energy_mev", math.nan
+                ))
+                for result in ordered
+            ],
+            "z_range": [
+                float(result["values"].get("z_range", math.nan))
+                for result in ordered
+            ],
+            "range_equivalent_ke_mev": ke0_values,
+            "initial_kinetic_energy_error_mev": [
+                float(result["errors"].get(
+                    "initial_kinetic_energy_mev", math.nan
+                ))
+                for result in ordered
+            ],
+            "full_range_error_mm": [
+                float(result["errors"].get("full_range", math.nan))
+                for result in ordered
             ],
             "range_constraint_status": [
                 str(result.get("range_constraint_status", "not_applicable"))
@@ -17103,6 +21996,22 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             ],
             "ke0": ke0_values,
             "t": [result["values"]["t0"] for result in ordered],
+            "raw_t": [
+                float(result.get("raw_values", result["values"])["t0"])
+                for result in ordered
+            ],
+            "longitudinal_gauge_applied": [
+                bool(result.get("longitudinal_gauge", {}).get("applied", False))
+                for result in ordered
+            ],
+            "longitudinal_gauge_translation_mm": [
+                float(
+                    result.get("longitudinal_gauge", {}).get(
+                        "translation_mm", 0.0
+                    )
+                )
+                for result in ordered
+            ],
             "prompt_time_min_ns": [
                 result["prompt_time_min_ns"] for result in ordered
             ],
@@ -17115,7 +22024,19 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 result["event_fit_wall_s"] for result in ordered
             ],
             "total_nfcn": [result["total_nfcn"] for result in ordered],
+            "multilateration_guided_full_bank_fallback": [
+                bool(result.get(
+                    "multilateration_guided_full_bank_fallback", False
+                ))
+                for result in ordered
+            ],
+            "mcs_status": [
+                str(result.get("mcs_status", "not_requested"))
+                for result in ordered
+            ],
+            "mcs_failure": [result.get("mcs_failure") for result in ordered],
         }
+        _append_event_status_columns(output, ordered)
         if SAVE_DETAILED_EVENT_RESULTS:
             output["results"] = ordered
             output["errors"] = [dict(result.get("errors", {})) for result in ordered]
@@ -17148,6 +22069,32 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             output["quadratic_warning_count"] = [
                 int(result.get("quadratic_warning_count", 0)) for result in ordered
             ]
+        if WCSIM_VISIBLE_RANGE_CONVENTION is None:
+            output["metadata"]["wcsim_visible_range_convention"] = {
+                "enabled": False,
+                "reason": "no reporting-calibration manifest requested",
+            }
+        else:
+            raw_visible = np.asarray(output["visible_length"], dtype=np.float64)
+            range_energy = np.asarray(ke0_values, dtype=np.float64)
+            accepted = np.asarray(output["fit_accepted"], dtype=bool)
+            valid = accepted & np.isfinite(raw_visible) & np.isfinite(range_energy)
+            correction = np.full(raw_visible.shape, np.nan, dtype=np.float64)
+            corrected = np.full(raw_visible.shape, np.nan, dtype=np.float64)
+            if np.any(valid):
+                correction[valid] = WCSIM_VISIBLE_RANGE_CONVENTION.correction_mm(
+                    range_energy[valid]
+                )
+                corrected[valid] = (
+                    WCSIM_VISIBLE_RANGE_CONVENTION.corrected_visible_length_mm(
+                        raw_visible[valid], range_energy[valid]
+                    )
+                )
+            output["wcsim_visible_range_correction_mm"] = correction.tolist()
+            output["visible_length_wcsim"] = corrected.tolist()
+            output["metadata"]["wcsim_visible_range_convention"] = (
+                WCSIM_VISIBLE_RANGE_CONVENTION.provenance()
+            )
         return output
 
 
@@ -17239,7 +22186,13 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         if not COSMIC_CHILD_QUIET:
             if VERBOSE_SETUP:
                 print("LicketyFit WCSim cosmic run")
-                print("  driver release:", DRIVER_RELEASE)
+                print(
+                    "  public release:",
+                    os.environ.get(
+                        "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                    ),
+                )
+                print("  embedded engine revision:", DRIVER_RELEASE)
                 print("  detector mode:", DETECTOR_MODE)
                 print("  particle hypothesis:", FIT_PARTICLE)
                 print("  sample energy label [MeV]:", float(ENERGY_TRUE))
@@ -17304,7 +22257,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             else:
                 worker_label = "worker" if int(NPROC) == 1 else "workers"
                 print(
-                    f"LicketyFit cosmic: fitting {n_events} event"
+                    f"LicketyFit general: fitting {n_events} event"
                     f"{'s' if n_events != 1 else ''} with {int(NPROC)} "
                     f"{worker_label}",
                     flush=True,
@@ -17325,30 +22278,99 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
 
         results = []
         fit_loop_start = time.perf_counter()
-        event_indices = list(range(n_events))
         event_pool = _create_persistent_event_pool(n_events)
         try:
-            results = run_event_batch_multiprocess(
-                event_indices, event_pool=event_pool
-            )
+            for batch_start in range(0, n_events, int(N_EVENTS_PER_BATCH)):
+                batch_end = min(
+                    batch_start + int(N_EVENTS_PER_BATCH), n_events
+                )
+                batch_wall0 = time.perf_counter()
+                batch_results = run_event_batch_multiprocess(
+                    list(range(batch_start, batch_end)), event_pool=event_pool
+                )
+                results.extend(batch_results)
+                results.sort(key=lambda item: int(item["event_index"]))
+                batch_wall_s = float(time.perf_counter() - batch_wall0)
+
+                if PRINT_EVENT_RESULTS:
+                    for offset, result in enumerate(batch_results, start=1):
+                        print_event_result(
+                            result,
+                            completed=batch_start + offset,
+                            total=n_events,
+                        )
+                        source_id = int(
+                            source_start + int(result["event_index"])
+                        )
+                        _print_optional_wcsim_truth(truth_records.get(source_id))
+                if PRINT_BATCH_PROGRESS and not COSMIC_CHILD_QUIET:
+                    print(
+                        f"  completed batch [{source_start + batch_start}, "
+                        f"{source_start + batch_end}) in {batch_wall_s:.3f} s "
+                        f"({len(batch_results) / max(batch_wall_s, 1.0e-300):.2f} "
+                        "events/s)",
+                        flush=True,
+                    )
+
+                if SAVE_AFTER_EACH_BATCH:
+                    elapsed = float(time.perf_counter() - fit_loop_start)
+                    checkpoint = build_output(
+                        results,
+                        n_events_requested=n_events,
+                        setup_wall_s=setup_wall_s,
+                        warm_wall_s=warm_wall_s,
+                        fit_loop_wall_s=elapsed,
+                    )
+                    completed_source_ids = [
+                        int(source_start + int(result["event_index"]))
+                        for result in results
+                    ]
+                    checkpoint["metadata"].update({
+                        "checkpoint": bool(batch_end < n_events),
+                        "last_completed_event_exclusive": int(
+                            source_start + batch_end
+                        ),
+                        "source_event_start_index": int(source_start),
+                        "source_event_stop_exclusive": int(
+                            source_start + batch_end
+                        ),
+                        "cosmic_supervised_child": bool(
+                            COSMIC_SUPERVISED_CHILD
+                        ),
+                        "safe_process_generation_capacity": int(
+                            generation_capacity
+                        ),
+                        "process_generation_max_events": int(
+                            COSMIC_PROCESS_GENERATION_MAX_EVENTS
+                        ),
+                        "process_generation_tasks_per_worker": int(
+                            COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER
+                        ),
+                    })
+                    checkpoint["source_event_index"] = completed_source_ids
+                    if "results" in checkpoint:
+                        for local_index, result in enumerate(
+                            checkpoint["results"]
+                        ):
+                            event_index = int(
+                                result.get("event_index", local_index)
+                            )
+                            result["local_event_index"] = event_index
+                            result["source_event_index"] = int(
+                                source_start + event_index
+                            )
+                    _attach_optional_wcsim_truth(
+                        checkpoint,
+                        source_event_ids=completed_source_ids,
+                        records=truth_records,
+                        metadata=truth_metadata,
+                    )
+                    save_output(checkpoint)
         finally:
             if event_pool is not None:
                 _shutdown_event_pool(event_pool)
         fit_loop_wall_s = float(time.perf_counter() - fit_loop_start)
         results.sort(key=lambda item: int(item["event_index"]))
-
-        if PRINT_EVENT_RESULTS:
-            for completed, result in enumerate(results, start=1):
-                print_event_result(result, completed=completed, total=n_events)
-                source_id = int(source_start + int(result["event_index"]))
-                _print_optional_wcsim_truth(truth_records.get(source_id))
-        if PRINT_BATCH_PROGRESS and VERBOSE_SETUP and not COSMIC_CHILD_QUIET:
-            print(
-                f"  completed event range [{source_start}, "
-                f"{source_start + n_events}) in {fit_loop_wall_s:.3f} s "
-                f"({n_events/max(fit_loop_wall_s,1e-300):.2f} events/s)",
-                flush=True,
-            )
 
         output = build_output(
             results,
@@ -17469,9 +22491,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
     Physics-process selection is intentionally not duplicated here.  Edit the
     ``DEFAULT_ENABLE_*`` switches at the top of ``LicketyFit/Emitter.py``.  In
-    particular, ``DEFAULT_ENABLE_PRIMARY_MCS`` remains the sole MCS on/off switch;
-    turning it off disables both the optical MCS mean and every FE/KL continuation
-    stage while retaining all MCS functionality in this driver.
+    ``DEFAULT_ENABLE_PRIMARY_MCS`` selects the ordinary contained/full-length
+    primary-MCS model. ``DEFAULT_COSMIC_MCS_CONTINUATION`` independently selects
+    the geometry-clipped cosmic continuation. Both live at the top of Emitter.py.
     """
 
     # =============================================================================
@@ -17479,7 +22501,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-10-wcte-standard-v6-authoritative-pmt"
+    DRIVER_RELEASE = "2026-08-31-wcte-standard-v9-beam-seed-speed"
 
     import hashlib
     import json
@@ -17570,6 +22592,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # LicketyFit/Emitter.py:
     #   DEFAULT_ENABLE_DELTA_E
     #   DEFAULT_ENABLE_PRIMARY_MCS
+    #   DEFAULT_COSMIC_MCS_CONTINUATION
     #   DEFAULT_ENABLE_RAYLEIGH
     #   DEFAULT_ENABLE_BLACKSHEET_REFLECTION
     # The driver prints the resolved process state at startup.
@@ -17592,6 +22615,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         "MAX_EVENTS_TO_FIT", _env_optional_int("TOT_EVENTS", None)
     )
     TOT_EVENTS = MAX_EVENTS_TO_FIT
+    EVENT_START_INDEX = max(0, _env_int("LF_EVENT_START_INDEX", 0))
 
     EVENT_SOURCE = os.environ.get("EVENT_SOURCE", "selection").strip().lower()
     if EVENT_SOURCE in {"selected", "internal", "event_loader", "auto"}:
@@ -17621,7 +22645,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # remains fully available through LIKELIHOOD_MODE=charge_time or timing_only.
     FIT_PARTICLE_RAW = os.environ.get("FIT_PARTICLE", "muon").strip()
     FIT_MODE_REQUEST = os.environ.get("FIT_MODE", "full_length").strip().lower().replace("-", "_")
-    LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_only").strip().lower().replace("-", "_")
+    LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_time").strip().lower().replace("-", "_")
     USE_T0_PRIOR = _env_bool("USE_T0_PRIOR", False)
     T0_PRIOR_SIGMA_NS = _env_optional_float("T0_PRIOR_SIGMA_NS", None)
     # This is seed guidance, not truth.  Beam momentum and kinetic energy are kept
@@ -17800,6 +22824,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     GLOBAL_CHARGE_SCALE = _env_optional_float(
         "WCTE_GLOBAL_CHARGE_SCALE", DEFAULT_WCTE_GLOBAL_CHARGE_SCALE
     )
+    GLOBAL_CHARGE_CALIBRATION_ID = os.environ.get(
+        "WCTE_GLOBAL_CHARGE_CALIBRATION_ID",
+        DEFAULT_WCTE_GLOBAL_CHARGE_CALIBRATION_ID,
+    ).strip()
 
     # Run-channel and data/MC relative-efficiency calibration.
     REL_EFF_MODE = os.environ.get("REL_EFF_MODE", "slot").strip().lower().replace("-", "_")
@@ -17899,19 +22927,28 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     )
     WCTE_EXPLICIT_LENGTHS_MM = _env_float_list("WCTE_SEED_LENGTHS_MM", ())
     WCTE_BEAM_LONGITUDINAL_OFFSETS_MM = (-50.0, 0.0, 50.0)
+    WCTE_BEAM_CORE_TRANSVERSE_MAX_MM = max(
+        0.0, _env_float("WCTE_BEAM_CORE_TRANSVERSE_MAX_MM", 150.0)
+    )
     WCTE_BEAM_TRANSVERSE_OFFSETS_MM = (
         (0.0, 0.0),
         (150.0, 0.0), (-150.0, 0.0),
         (0.0, 150.0), (0.0, -150.0),
-    )
+    ) + ((
+        (300.0, 0.0), (-300.0, 0.0),
+        (0.0, 300.0), (0.0, -300.0),
+    ) if FIT_MODE_REQUEST == "full_length" else ())
     WCTE_BEAM_DIRECTION_TANGENT_OFFSETS = (
         (0.0, 0.0),
         (0.04, 0.0), (-0.04, 0.0),
         (0.0, 0.04), (0.0, -0.04),
     )
-    # Keep this True for arbitrary-direction WCTE validation. Setting it False gives
-    # the smallest beam-only proxy library.
-    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool("WCTE_INCLUDE_ORIENTATION_GUARD", True)
+    # Beam mode is intentionally a compact beam-pipe search.  Absorption keeps
+    # the broad guard by default because its abrupt light pattern can be more
+    # ambiguous.  Experts can opt the guard back into beam studies explicitly.
+    WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool(
+        "WCTE_INCLUDE_ORIENTATION_GUARD", FIT_MODE_REQUEST != "full_length"
+    )
     WCTE_GUARD_DIRECTION_FIBONACCI = _env_int("WCTE_GUARD_DIRECTION_FIBONACCI", 14)
     WCTE_GUARD_ENTRY_INSETS_MM = (200.0, 350.0, 550.0)
     WCTE_GUARD_TRANSVERSE_OFFSETS_MM = (
@@ -17923,13 +22960,34 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # the high-resolution default for beam events, while this library guarantees
     # interior-vertex and full-sphere coverage for calibration, validation and IWCD-
     # style topologies.  It is built from detector geometry only.
-    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool("WCTE_INCLUDE_DETECTOR_GLOBAL", True)
+    WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool(
+        "WCTE_INCLUDE_DETECTOR_GLOBAL", FIT_MODE_REQUEST != "full_length"
+    )
     WCTE_GLOBAL_VERTEX_SPACING_MM = _env_float("WCTE_GLOBAL_SEED_SPACING_MM", 700.0)
     WCTE_GLOBAL_WALL_MARGIN_MM = _env_float("WCTE_GLOBAL_SEED_WALL_MARGIN_MM", 100.0)
     WCTE_GLOBAL_MAX_SEEDS = _env_int("WCTE_GLOBAL_MAX_SEEDS", 20_000)
     WCTE_GLOBAL_DIRECTION_FIBONACCI = _env_int("WCTE_GLOBAL_DIRECTION_FIBONACCI", 14)
     WCTE_GLOBAL_LENGTH_FACTORS = _env_float_list(
         "WCTE_GLOBAL_SEED_LENGTH_FACTORS", (0.25, 0.50, 0.75, 1.00, 1.25, 1.50)
+    )
+    # Abrupt endpoints need genuinely short visible-track hypotheses even when
+    # the incident-particle range is large. These geometry-scaled anchors and
+    # their likelihood-only basin challenges match the WCSim standard engine.
+    ABSORPTION_VISIBLE_LENGTH_FRACTIONS = _env_float_list(
+        "ABSORPTION_VISIBLE_LENGTH_FRACTIONS",
+        (0.018, 0.036, 0.064, 0.10, 0.143, 0.214, 0.321, 0.429),
+    )
+    ABSORPTION_LENGTH_CHALLENGE_CANDIDATES = max(
+        0, _env_int("ABSORPTION_LENGTH_CHALLENGE_CANDIDATES", 4)
+    )
+    ABSORPTION_EXACT_CHALLENGE_BASINS = max(
+        0, _env_int("ABSORPTION_EXACT_CHALLENGE_BASINS", 2)
+    )
+    ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW = _env_float(
+        "ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW", 250.0
+    )
+    ABSORPTION_EXACT_MIN_LOG_SEPARATION = _env_float(
+        "ABSORPTION_EXACT_MIN_LOG_SEPARATION", 0.18
     )
     WCTE_GLOBAL_PROXY_CANDIDATES = _env_int("WCTE_GLOBAL_PROXY_CANDIDATES", 8)
     WCTE_GLOBAL_CHALLENGE_CANDIDATES = _env_int("WCTE_GLOBAL_CHALLENGE_CANDIDATES", 2)
@@ -17960,18 +23018,50 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     T0_LIMITS = (_env_float("T0_MIN", -8.0), _env_float("T0_MAX", 8.0))
     PROXY_CANDIDATES = _env_int("GLOBAL_PROXY_CANDIDATES", 8)
     WCTE_BEAM_PROXY_CANDIDATES = _env_int("WCTE_BEAM_PROXY_CANDIDATES", 8)
+    WCTE_BEAM_OUTER_PROXY_CANDIDATES = max(
+        0, _env_int("WCTE_BEAM_OUTER_PROXY_CANDIDATES", 4)
+    )
     WCTE_GUARD_CHALLENGE_CANDIDATES = _env_int("WCTE_GUARD_CHALLENGE_CANDIDATES", 2)
     JOINT_EXACT_SWEEPS = _env_int("JOINT_EXACT_SWEEPS", 2)
     JOINT_FULL_CROSS_SWEEPS = _env_int("JOINT_FULL_CROSS_SWEEPS", 1)
     JOINT_PROFILE_T0 = _env_bool("JOINT_PROFILE_T0", False)
-    # Continue the exact optimizer only when its final scheduled sweep is still
-    # making a substantial NLL improvement. This targets rare unconverged tails
-    # without paying extra sweeps on well-converged events.
+    # Continue the unchanged exact optimizer one sweep at a time only while its
+    # last accepted exact-NLL decrease exceeds the convergence threshold.  The
+    # cap counts base plus continuation sweeps.  The historical *_SWEEPS setting
+    # remains an accepted alias for the new explicit maximum-total setting.
+    # See the standard-WCSim branch above.  Exact continuation remains fully
+    # available and diagnosed, but is opt-in because it is accuracy work rather
+    # than a result-identical speed optimization.
     ADAPTIVE_EXACT_POLISH = _env_bool("ADAPTIVE_EXACT_POLISH", False)
     ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT = _env_float(
-        "ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT", 2.5
+        "ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT", 1.0e-3
     )
-    ADAPTIVE_EXACT_POLISH_SWEEPS = _env_int("ADAPTIVE_EXACT_POLISH_SWEEPS", 1)
+    _ADAPTIVE_EXACT_TOTAL_RAW = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS", ""
+    ).strip()
+    _ADAPTIVE_EXACT_LEGACY_EXTRA_RAW = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_SWEEPS", ""
+    ).strip()
+    ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS = max(
+        1, _env_int("ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS", 12)
+    )
+    ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS = (
+        max(0, int(float(_ADAPTIVE_EXACT_LEGACY_EXTRA_RAW)))
+        if _ADAPTIVE_EXACT_LEGACY_EXTRA_RAW and not _ADAPTIVE_EXACT_TOTAL_RAW
+        else None
+    )
+    ADAPTIVE_EXACT_POLISH_SWEEPS = ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS
+    ADAPTIVE_EXACT_POLISH_BACKEND = os.environ.get(
+        "ADAPTIVE_EXACT_POLISH_BACKEND", "cobyqa"
+    ).strip().lower().replace("-", "_")
+    if ADAPTIVE_EXACT_POLISH_BACKEND not in {"cobyqa", "block"}:
+        raise ValueError("ADAPTIVE_EXACT_POLISH_BACKEND must be cobyqa or block")
+    ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS = max(
+        1, _env_int("ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS", 240)
+    )
+    ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS = max(
+        0, _env_int("ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS", 2)
+    )
     WCTE_SKIP_BROAD_PROXY_OPTIMIZATION = _env_bool("WCTE_SKIP_BROAD_PROXY_OPTIMIZATION", True)
     PROXY_SWEEPS = _env_int("GLOBAL_PROXY_SWEEPS", 1)
     EXACT_CHARGE_SWEEPS = _env_int("EXACT_CHARGE_SWEEPS", 3)
@@ -18024,8 +23114,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     PHOTON_SCATTER_NATIVE_RECEIVER = _env_bool(
         "EMITTER_PHOTON_SCATTER_NATIVE_RECEIVER", True
     )
+    _PHOTON_SCATTER_NATIVE_THREADS_DEFAULT = 4 if NPROC == 1 else 1
     PHOTON_SCATTER_NATIVE_THREADS = max(
-        1, _env_int("EMITTER_PHOTON_SCATTER_NATIVE_THREADS", 1)
+        1,
+        _env_int(
+            "EMITTER_PHOTON_SCATTER_NATIVE_THREADS",
+            _PHOTON_SCATTER_NATIVE_THREADS_DEFAULT,
+        ),
     )
     PHOTON_SCATTER_NATIVE_REQUIRED = _env_bool(
         "EMITTER_PHOTON_SCATTER_NATIVE_REQUIRED", False
@@ -18053,8 +23148,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # use the validated four-thread compiled FALI kernel. In multiprocessing mode
     # explicitly force the generic GNU OpenMP pool to one thread as well; the pool
     # is created before any OpenMP-backed kernel is executed in the parent.
-    os.environ.setdefault(
-        "NUMBA_NUM_THREADS", str(int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED))
+    _MCS_COHERENT_NUMBA_THREADS_REQUESTED = _prepare_numba_thread_budget(
+        _MCS_COHERENT_NUMBA_THREADS_REQUESTED
     )
     if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -18098,19 +23193,35 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     # regression tests. The coherent-Fisher controls are numerical quadrature and
     # local trust-region choices, not empirical MCS scales.
     MCS_TIMING_POLICY = os.environ.get("MCS_PROCESS_TIMING_POLICY", "fe_prior_transverse").strip().lower().replace("-", "_")
-    MCS_PROCESS_MODES_PER_PLANE = _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
-    MCS_PROCESS_GRID_POINTS = _env_int("MCS_PROCESS_GRID_POINTS", 41)
+    _MCS_PROCESS_MODES_PER_PLANE_TEXT = os.environ.get(
+        "MCS_PROCESS_MODES_PER_PLANE", ""
+    ).strip()
+    MCS_COHERENT_IMPLEMENTATION = os.environ.get(
+        "MCS_COHERENT_IMPLEMENTATION", "physics_reference"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_IMPLEMENTATION not in {
+        "physics_reference", "fast12_profile", "legacy_fisher"
+    }:
+        raise ValueError(
+            "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
+            "fast12_profile, or legacy_fisher"
+        )
+    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    MCS_PROCESS_GRID_POINTS = _env_int(
+        "MCS_PROCESS_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
+    )
     MCS_FD_XYZ_MM = _env_float("MCS_PROCESS_CHARGE_FD_XYZ_MM", 1.0)
     MCS_FD_DIRECTION = _env_float("MCS_PROCESS_CHARGE_FD_DIRECTION", 2.0e-4)
     MCS_FD_LENGTH_MM = _env_float("MCS_PROCESS_CHARGE_FD_LENGTH_MM", 1.0)
     MCS_TIMING_SWEEPS = _env_int("MCS_PROCESS_TIMING_SWEEPS", 2)
 
-    # Validated fast defaults. Relative to the conservative 81-point/32-node
-    # reference, the 41-point FALI path and 24-node global Gauss--Legendre timing
-    # integral change reconstructed coordinates by far below the detector resolution
-    # while cutting the coherent continuation cost substantially. The conservative
-    # settings remain available through the same environment variables.
-    MCS_COHERENT_GRID_POINTS = _env_int("MCS_COHERENT_GRID_POINTS", 41)
+    # Fast12 uses the same validated 41-point numerical budget as the general
+    # engine.  The physics-reference implementation retains its mandatory
+    # 241-point convergence grid.  Explicit environment overrides remain
+    # available and are checked by validate_coherent_configuration below.
+    MCS_COHERENT_GRID_POINTS = _env_int(
+        "MCS_COHERENT_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
+    )
     MCS_COHERENT_TIMING_QUADRATURE_NODES = _env_int(
         "MCS_COHERENT_TIMING_QUADRATURE_NODES", 24
     )
@@ -18124,15 +23235,66 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     MCS_COHERENT_APPLY_EXPECTED_CONTRACTION = _env_bool(
         "MCS_COHERENT_APPLY_EXPECTED_CONTRACTION", False
     )
-    MCS_COHERENT_IMPLEMENTATION = os.environ.get(
-        "MCS_COHERENT_IMPLEMENTATION", "fast12_profile"
-    ).strip().lower().replace("-", "_")
-    if MCS_COHERENT_IMPLEMENTATION not in {"fast12_profile", "legacy_fisher"}:
-        raise ValueError(
-            "MCS_COHERENT_IMPLEMENTATION must be fast12_profile or legacy_fisher"
-        )
+    MCS_PROCESS_MODES_PER_PLANE = (
+        _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+        if _MCS_PROCESS_MODES_PER_PLANE_TEXT
+        else default_coherent_modes_per_plane(MCS_COHERENT_IMPLEMENTATION)
+    )
     MCS_COHERENT_LATENT_MAX_ITERATIONS = _env_int(
-        "MCS_COHERENT_LATENT_MAX_ITERATIONS", 4
+        "MCS_COHERENT_LATENT_MAX_ITERATIONS",
+        20 if _FAST12_NUMERICAL_DEFAULTS else 160,
+    )
+    MCS_COHERENT_LATENT_SOLVER = os.environ.get(
+        "MCS_COHERENT_LATENT_SOLVER", "physics_response"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_LATENT_SOLVER not in {
+        "physics_response", "derivative_free", "analytic"
+    }:
+        raise ValueError(
+            "MCS_COHERENT_LATENT_SOLVER must be physics_response, "
+            "derivative_free, or analytic"
+        )
+    MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS = _env_int(
+        "MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS", 600
+    )
+    MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS", 0.0003
+    )
+    MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS = _env_int(
+        "MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS", 12
+    )
+    MCS_PHYSICS_MULTIGRID_INITIALIZER = _env_bool(
+        "MCS_PHYSICS_MULTIGRID_INITIALIZER", True
+    )
+    MCS_PHYSICS_MULTIGRID_GRID_POINTS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_GRID_POINTS", 121
+    )
+    MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS", 40
+    )
+    MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS", 20
+    )
+    MCS_PHYSICS_RESPONSE_GRID_POINTS = _env_int(
+        "MCS_PHYSICS_RESPONSE_GRID_POINTS", 81
+    )
+    MCS_PHYSICS_RESPONSE_PRIMARY_TRUST = _env_float(
+        "MCS_PHYSICS_RESPONSE_PRIMARY_TRUST", 1.0
+    )
+    MCS_PHYSICS_RESPONSE_SECONDARY_TRUST = _env_float(
+        "MCS_PHYSICS_RESPONSE_SECONDARY_TRUST", 1.5
+    )
+    MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS", 12
+    )
+    MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS", 40
+    )
+    MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS = _env_int(
+        "MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS", 4
+    )
+    MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT = _env_bool(
+        "MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT", True
     )
     MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS = _env_int(
         "MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS", 2
@@ -18147,312 +23309,37 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM = _env_float(
         "MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM", 100.0
     )
-    MCS_COHERENT_NUMBA_THREADS = int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED)
-
-    # -------------------------------------------------------------------------
-    # Latest shared cosmic navigation/core controls.  These are intentionally
-    # identical to the WCSim cosmic branch.  Real-WCTE differences remain
-    # confined to event loading, surveyed placement, channel masks, ADC/PE
-    # conversion, timing reference, and relative mPMT efficiencies.
-    # -------------------------------------------------------------------------
-    COSMIC_COMPACT_FIXED_NAVIGATION = _env_bool(
-        "COSMIC_COMPACT_FIXED_NAVIGATION", True
+    MCS_COHERENT_GLOBAL_MAX_EVALUATIONS = _env_int(
+        "MCS_COHERENT_GLOBAL_MAX_EVALUATIONS", 300
     )
-    WCTE_UNIVERSAL_LENGTH_FRACTIONS = _env_float_list(
-        "WCTE_UNIVERSAL_SEED_LENGTH_FRACTIONS",
-        (0.02, 0.045, 0.10, 0.22, 0.42, 0.68, 0.96),
+    MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS", 1.0
     )
-    WCTE_GUARD_ENTRY_INSETS_MM = tuple(_env_float_list(
-        "WCTE_GUARD_ENTRY_INSETS_MM", (0.5,)
-    ))
-    WCTE_GUARD_TRANSVERSE_OFFSETS_MM = (
-        (0.0, 0.0),
-        (700.0, 0.0), (-700.0, 0.0),
-        (0.0, 700.0), (0.0, -700.0),
+    MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS", 0.02
     )
-    WCTE_GUARD_CHORD_FRACTIONS = _env_float_list(
-        "WCTE_GUARD_CHORD_FRACTIONS", (0.45, 0.85, 1.0)
-    )
-    WCTE_GLOBAL_MAX_SEEDS = _env_int("WCTE_GLOBAL_MAX_SEEDS", 7000)
-    AUTO_BOUNDARY_DIRECTION_FIBONACCI = _env_int(
-        "AUTO_BOUNDARY_DIRECTION_FIBONACCI", 14
-    )
-    AUTO_BOUNDARY_TRANSVERSE_OFFSETS_MM = (
-        (0.0, 0.0),
-        (750.0, 0.0), (-750.0, 0.0),
-        (0.0, 750.0), (0.0, -750.0),
-    )
-    AUTO_BOUNDARY_RANGE_FRACTIONS = tuple(_env_float_list(
-        "AUTO_BOUNDARY_RANGE_FRACTIONS", (0.35, 0.75, 1.0, 2.0)
-    ))
-
-    COSMIC_CAUSAL_TIMING_GUARD = _env_bool("COSMIC_CAUSAL_TIMING_GUARD", True)
-    COSMIC_CAUSAL_DIRECTION_COUNT = max(24, _env_int(
-        "COSMIC_CAUSAL_DIRECTION_COUNT", 72
-    ))
-    COSMIC_CAUSAL_RETAINED_LINES = max(2, _env_int(
-        "COSMIC_CAUSAL_RETAINED_LINES", 4
-    ))
-    COSMIC_CAUSAL_REFINEMENT_ROUNDS = max(0, _env_int(
-        "COSMIC_CAUSAL_REFINEMENT_ROUNDS", 2
-    ))
-    COSMIC_CAUSAL_MAX_HITS = max(32, _env_int(
-        "COSMIC_CAUSAL_MAX_HITS", 360
-    ))
-    COSMIC_CAUSAL_POOL_SEEDS = max(16, _env_int(
-        "COSMIC_CAUSAL_POOL_SEEDS", 64
-    ))
-    COSMIC_CAUSAL_MAX_SEEDS = max(0, _env_int(
-        "COSMIC_CAUSAL_MAX_SEEDS", 4
-    ))
-    COSMIC_CAUSAL_MAX_PER_TOPOLOGY = max(1, _env_int(
-        "COSMIC_CAUSAL_MAX_PER_TOPOLOGY", 2
-    ))
-    COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS = max(1, _env_int(
-        "COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS", 2
-    ))
-
-    COSMIC_TWO_ANCHOR_REFINEMENT = _env_bool(
-        "COSMIC_TWO_ANCHOR_REFINEMENT", True
-    )
-    COSMIC_TWO_ANCHOR_SWEEPS = max(1, _env_int(
-        "COSMIC_TWO_ANCHOR_SWEEPS", 3
-    ))
-    COSMIC_TWO_ANCHOR_MIN_IMPROVEMENT_NLL = _env_float(
-        "COSMIC_TWO_ANCHOR_MIN_IMPROVEMENT_NLL", 0.5
-    )
-    COSMIC_TWO_ANCHOR_MIN_VISIBLE_MM = _env_float(
-        "COSMIC_TWO_ANCHOR_MIN_VISIBLE_MM", 250.0
-    )
-    COSMIC_DIRECTION_FAN_ENABLED = _env_bool(
-        "COSMIC_DIRECTION_FAN_ENABLED", True
-    )
-    COSMIC_DIRECTION_FAN_RADII_DEG = _env_float_list(
-        "COSMIC_DIRECTION_FAN_RADII_DEG", (1.0, 2.5, 5.0)
-    )
-    COSMIC_DIRECTION_FAN_AZIMUTHS = max(
-        4, _env_int("COSMIC_DIRECTION_FAN_AZIMUTHS", 8)
-    )
-    COSMIC_DIRECTION_FAN_EXACT_CANDIDATES = max(
-        1, _env_int("COSMIC_DIRECTION_FAN_EXACT_CANDIDATES", 2)
-    )
-    COSMIC_DIRECTION_FAN_CONTINUATION_SWEEPS = max(
-        1, _env_int("COSMIC_DIRECTION_FAN_CONTINUATION_SWEEPS", 1)
-    )
-    COSMIC_DIRECTION_FAN_MIN_IMPROVEMENT_NLL = _env_float(
-        "COSMIC_DIRECTION_FAN_MIN_IMPROVEMENT_NLL", 0.25
-    )
-
-    COSMIC_BOUNDARY_CAUSAL_POLISH_ENABLED = _env_bool(
-        "COSMIC_BOUNDARY_CAUSAL_POLISH_ENABLED", False
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_MAX_HITS = max(
-        24, _env_int("COSMIC_BOUNDARY_CAUSAL_POLISH_MAX_HITS", 120)
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_EARLIEST_FRACTION = _env_float(
-        "COSMIC_BOUNDARY_CAUSAL_POLISH_EARLIEST_FRACTION", 0.72
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_ROUNDS = max(
-        1, _env_int("COSMIC_BOUNDARY_CAUSAL_POLISH_ROUNDS", 3)
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_TRANSVERSE_MM = _env_float(
-        "COSMIC_BOUNDARY_CAUSAL_POLISH_TRANSVERSE_MM", 90.0
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_DIRECTION_DEG = _env_float(
-        "COSMIC_BOUNDARY_CAUSAL_POLISH_DIRECTION_DEG", 3.0
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_RETAINED_LINES = max(
-        2, _env_int("COSMIC_BOUNDARY_CAUSAL_POLISH_RETAINED_LINES", 6)
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_EXACT_CANDIDATES = max(
-        1, _env_int("COSMIC_BOUNDARY_CAUSAL_POLISH_EXACT_CANDIDATES", 2)
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_SWEEPS = max(
-        1, _env_int("COSMIC_BOUNDARY_CAUSAL_POLISH_SWEEPS", 1)
-    )
-    COSMIC_BOUNDARY_CAUSAL_POLISH_MIN_IMPROVEMENT_NLL = _env_float(
-        "COSMIC_BOUNDARY_CAUSAL_POLISH_MIN_IMPROVEMENT_NLL", 0.25
-    )
-    COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG = _env_float(
-        "COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG", 4.0
-    )
-    AUTO_RANGE_CLOSE_BOTH_START_HYPOTHESES = _env_bool(
-        "AUTO_RANGE_CLOSE_BOTH_START_HYPOTHESES", True
-    )
-
-    # Analytic WCTE mPMT interface subclasses.  The physical constants and
-    # statistical selection are shared with WCSim; surveyed geometry and the
-    # run's active-channel mask are supplied by the real-data adapter.
-    COSMIC_MPMT_BOUNDARY_ENABLED = _env_bool(
-        "COSMIC_MPMT_BOUNDARY_ENABLED", True
-    )
-    COSMIC_MPMT_MAX_SLOTS_PER_INTERFACE = max(0, _env_int(
-        "COSMIC_MPMT_MAX_SLOTS_PER_INTERFACE", 2
-    ))
-    COSMIC_MPMT_MAX_JOINT_HYPOTHESES = max(0, _env_int(
-        "COSMIC_MPMT_MAX_JOINT_HYPOTHESES", 1
-    ))
-    COSMIC_MPMT_MIN_POSITIVE_DEVIANCE = _env_float(
-        "COSMIC_MPMT_MIN_POSITIVE_DEVIANCE", 8.0
-    )
-    COSMIC_MPMT_MIN_POSITIVE_RESIDUAL_PE = _env_float(
-        "COSMIC_MPMT_MIN_POSITIVE_RESIDUAL_PE", 4.0
-    )
-    COSMIC_MPMT_PROXIMITY_MARGIN_MM = _env_float(
-        "COSMIC_MPMT_PROXIMITY_MARGIN_MM", 140.0
-    )
-    COSMIC_MPMT_RESIDUAL_PROXIMITY_MARGIN_MM = _env_float(
-        "COSMIC_MPMT_RESIDUAL_PROXIMITY_MARGIN_MM", 260.0
-    )
-    COSMIC_MPMT_MAX_SEEDS_PER_HYPOTHESIS = max(1, _env_int(
-        "COSMIC_MPMT_MAX_SEEDS_PER_HYPOTHESIS", 6
-    ))
-    COSMIC_MPMT_PROBE_SEEDS = max(1, _env_int(
-        "COSMIC_MPMT_PROBE_SEEDS", 2
-    ))
-    COSMIC_MPMT_PROBE_SWEEPS = max(1, _env_int(
-        "COSMIC_MPMT_PROBE_SWEEPS", 1
-    ))
-    COSMIC_MPMT_FINAL_SWEEPS = max(1, _env_int(
-        "COSMIC_MPMT_FINAL_SWEEPS", 1
-    ))
-    COSMIC_MPMT_MAX_TOTAL_FRACTION = _env_float(
-        "COSMIC_MPMT_MAX_TOTAL_FRACTION", 0.35
-    )
-    COSMIC_MPMT_AMPLITUDE_CAP_MULTIPLIER = _env_float(
-        "COSMIC_MPMT_AMPLITUDE_CAP_MULTIPLIER", 4.0
-    )
-    COSMIC_MPMT_MIN_PENALIZED_GAIN_NLL = _env_float(
-        "COSMIC_MPMT_MIN_PENALIZED_GAIN_NLL", 0.0
-    )
-    COSMIC_MPMT_COARSENED_MIN_PENALIZED_GAIN_NLL = _env_float(
-        "COSMIC_MPMT_COARSENED_MIN_PENALIZED_GAIN_NLL", 0.0
-    )
-    COSMIC_MPMT_GLOBAL_AUTHORITATIVE_GAIN_NLL = max(0.0, _env_float(
-        "COSMIC_MPMT_GLOBAL_AUTHORITATIVE_GAIN_NLL", 6.0
-    ))
-    COSMIC_MPMT_MIN_PROFILED_HARDWARE_FRACTION = max(0.0, _env_float(
-        "COSMIC_MPMT_MIN_PROFILED_HARDWARE_FRACTION", 0.002
-    ))
-    COSMIC_MPMT_MIN_PROFILED_HARDWARE_PE = max(0.0, _env_float(
-        "COSMIC_MPMT_MIN_PROFILED_HARDWARE_PE", 8.0
-    ))
-    COSMIC_MPMT_WCPMT_MIN_SINGLE_DEVIANCE_NLL = _env_float(
-        "COSMIC_MPMT_WCPMT_MIN_SINGLE_DEVIANCE_NLL", 12.0
-    )
-    COSMIC_MPMT_WCPMT_MIN_CONCENTRATION = float(np.clip(_env_float(
-        "COSMIC_MPMT_WCPMT_MIN_CONCENTRATION", 0.30
-    ), 0.0, 1.0))
-    COSMIC_MPMT_LOCAL_MIN_PENALIZED_GAIN_NLL = _env_float(
-        "COSMIC_MPMT_LOCAL_MIN_PENALIZED_GAIN_NLL", 6.0
-    )
-    COSMIC_MPMT_LOCAL_MIN_BALANCED_GAIN_PER_PE = _env_float(
-        "COSMIC_MPMT_LOCAL_MIN_BALANCED_GAIN_PER_PE", 0.02
-    )
-    COSMIC_MPMT_DISCOVERY_DISABLE_PHOTON_SCATTER = _env_bool(
-        "COSMIC_MPMT_DISCOVERY_DISABLE_PHOTON_SCATTER", True
-    )
-    COSMIC_MPMT_EXACT_RERANK = _env_bool(
-        "COSMIC_MPMT_EXACT_RERANK", True
-    )
-    COSMIC_MPMT_TIMING_POLICY = os.environ.get(
-        "COSMIC_MPMT_TIMING_POLICY", "mask_module"
-    ).strip().lower()
-    if COSMIC_MPMT_TIMING_POLICY not in {"mask_module", "charge_only"}:
+    MCS_COHERENT_GLOBAL_PROFILE_MODE = os.environ.get(
+        "MCS_COHERENT_GLOBAL_PROFILE_MODE", "conditional"
+    ).strip().lower().replace("-", "_")
+    if MCS_COHERENT_GLOBAL_PROFILE_MODE not in {
+        "conditional", "fisher_laplace", "joint_exact"
+    }:
         raise ValueError(
-            "COSMIC_MPMT_TIMING_POLICY must be mask_module or charge_only"
+            "MCS_COHERENT_GLOBAL_PROFILE_MODE must be conditional, "
+            "fisher_laplace, or joint_exact"
         )
-    COSMIC_MPMT_TIMING_POLISH_SWEEPS = max(0, _env_int(
-        "COSMIC_MPMT_TIMING_POLISH_SWEEPS", 1
-    ))
-    COSMIC_MPMT_TIMING_MAX_CHARGE_DEGRADATION_NLL = _env_float(
-        "COSMIC_MPMT_TIMING_MAX_CHARGE_DEGRADATION_NLL", 4.0
+    MCS_COHERENT_JOINT_MAX_CYCLES = _env_int(
+        "MCS_COHERENT_JOINT_MAX_CYCLES", 3
     )
-    COSMIC_MPMT_TIMING_REFINE_ENTRY_RANGE = _env_bool(
-        "COSMIC_MPMT_TIMING_REFINE_ENTRY_RANGE", True
+    MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS = _env_float(
+        "MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS", 0.005
     )
-    COSMIC_MPMT_TIMING_RANGE_HALF_WIDTH_MM = max(0.0, _env_float(
-        "COSMIC_MPMT_TIMING_RANGE_HALF_WIDTH_MM", 250.0
-    ))
-    COSMIC_MPMT_TIMING_REFINE_ENTRY_GEOMETRY = _env_bool(
-        "COSMIC_MPMT_TIMING_REFINE_ENTRY_GEOMETRY", False
+    MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS = _env_int(
+        "MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS", 3
     )
-    COSMIC_MPMT_CONFIG_KWARGS = {
-        "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
-        "max_slots_per_interface": int(COSMIC_MPMT_MAX_SLOTS_PER_INTERFACE),
-        "proximity_margin_mm": float(COSMIC_MPMT_PROXIMITY_MARGIN_MM),
-        "residual_proximity_margin_mm": float(
-            COSMIC_MPMT_RESIDUAL_PROXIMITY_MARGIN_MM
-        ),
-        "minimum_positive_deviance": float(COSMIC_MPMT_MIN_POSITIVE_DEVIANCE),
-        "minimum_positive_residual_pe": float(
-            COSMIC_MPMT_MIN_POSITIVE_RESIDUAL_PE
-        ),
-        "timing_policy": str(COSMIC_MPMT_TIMING_POLICY),
-        "max_total_hardware_fraction": float(COSMIC_MPMT_MAX_TOTAL_FRACTION),
-        "minimum_penalized_gain_nll": float(
-            COSMIC_MPMT_MIN_PENALIZED_GAIN_NLL
-        ),
-    }
-
-    # Retained research continuations; both remain off by default and are
-    # isolated from the validated straight cosmic production path.
-    COSMIC_FERMI_EYGES_ENABLED = _env_bool(
-        "COSMIC_FERMI_EYGES_ENABLED", False
+    MCS_COHERENT_JOINT_MODEL_CACHE_SIZE = _env_int(
+        "MCS_COHERENT_JOINT_MODEL_CACHE_SIZE", 32
     )
-    COSMIC_COHERENT_PROFILE_ENABLED = _env_bool(
-        "COSMIC_COHERENT_PROFILE_ENABLED", False
-    )
-    if COSMIC_FERMI_EYGES_ENABLED and COSMIC_COHERENT_PROFILE_ENABLED:
-        raise ValueError(
-            "Enable only one cosmic MCS continuation: linear FE or nonlinear coherent profile"
-        )
-    COSMIC_COHERENT_MODES_PER_PLANE = max(1, _env_int(
-        "COSMIC_COHERENT_MODES_PER_PLANE", 4
-    ))
-    COSMIC_COHERENT_GRID_POINTS = max(17, _env_int(
-        "COSMIC_COHERENT_GRID_POINTS", 41
-    ))
-    COSMIC_COHERENT_LATENT_FD = _env_float(
-        "COSMIC_COHERENT_LATENT_FD", 0.20
-    )
-    COSMIC_COHERENT_LATENT_ITERATIONS = max(1, _env_int(
-        "COSMIC_COHERENT_LATENT_ITERATIONS", 4
-    ))
-    COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS = max(1, _env_int(
-        "COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS", 2
-    ))
-    COSMIC_COHERENT_TRACK_CYCLES = max(1, _env_int(
-        "COSMIC_COHERENT_TRACK_CYCLES", 2
-    ))
-    COSMIC_FE_MODES_PER_PLANE = max(1, _env_int(
-        "COSMIC_FE_MODES_PER_PLANE", 4
-    ))
-    COSMIC_FE_GRID_POINTS = max(17, _env_int(
-        "COSMIC_FE_GRID_POINTS", 41
-    ))
-    COSMIC_FE_MAX_CYCLES = max(1, _env_int(
-        "COSMIC_FE_MAX_CYCLES", 2
-    ))
-    COSMIC_FE_FD_LONGITUDINAL_MM = _env_float(
-        "COSMIC_FE_FD_LONGITUDINAL_MM", 2.0
-    )
-    COSMIC_FE_FD_TRANSVERSE_MM = _env_float(
-        "COSMIC_FE_FD_TRANSVERSE_MM", 2.0
-    )
-    COSMIC_FE_FD_DIRECTION = _env_float(
-        "COSMIC_FE_FD_DIRECTION", 2.0e-4
-    )
-    COSMIC_FE_FD_FULL_RANGE_MM = _env_float(
-        "COSMIC_FE_FD_FULL_RANGE_MM", 2.0
-    )
-    COSMIC_FE_CHARGE_SWEEPS = max(1, _env_int(
-        "COSMIC_FE_CHARGE_SWEEPS", 2
-    ))
-    COSMIC_FE_TIMING_SWEEPS = max(1, _env_int(
-        "COSMIC_FE_TIMING_SWEEPS", 2
-    ))
-
     # PMT response used by the current analytic likelihood.
     PMT_SINGLE_PE_AMP_MEAN = _env_float("PMT_SINGLE_PE_AMP_MEAN", 1.0)
     PMT_SINGLE_PE_AMP_STD = _env_float("PMT_SINGLE_PE_AMP_STD", 0.3)
@@ -18525,6 +23412,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     from LicketyFit.PMT import PMT
     from LicketyFit.mcs_coherent_fisher import run_coherent_fisher_update
     from LicketyFit.mcs_fast12_continuation import run_fast12_coherent_update
+    from LicketyFit.mcs_physics_continuation import run_physics_coherent_update
     from LicketyFit.fast_track_fit import (
         BlockOptimizerResult,
         ConvexDetectorVolume,
@@ -18542,6 +23430,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         profile_t0,
         reanchor_result,
         run_generalized_fermi_eyges_update,
+        cobyqa_exact_continuation,
         seed_values_from_mapping,
         select_diverse_seed_indices,
         track_aligned_block_optimize,
@@ -18661,6 +23550,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "WCTE_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
             "WCTE_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
         )
+    CHARGE_LIKELIHOOD_MODE = _validate_charge_likelihood_calibration(
+        normalization_mode=CHARGE_NORMALIZATION_MODE,
+        global_scale=GLOBAL_CHARGE_SCALE,
+        calibration_id=GLOBAL_CHARGE_CALIBRATION_ID,
+        environment_prefix="WCTE",
+    )
     if EVENT_SOURCE == "file" and not USER_EVENT_FILE:
         raise ValueError("EVENT_SOURCE=file requires USER_EVENT_FILE")
 
@@ -18702,8 +23597,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     USE_COHERENT_FISHER = MCS_RECONSTRUCTION_MODE == "coherent_fisher"
     USE_FERMI_EYGES = MCS_RECONSTRUCTION_MODE == "fermi_eyges_process"
     USE_LEGACY_MCS = MCS_RECONSTRUCTION_MODE == "legacy"
-    if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and FIT_MODE != "full_length":
-        raise ValueError("Fermi--Eyges reconstruction currently requires full_length mode")
+    if USE_COHERENT_FISHER:
+        MCS_COHERENT_IMPLEMENTATION = validate_coherent_configuration(
+            MCS_COHERENT_IMPLEMENTATION,
+            MCS_PROCESS_MODES_PER_PLANE,
+            MCS_PROCESS_GRID_POINTS,
+            MCS_COHERENT_GRID_POINTS,
+        )
+    _ABSORPTION_FAST12_COHERENT = bool(
+        FIT_MODE == "absorption"
+        and USE_COHERENT_FISHER
+        and MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    )
+    if (
+        (USE_FERMI_EYGES or USE_COHERENT_FISHER)
+        and FIT_MODE != "full_length"
+        and not _ABSORPTION_FAST12_COHERENT
+    ):
+        raise ValueError(
+            "Fermi--Eyges reconstruction requires full_length mode, except "
+            "for the absorption-compatible fast12 coherent profile"
+        )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and LIKELIHOOD_MODE == "timing_only":
         raise ValueError("Fermi--Eyges reconstruction requires a charge-capable fit")
     if MCS_TIMING_POLICY not in {"fe_prior_transverse", "fe_prior_all", "freeze_updated"}:
@@ -18766,7 +23680,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     else:
         OUTPUT_FILE = str(
             PROJECT_ROOT / "outputs" /
-            f"estimates_run{RUN}_{BEAM_P:g}p_{FIT_PARTICLE}_{FIT_MODE}_"
+            f"estimates_run{RUN}_{BEAM_P:g}p_{FIT_PARTICLE}_{_PUBLIC_FIT_MODE}_"
             f"{LIKELIHOOD_MODE}_relEff-{REL_EFF_MODE}.dict"
         )
 
@@ -18806,12 +23720,16 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     OBS_PROMPT_MAX_ALL = None
     OBS_SOURCE_EVENT_ID_ALL = None
     OBS_SOURCE_ROOT_ENTRY_INDEX_ALL = None
+    OBS_SOURCE_INPUT_INDEX_ALL = None
     OBS_TIME_OFFSET_ALL = None
     OBS_RAW_HIT_COUNT_ALL = None
     OBS_PROMPT_HIT_COUNT_ALL = None
     SKIPPED_EVENT_RECORDS = []
+    INPUT_EVENTS_AVAILABLE_COUNT = 0
     INPUT_EVENTS_LOADED_COUNT = 0
     INPUT_EVENTS_PREPARED_COUNT = 0
+    INPUT_SOURCE_START_INDEX = 0
+    INPUT_SOURCE_STOP_EXCLUSIVE = 0
 
 
     def _file_sha256(path: Path) -> str | None:
@@ -19331,6 +24249,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
         if WCTE_EXPLICIT_LENGTHS_MM:
             raw = [float(value) for value in WCTE_EXPLICIT_LENGTHS_MM]
+        elif FIT_MODE == "absorption":
+            raw = [
+                maximum * float(factor)
+                for factor in ABSORPTION_VISIBLE_LENGTH_FRACTIONS
+            ]
         else:
             raw = [expected_range * float(factor) for factor in WCTE_LENGTH_FACTORS]
             raw.append(expected_range)
@@ -19433,6 +24356,23 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         if vertex_central or direction_central:
                             sparse.append(seed)
                     beam_seeds = sparse
+                # Keep the historical 150 mm beam cluster as an immutable core.
+                # The modest 300 mm ring is a separately arbitrated challenge
+                # tier: adding it must never displace the accepted core basin
+                # merely by perturbing proxy-shortlist diversity.
+                beam_reference = np.asarray(WCTE_BEAM_ENTRY_MM, dtype=np.float64)
+                for seed in beam_seeds:
+                    point = np.asarray(
+                        [seed["x0"], seed["y0"], seed["z0"]], dtype=np.float64
+                    )
+                    delta = point - beam_reference
+                    transverse = delta - np.dot(delta, beam_direction) * beam_direction
+                    seed["beam_seed_tier"] = (
+                        "outer"
+                        if np.linalg.norm(transverse)
+                        > float(WCTE_BEAM_CORE_TRANSVERSE_MAX_MM) + 1.0e-8
+                        else "core"
+                    )
                 if FIXED_DIRECTION is None and not beam_seeds:
                     raise ValueError(
                         "The WCTE beam seed cluster is empty. Check WCTE_BEAM_ENTRY_MM, "
@@ -19516,6 +24456,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 fixed_params=FIXED_PARAMS,
                 fixed_direction=FIXED_DIRECTION,
                 full_range_limits=full_range_limits,
+                prevalidated=True,
             )
             metadata = {
                 "strategy": "wcte_beam_focused_plus_detector_global",
@@ -19573,6 +24514,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             fixed_params=FIXED_PARAMS,
             fixed_direction=FIXED_DIRECTION,
             full_range_limits=full_range_limits,
+            prevalidated=True,
         )
         metadata = dict(metadata)
         metadata.update({
@@ -20269,6 +25211,43 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         }
 
 
+    def physics_profile_payload(result):
+        """Serialize the all-PMT, jointly reprofiled physics reference."""
+        return {
+            "model": "arc_length_fali_delta_survival_physics_reference",
+            "central_estimator": (
+                "fully converged nonlinear charge MAP in an onset-pinned "
+                "Fermi--Eyges/KL path, jointly reprofiled over the physical "
+                "onset line with an all-PMT Fisher--Laplace scalar"
+            ),
+            "initial_values": dict(result.initial_values),
+            "updated_values": result.output_values(),
+            "coefficients_mean": np.asarray(result.coefficients_mean).tolist(),
+            "coefficients_covariance": np.asarray(
+                result.coefficients_covariance
+            ).tolist(),
+            "charge_nll": float(result.charge_nll),
+            "posterior_nll": float(result.posterior_nll),
+            "laplace_nll": float(result.laplace_nll),
+            "start_along_track_correction_mm": float(
+                result.start_along_track_correction_mm
+            ),
+            "length_correction_mm": float(result.length_correction_mm),
+            "downstream_endpoint_correction_mm": float(
+                result.downstream_endpoint_correction_mm
+            ),
+            "latent_converged": bool(result.latent_converged),
+            "profile_converged": bool(result.profile_converged),
+            "path_s_mm": np.asarray(result.path_s_mm).tolist(),
+            "path_position_mm": np.asarray(result.path_position_mm).tolist(),
+            "path_tangent": np.asarray(result.path_tangent).tolist(),
+            "path_energy_mev": np.asarray(result.path_energy_mev).tolist(),
+            "path_beta": np.asarray(result.path_beta).tolist(),
+            "wall_s": float(result.wall_s),
+            "diagnostics": dict(result.diagnostics),
+        }
+
+
     def _fit_event_staged(obs_pes, obs_ts):
         wall0 = time.perf_counter()
         scores = PROXY_LIBRARY.score(obs_pes, charge_floor_pe=float(getattr(EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4)))
@@ -20669,6 +25648,65 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         return [int(row[1]) for row in selected]
 
 
+    def _select_absorption_length_challenges(scores, indices, *, n_keep):
+        """Retain proxy candidates from disconnected abrupt-endpoint basins.
+
+        The usual diversity selector operates mainly in vertex/direction space.
+        In absorption mode that can discard every short visible-length seed even
+        though visible length and initial range move together during the exact
+        fit.  Keep the best geometric seed at each visible-length anchor, then
+        choose logarithmically separated anchors without consulting event truth.
+        """
+        if FIT_MODE != "absorption" or int(n_keep) <= 0:
+            return []
+        best_by_length = {}
+        for index in indices:
+            try:
+                seed = SEEDS[int(index)]
+                visible = float(seed["visible_length"])
+                full_range = float(seed["full_range"])
+                score = float(scores[int(index)])
+            except Exception:
+                continue
+            if not (
+                math.isfinite(visible) and visible > 0.0
+                and math.isfinite(full_range) and full_range >= visible
+                and math.isfinite(score)
+            ):
+                continue
+            key = round(visible, 5)
+            previous = best_by_length.get(key)
+            if previous is None or score < previous[0]:
+                best_by_length[key] = (score, int(index), visible, full_range)
+        rows = sorted(best_by_length.values())
+        if not rows:
+            return []
+        selected = [rows[0]]
+        remaining = rows[1:]
+        while remaining and len(selected) < int(n_keep):
+            base = float(rows[0][0])
+            viable = [row for row in remaining if float(row[0]) <= base + 2500.0]
+            pool = viable if viable else remaining
+
+            def merit(row):
+                separation = min(
+                    math.hypot(
+                        math.log(float(row[2]) / float(keep[2])),
+                        0.35 * math.log(float(row[3]) / float(keep[3])),
+                    )
+                    for keep in selected
+                )
+                return (
+                    separation - 2.0e-4 * max(float(row[0]) - base, 0.0),
+                    -float(row[0]),
+                )
+
+            chosen = max(pool, key=merit)
+            selected.append(chosen)
+            remaining.remove(chosen)
+        return [int(row[1]) for row in selected]
+
+
     def _select_family_diverse(scores, indices, *, n_keep, raw_top):
         if not indices or int(n_keep) <= 0:
             return []
@@ -20684,44 +25722,92 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def _select_wcte_local_candidates(scores):
-        """Reproduce the accepted beam/entry-guard WCTE candidate policy."""
+        """Preserve the accepted beam core and add a gated outer challenge."""
         beam_indices, guard_indices, _ = _wcte_seed_family_indices()
-        local_indices = beam_indices + guard_indices
+        core_beam_indices = [
+            index for index in beam_indices
+            if str(SEEDS[int(index)].get("beam_seed_tier", "core")) != "outer"
+        ]
+        outer_beam_indices = [
+            index for index in beam_indices
+            if str(SEEDS[int(index)].get("beam_seed_tier", "core")) == "outer"
+        ]
+        # A legacy/custom seed file may predate the tier annotation.  In that
+        # case the complete beam family remains the core, exactly as before.
+        core_beam_indices = core_beam_indices or list(beam_indices)
+        local_indices = core_beam_indices + guard_indices
         if not local_indices:
             return []
         best_index = min(local_indices, key=lambda i: float(scores[i]))
         best_family = str(SEEDS[best_index].get("seed_family", ""))
         if best_family == "wcte_orientation_guard":
-            return _select_family_diverse(
+            selected = _select_family_diverse(
                 scores,
                 local_indices,
                 n_keep=max(1, int(PROXY_CANDIDATES)),
                 raw_top=min(4, max(1, int(PROXY_CANDIDATES))),
             )
-
-        selected = _select_family_diverse(
-            scores,
-            beam_indices,
-            n_keep=max(1, int(WCTE_BEAM_PROXY_CANDIDATES)),
-            raw_top=min(4, max(1, int(WCTE_BEAM_PROXY_CANDIDATES))),
-        )
-        used = set(selected)
-        for index in _select_family_diverse(
-            scores,
-            guard_indices,
-            n_keep=max(0, int(WCTE_GUARD_CHALLENGE_CANDIDATES)),
-            raw_top=min(2, max(1, int(WCTE_GUARD_CHALLENGE_CANDIDATES))),
-        ):
-            if index not in used:
-                used.add(index)
-                selected.append(index)
+            used = set(selected)
+        else:
+            selected = _select_family_diverse(
+                scores,
+                core_beam_indices,
+                n_keep=max(1, int(WCTE_BEAM_PROXY_CANDIDATES)),
+                raw_top=min(4, max(1, int(WCTE_BEAM_PROXY_CANDIDATES))),
+            )
+            used = set(selected)
+            for index in _select_family_diverse(
+                scores,
+                guard_indices,
+                n_keep=max(0, int(WCTE_GUARD_CHALLENGE_CANDIDATES)),
+                raw_top=min(2, max(1, int(WCTE_GUARD_CHALLENGE_CANDIDATES))),
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
         for index in _select_full_length_range_challenges(
-            scores, beam_indices + guard_indices,
+            scores, core_beam_indices + guard_indices,
             n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
         ):
             if index not in used:
                 used.add(index)
                 selected.append(index)
+        for index in _select_absorption_length_challenges(
+            scores, core_beam_indices + guard_indices,
+            n_keep=ABSORPTION_LENGTH_CHALLENGE_CANDIDATES,
+        ):
+            if index not in used:
+                used.add(index)
+                selected.append(index)
+
+        # The outer ring is considered only when its charge proxy beats every
+        # core/guard seed.  Its shortlist and range strata stay separate, so
+        # merely adding the ring cannot perturb the historical core shortlist.
+        outer_triggered = bool(
+            FIT_MODE == "full_length"
+            and outer_beam_indices
+            and int(WCTE_BEAM_OUTER_PROXY_CANDIDATES) > 0
+            and min(float(scores[index]) for index in outer_beam_indices)
+            < min(float(scores[index]) for index in local_indices)
+        )
+        if outer_triggered:
+            for index in _select_family_diverse(
+                scores,
+                outer_beam_indices,
+                n_keep=int(WCTE_BEAM_OUTER_PROXY_CANDIDATES),
+                raw_top=min(2, int(WCTE_BEAM_OUTER_PROXY_CANDIDATES)),
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
+            for index in _select_full_length_range_challenges(
+                scores,
+                outer_beam_indices,
+                n_keep=FULL_LENGTH_RANGE_CHALLENGE_CANDIDATES,
+            ):
+                if index not in used:
+                    used.add(index)
+                    selected.append(index)
         return selected
 
 
@@ -20747,12 +25833,21 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             if best_global <= best_local
             else int(WCTE_GLOBAL_CHALLENGE_CANDIDATES)
         )
-        return _select_family_diverse(
+        selected = _select_family_diverse(
             scores,
             global_indices,
             n_keep=max(1, n_keep),
             raw_top=min(4, max(1, n_keep)),
         )
+        used = set(selected)
+        for index in _select_absorption_length_challenges(
+            scores, global_indices,
+            n_keep=ABSORPTION_LENGTH_CHALLENGE_CANDIDATES,
+        ):
+            if index not in used:
+                used.add(index)
+                selected.append(index)
+        return selected
 
 
     def _select_wcte_quality_candidates(scores):
@@ -20797,44 +25892,83 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     def _maybe_continue_exact_optimizer(
         objective, result, *, fixed_params, length_limits, full_range_limits
     ):
-        """Finish rare events whose last exact sweep is visibly unconverged."""
-        if (
-            not ADAPTIVE_EXACT_POLISH
-            or int(ADAPTIVE_EXACT_POLISH_SWEEPS) <= 0
-            or len(result.history) < 2
-        ):
-            return result, False, math.nan
-        previous = float(result.history[-2]["fval"])
-        current = float(result.history[-1]["fval"])
-        last_improvement = previous - current
-        if (
-            not math.isfinite(last_improvement)
-            or last_improvement <= float(ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT)
-        ):
-            return result, False, last_improvement
+        """Continue exact NLL descent one sweep at a time to a total-sweep cap."""
 
-        continuation = track_aligned_block_optimize(
-            objective,
-            result.values,
-            fixed_params=fixed_params,
-            sweeps=int(ADAPTIVE_EXACT_POLISH_SWEEPS),
-            initial_steps=_optimizer_continuation_steps(result),
-            length_limits=length_limits,
-            full_range_limits=full_range_limits,
-            min_improvement=0.0,
-            full_cross_sweeps=1,
+        def continue_one_sweep(current):
+            if ADAPTIVE_EXACT_POLISH_BACKEND == "cobyqa":
+                continuation, backend_diagnostics = cobyqa_exact_continuation(
+                    objective,
+                    current.values,
+                    fixed_params=fixed_params,
+                    initial_steps=_optimizer_continuation_steps(current),
+                    length_limits=length_limits,
+                    full_range_limits=full_range_limits,
+                    max_evaluations=int(ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS),
+                    max_restarts=int(ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS),
+                    initial_errors=current.errors,
+                    poll_tolerance=float(
+                        ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+                    ),
+                )
+                return continuation, backend_diagnostics
+            return track_aligned_block_optimize(
+                objective,
+                current.values,
+                fixed_params=fixed_params,
+                sweeps=1,
+                initial_steps=_optimizer_continuation_steps(current),
+                length_limits=length_limits,
+                full_range_limits=full_range_limits,
+                min_improvement=0.0,
+                full_cross_sweeps=1,
+            )
+
+        continued, diagnostics = continue_adaptive_exact(
+            result,
+            enabled=bool(ADAPTIVE_EXACT_POLISH),
+            convergence_threshold_nll=float(
+                ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+            ),
+            max_total_sweeps=(
+                int(
+                    len(result.history)
+                    + ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS
+                )
+                if (
+                    ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                    and ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS is not None
+                )
+                else int(ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS)
+                if ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                else int(len(result.history) + 1)
+            ),
+            continue_step=continue_one_sweep,
+            backend=(
+                "one_sweep_block"
+                if ADAPTIVE_EXACT_POLISH_BACKEND == "block"
+                else "cobyqa_exact_physical_chart"
+            ),
         )
-        if not math.isfinite(continuation.fval) or continuation.fval >= result.fval:
-            return result, False, last_improvement
-        continuation.nfcn += int(result.nfcn)
-        continuation.wall_s += float(result.wall_s)
-        continuation.invalid_evaluations += int(result.invalid_evaluations)
-        continuation.quadratic_skips += int(result.quadratic_skips)
-        continuation.history = list(result.history) + [
-            {**entry, "adaptive_polish": True}
-            for entry in continuation.history
-        ]
-        return continuation, True, last_improvement
+        return (
+            continued,
+            bool(diagnostics.accepted_extra_sweeps > 0),
+            float(diagnostics.initial_gain_nll),
+            diagnostics.as_dict(),
+        )
+
+
+    def _disabled_adaptive_exact_diagnostics(result):
+        _, diagnostics = continue_adaptive_exact(
+            result,
+            enabled=False,
+            convergence_threshold_nll=float(
+                ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
+            ),
+            max_total_sweeps=int(ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS),
+            continue_step=lambda current: current,
+            backend="disabled",
+        )
+        return diagnostics.as_dict()
 
 
     def _wcte_local_fit_is_beam_compatible(fit_payload):
@@ -21059,7 +26193,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 ),
             )
             if allow_adaptive:
-                exact_result, adaptive_polish_used, pre_polish_last_improvement = (
+                (
+                    exact_result,
+                    adaptive_polish_used,
+                    pre_polish_last_improvement,
+                    adaptive_exact_convergence,
+                ) = (
                     _maybe_continue_exact_optimizer(
                         exact_objective,
                         exact_result,
@@ -21070,10 +26209,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 )
             else:
                 adaptive_polish_used = False
-                pre_polish_last_improvement = (
-                    float(exact_result.history[-2]["fval"])
-                    - float(exact_result.history[-1]["fval"])
-                    if len(exact_result.history) >= 2 else math.nan
+                adaptive_exact_convergence = _disabled_adaptive_exact_diagnostics(
+                    exact_result
+                )
+                pre_polish_last_improvement = float(
+                    adaptive_exact_convergence["initial_gain_nll"]
                 )
             final_t0_profile = None
             if JOINT_PROFILE_T0 and exact_mode != "charge_only" and "t0" not in FIXED_PARAMS:
@@ -21102,13 +26242,23 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "result": exact_result,
                 "adaptive_polish_used": bool(adaptive_polish_used),
                 "pre_polish_last_improvement": float(pre_polish_last_improvement),
+                "adaptive_exact_convergence": dict(adaptive_exact_convergence),
             }
 
         local_rows = [
             row for row in candidate_rows
             if str(SEEDS[int(row[1])].get("seed_family", ""))
             != "wcte_detector_global"
+            and str(SEEDS[int(row[1])].get("beam_seed_tier", "core"))
+            != "outer"
         ] if WCTE else list(candidate_rows)
+        outer_beam_rows = [
+            row for row in candidate_rows
+            if str(SEEDS[int(row[1])].get("seed_family", ""))
+            == "wcte_beam_cluster"
+            and str(SEEDS[int(row[1])].get("beam_seed_tier", "core"))
+            == "outer"
+        ] if WCTE else []
         global_rows = [
             row for row in candidate_rows
             if str(SEEDS[int(row[1])].get("seed_family", ""))
@@ -21188,7 +26338,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     optimized_basins.append(global_probe)
                     if float(global_probe["result"].fval) < local_final - 1.0e-9:
                         global_escape_triggered = True
-                        continued_result, continued_used, continued_last = (
+                        (
+                            continued_result,
+                            continued_used,
+                            continued_last,
+                            continued_convergence,
+                        ) = (
                             _maybe_continue_exact_optimizer(
                                 global_probe["objective"],
                                 global_probe["result"],
@@ -21200,6 +26355,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         global_probe["result"] = continued_result
                         global_probe["adaptive_polish_used"] = bool(continued_used)
                         global_probe["pre_polish_last_improvement"] = float(continued_last)
+                        global_probe["adaptive_exact_convergence"] = dict(
+                            continued_convergence
+                        )
                         if float(global_probe["result"].fval) < float(chosen_fit["result"].fval):
                             chosen_fit = global_probe
         elif global_rows:
@@ -21210,15 +26368,112 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             chosen_fit = optimize_candidate_row(candidate_rows[0])
             optimized_basins.append(chosen_fit)
 
+        # The outer beam-pipe ring is an independent challenge basin.  Always
+        # complete its best exact fit once its proxy gate opens, then arbitrate
+        # on the same final likelihood.  The historical core fit is therefore
+        # immutable: the outer ring can improve it but can never displace it by
+        # changing shortlist diversity or an unoptimized start score.
+        outer_beam_challenge_tested = bool(outer_beam_rows)
+        outer_beam_challenge_accepted = False
+        if outer_beam_rows:
+            outer_beam_fit = optimize_candidate_row(outer_beam_rows[0])
+            optimized_basins.append(outer_beam_fit)
+            if (
+                float(outer_beam_fit["result"].fval)
+                < float(chosen_fit["result"].fval) - 1.0e-9
+            ):
+                chosen_fit = outer_beam_fit
+                outer_beam_challenge_accepted = True
+                local_beam_compatible, beam_basin_diagnostics = (
+                    _wcte_local_fit_is_beam_compatible(outer_beam_fit)
+                )
+
+        # In absorption mode, an unoptimized exact seed score is not a reliable
+        # ordering of endpoint basins: visible length and full range are coupled
+        # in the first exact block.  Challenge the provisional solution with a
+        # small number of exact fits from separated length/range anchors.  This
+        # uses only the same reconstructed-event likelihood used for the final
+        # fit; neither the nominal beam energy nor simulation truth participates
+        # in the arbitration.
+        absorption_challenge_diagnostics = []
+        if FIT_MODE == "absorption" and ABSORPTION_EXACT_CHALLENGE_BASINS > 0:
+            already_optimized = {
+                int(item["seed_index"]) for item in optimized_basins
+            }
+            reference_pairs = []
+            for item in optimized_basins:
+                seed = SEEDS[int(item["seed_index"])]
+                reference_pairs.append((
+                    float(seed["visible_length"]), float(seed["full_range"])
+                ))
+            n_challenged = 0
+            for challenge_row in candidate_rows:
+                if n_challenged >= int(ABSORPTION_EXACT_CHALLENGE_BASINS):
+                    break
+                start_fval, challenge_index = (
+                    float(challenge_row[0]), int(challenge_row[1])
+                )
+                if challenge_index in already_optimized:
+                    continue
+                seed = SEEDS[challenge_index]
+                pair = (
+                    float(seed["visible_length"]), float(seed["full_range"])
+                )
+                separation = min(
+                    math.hypot(
+                        math.log(pair[0] / keep[0]),
+                        0.35 * math.log(pair[1] / keep[1]),
+                    )
+                    for keep in reference_pairs
+                )
+                if separation < float(ABSORPTION_EXACT_MIN_LOG_SEPARATION):
+                    continue
+                provisional_fval = float(chosen_fit["result"].fval)
+                if start_fval > (
+                    provisional_fval
+                    + float(ABSORPTION_EXACT_CHALLENGE_NLL_WINDOW)
+                ):
+                    continue
+                challenge_fit = optimize_candidate_row(challenge_row)
+                optimized_basins.append(challenge_fit)
+                already_optimized.add(challenge_index)
+                reference_pairs.append(pair)
+                n_challenged += 1
+                accepted = bool(
+                    float(challenge_fit["result"].fval)
+                    < float(chosen_fit["result"].fval) - 1.0e-9
+                )
+                absorption_challenge_diagnostics.append({
+                    "seed_index": int(challenge_index),
+                    "seed_family": str(challenge_fit["seed_family"]),
+                    "visible_length_seed_mm": float(pair[0]),
+                    "full_range_seed_mm": float(pair[1]),
+                    "log_separation": float(separation),
+                    "exact_start_fval": float(start_fval),
+                    "final_fval": float(challenge_fit["result"].fval),
+                    "accepted": bool(accepted),
+                })
+                if accepted:
+                    chosen_fit = challenge_fit
+
         chosen_row = chosen_fit["row"]
         _, chosen_index, chosen_proxy, start_values, exact_chart, initial_t0_profile = chosen_row
         exact_objective = chosen_fit["objective"]
         exact_result = chosen_fit["result"]
         adaptive_polish_used = chosen_fit["adaptive_polish_used"]
         pre_polish_last_improvement = chosen_fit["pre_polish_last_improvement"]
+        adaptive_exact_convergence = dict(
+            chosen_fit["adaptive_exact_convergence"]
+        )
         final_t0_profile = chosen_fit["final_t0_profile"]
 
         straight_values = exact_result.output_values()
+        straight_geometry_key = exact_objective._geometry_key(exact_result.values)
+        straight_event_mean_contamination_fraction = float(
+            exact_objective.event_mean_contamination_cache.get(
+                straight_geometry_key, math.nan
+            )
+        )
         straight_errors = {
             name: float(value)
             for name, value in exact_result.errors.items()
@@ -21226,14 +26481,64 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         }
         straight_fval = float(exact_result.fval)
         coherent_result = None
+        mcs_attempted = bool(USE_COHERENT_FISHER)
+        mcs_applied = False
+        mcs_status = "not_requested"
+        mcs_failure = None
         final_values = dict(straight_values)
         errors = dict(straight_errors)
         final_fval = straight_fval
         fval_definition = "accepted straight-track production NLL"
 
+        # Coherent helpers use the common seven-coordinate name ``length``.
+        # In absorption mode this is the abrupt visible support; the separate
+        # full-range/initial-energy coordinate stays conditioned at the
+        # accepted straight fit during the MCS path profile.
+        coherent_input_values = dict(exact_result.values)
+        coherent_fixed_params = dict(FIXED_PARAMS)
+        coherent_track_end_mode = "threshold"
+        coherent_full_range_mm = None
+        coherent_initial_ke_mev = None
+        coherent_profile_start_along = None
+        if FIT_MODE == "absorption":
+            coherent_input_values["length"] = float(
+                coherent_input_values["visible_length"]
+            )
+            coherent_full_range_mm = float(
+                coherent_input_values["full_range"]
+            )
+            coherent_initial_ke_mev = float(
+                RANGE_LOOKUP.range_mm_to_energy(coherent_full_range_mm)
+            )
+            coherent_track_end_mode = "abrupt"
+            if "visible_length" in coherent_fixed_params:
+                coherent_fixed_params["length"] = coherent_fixed_params[
+                    "visible_length"
+                ]
+            coherent_profile_start_along = not any(
+                name in coherent_fixed_params for name in ("x0", "y0", "z0")
+            )
+
+        def _attempt_coherent_stage(callback):
+            """Run MCS without sacrificing an already accepted straight fit."""
+            try:
+                return callback(), None
+            except Exception as exc:
+                if not _env_bool("MCS_RETAIN_STRAIGHT_ON_FAILURE", True):
+                    raise
+                import traceback
+                return None, {
+                    "failure_stage": "coherent_mcs",
+                    "failure_type": type(exc).__name__,
+                    "failure_message": str(exc),
+                    "failure_traceback": traceback.format_exc(),
+                }
+
         if USE_COHERENT_FISHER:
-            if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
-                coherent_result = run_fast12_coherent_update(
+            mcs_status = "attempted"
+            if MCS_COHERENT_IMPLEMENTATION == "physics_reference":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_physics_coherent_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
                     chart=exact_result.chart,
@@ -21253,6 +26558,108 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     coherent_grid_points=MCS_COHERENT_GRID_POINTS,
                     latent_fd=MCS_COHERENT_LATENT_FD,
                     latent_max_iterations=MCS_COHERENT_LATENT_MAX_ITERATIONS,
+                    latent_solver=MCS_COHERENT_LATENT_SOLVER,
+                    latent_exact_max_evaluations=(
+                        MCS_COHERENT_LATENT_EXACT_MAX_EVALUATIONS
+                    ),
+                    latent_exact_final_trust_radius=(
+                        MCS_COHERENT_LATENT_EXACT_FINAL_TRUST_RADIUS
+                    ),
+                    latent_exact_max_restarts=(
+                        MCS_COHERENT_LATENT_EXACT_MAX_RESTARTS
+                    ),
+                    multigrid_initializer=MCS_PHYSICS_MULTIGRID_INITIALIZER,
+                    multigrid_grid_points=(
+                        MCS_PHYSICS_MULTIGRID_GRID_POINTS
+                    ),
+                    multigrid_coarse_iterations=(
+                        MCS_PHYSICS_MULTIGRID_COARSE_ITERATIONS
+                    ),
+                    multigrid_fine_iterations=(
+                        MCS_PHYSICS_MULTIGRID_FINE_ITERATIONS
+                    ),
+                    response_grid_points=MCS_PHYSICS_RESPONSE_GRID_POINTS,
+                    response_primary_trust=(
+                        MCS_PHYSICS_RESPONSE_PRIMARY_TRUST
+                    ),
+                    response_secondary_trust=(
+                        MCS_PHYSICS_RESPONSE_SECONDARY_TRUST
+                    ),
+                    response_probe_iterations=(
+                        MCS_PHYSICS_RESPONSE_PROBE_ITERATIONS
+                    ),
+                    response_proposal_iterations=(
+                        MCS_PHYSICS_RESPONSE_PROPOSAL_ITERATIONS
+                    ),
+                    response_correction_iterations=(
+                        MCS_PHYSICS_RESPONSE_CORRECTION_ITERATIONS
+                    ),
+                    response_fallback_to_exact=(
+                        MCS_PHYSICS_RESPONSE_FALLBACK_TO_EXACT
+                    ),
+                    latent_trust_max_component=MCS_COHERENT_TRUST_BOX,
+                    max_global_evaluations=(
+                        MCS_COHERENT_GLOBAL_MAX_EVALUATIONS
+                    ),
+                    initial_global_trust_radius=(
+                        MCS_COHERENT_GLOBAL_INITIAL_TRUST_RADIUS
+                    ),
+                    final_global_trust_radius=(
+                        MCS_COHERENT_GLOBAL_FINAL_TRUST_RADIUS
+                    ),
+                    global_profile_mode=MCS_COHERENT_GLOBAL_PROFILE_MODE,
+                    joint_max_cycles=MCS_COHERENT_JOINT_MAX_CYCLES,
+                    joint_final_global_trust_radius=(
+                        MCS_COHERENT_JOINT_FINAL_GLOBAL_TRUST_RADIUS
+                    ),
+                    joint_global_max_restarts=(
+                        MCS_COHERENT_JOINT_GLOBAL_MAX_RESTARTS
+                    ),
+                    joint_model_cache_size=(
+                        MCS_COHERENT_JOINT_MODEL_CACHE_SIZE
+                    ),
+                    numba_threads=MCS_COHERENT_NUMBA_THREADS,
+                    )
+                )
+                if coherent_result is not None:
+                    final_values = coherent_result.output_values()
+                    errors = (
+                        {}
+                        if MCS_COHERENT_GLOBAL_PROFILE_MODE == "joint_exact"
+                        else dict(straight_errors)
+                    )
+                    # The MCS reference is deliberately charge-only until every
+                    # enabled source has curved first-photoelectron timing nodes.
+                    # Keep the accepted production charge-time NLL separate rather
+                    # than overwriting it with an incomparable marginal charge NLL.
+                    final_fval = straight_fval
+                    fval_definition = (
+                        "accepted straight-track production NLL at straight_fit_values; "
+                        "the coherent charge posterior is stored separately in "
+                        "mcs_process and is not a charge-time NLL or covariance claim"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_fast12_coherent_update(
+                    EMITTER_TEMPLATE,
+                    values=coherent_input_values,
+                    chart=exact_result.chart,
+                    detector=DETECTOR,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    obs_ts=obs_ts,
+                    mpmt_types=MPMT_TYPE_CODES,
+                    fixed_params=coherent_fixed_params,
+                    length_limits=length_limits,
+                    t0_limits=T0_LIMITS,
+                    modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                    process_grid_points=MCS_PROCESS_GRID_POINTS,
+                    coherent_grid_points=MCS_COHERENT_GRID_POINTS,
+                    latent_fd=MCS_COHERENT_LATENT_FD,
+                    latent_max_iterations=MCS_COHERENT_LATENT_MAX_ITERATIONS,
                     candidate_latent_max_iterations=(
                         MCS_COHERENT_CANDIDATE_LATENT_MAX_ITERATIONS
                     ),
@@ -21265,20 +26672,39 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
                     ),
                     numba_threads=MCS_COHERENT_NUMBA_THREADS,
+                    track_end_mode=coherent_track_end_mode,
+                    full_range_mm=coherent_full_range_mm,
+                    initial_kinetic_energy_mev=coherent_initial_ke_mev,
+                    profile_start_along=coherent_profile_start_along,
+                    require_convergence=(FIT_MODE == "absorption"),
+                    )
                 )
-                final_values = coherent_result.output_values()
-                # The fast continuation profiles only the longitudinal endpoint
-                # block.  Preserve the accepted straight-fit uncertainty estimate
-                # rather than manufacturing unvalidated all-parameter errors from a
-                # two-coordinate charge profile.
-                errors = dict(straight_errors)
-                final_fval = float(coherent_result.laplace_nll)
-                fval_definition = (
-                    "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
-                    "modes per transverse plane; straight-fit errors retained"
-                )
-            else:
-                coherent_result = run_coherent_fisher_update(
+                if coherent_result is not None:
+                    coherent_output_values = coherent_result.output_values()
+                    if FIT_MODE == "absorption":
+                        final_values = dict(straight_values)
+                        final_values.update(coherent_output_values)
+                        final_values["visible_length"] = float(
+                            coherent_output_values["length"]
+                        )
+                        final_values["full_range"] = float(
+                            straight_values["full_range"]
+                        )
+                    else:
+                        final_values = coherent_output_values
+                    # The fast continuation profiles only the longitudinal endpoint
+                    # block.  Preserve the accepted straight-fit uncertainty estimate
+                    # rather than manufacturing unvalidated all-parameter errors from a
+                    # two-coordinate charge profile.
+                    errors = dict(straight_errors)
+                    final_fval = float(coherent_result.laplace_nll)
+                    fval_definition = (
+                        "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
+                        "modes per transverse plane; straight-fit errors retained"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "legacy_fisher":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_coherent_fisher_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
                     chart=exact_result.chart,
@@ -21302,24 +26728,43 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     trust_box=MCS_COHERENT_TRUST_BOX,
                     apply_expected_contraction=MCS_COHERENT_APPLY_EXPECTED_CONTRACTION,
                     straight_prediction_cache=exact_objective.prediction_cache,
+                    )
                 )
-                final_values = coherent_result.output_values()
-                covariance_global = np.asarray(
-                    coherent_result.marginal_covariance_global, dtype=np.float64
-                )
-                global_names = (
-                    "x0", "y0", "z0", "cx", "cy", "cz", "length", "t0"
-                )
-                errors = {
-                    name: float(math.sqrt(max(covariance_global[i, i], 0.0)))
-                    for i, name in enumerate(global_names)
-                    if np.isfinite(covariance_global[i, i])
-                }
-                final_fval = float(coherent_result.coherent_posterior_nll_updated)
+                if coherent_result is not None:
+                    final_values = coherent_result.output_values()
+                    covariance_global = np.asarray(
+                        coherent_result.marginal_covariance_global, dtype=np.float64
+                    )
+                    global_names = (
+                        "x0", "y0", "z0", "cx", "cy", "cz", "length", "t0"
+                    )
+                    errors = {
+                        name: float(math.sqrt(max(covariance_global[i, i], 0.0)))
+                        for i, name in enumerate(global_names)
+                        if np.isfinite(covariance_global[i, i])
+                    }
+                    final_fval = float(coherent_result.coherent_posterior_nll_updated)
+                    fval_definition = (
+                        "conditional coherent FALI data NLL plus standard-normal FE/KL "
+                        "prior; coefficients inferred from charge covariance at the "
+                        "accepted joint fit"
+                    )
+
+            if coherent_result is not None:
+                mcs_applied = True
+                mcs_status = "applied"
+            elif mcs_failure is not None:
+                # Preserve the already accepted no-MCS fit.  The explicit MCS
+                # failure fields below prevent this from masquerading as a curved
+                # reconstruction while retaining a scientifically usable event.
+                mcs_applied = False
+                mcs_status = "failed_straight_fallback"
+                final_values = dict(straight_values)
+                errors = dict(straight_errors)
+                final_fval = straight_fval
                 fval_definition = (
-                    "conditional coherent FALI data NLL plus standard-normal FE/KL "
-                    "prior; coefficients inferred from charge covariance at the "
-                    "accepted joint fit"
+                    "accepted straight-track production NLL; coherent MCS was "
+                    "attempted, failed, and was not applied"
                 )
 
         full_length_range_profile = None
@@ -21327,7 +26772,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         if FIT_MODE == "full_length":
             final_values["full_range"] = float(final_values["length"])
             final_values, _summary = _resolved_full_length_output(final_values)
-            if not (USE_FERMI_EYGES or USE_COHERENT_FISHER):
+            if not (USE_FERMI_EYGES or (USE_COHERENT_FISHER and mcs_applied)):
                 final_values, final_fval, full_length_range_profile, full_length_range_profile_nfcn = (
                     _profile_full_length_range(
                         obs_pes, obs_ts, final_values, final_fval
@@ -21362,7 +26807,17 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "straight_fit_fval": float(straight_fval),
             "straight_fit_values": dict(straight_values),
             "straight_fit_errors": dict(straight_errors),
+            "event_mean_contamination_fraction": float(
+                straight_event_mean_contamination_fraction
+            ),
             "fit_accepted": bool(np.isfinite(final_fval)),
+            "mcs_attempted": bool(mcs_attempted),
+            "mcs_applied": bool(mcs_applied),
+            "mcs_fit_accepted": bool(mcs_applied),
+            "mcs_status": str(mcs_status),
+            "mcs_failure": (
+                None if mcs_failure is None else dict(mcs_failure)
+            ),
             "chosen_seed_index": int(chosen_index),
             "chosen_seed": dict(SEEDS[chosen_index]),
             "proxy_candidate_indices": [int(x) for x in candidate_indices],
@@ -21384,10 +26839,17 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "policy": "accepted_wcte_local_then_two_sweep_exact_global_escape",
                 "global_escape_tested": bool(global_escape_tested),
                 "global_escape_triggered": bool(global_escape_triggered),
+                "outer_beam_challenge_tested": bool(
+                    outer_beam_challenge_tested
+                ),
+                "outer_beam_challenge_accepted": bool(
+                    outer_beam_challenge_accepted
+                ),
                 "local_beam_compatible": bool(local_beam_compatible),
                 "beam_basin_diagnostics": dict(beam_basin_diagnostics),
                 "optimized_basins": basin_payload,
                 "chosen_family": str(chosen_fit["seed_family"]),
+                "absorption_exact_challenges": absorption_challenge_diagnostics,
             },
             "exact_charge_rerank_nfcn": int(exact_rerank_nfcn),
             "post_stage_validation_nfcn": (
@@ -21396,6 +26858,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             ),
             "adaptive_exact_polish_used": bool(adaptive_polish_used),
             "pre_polish_last_sweep_improvement": float(pre_polish_last_improvement),
+            "adaptive_exact_convergence": dict(adaptive_exact_convergence),
             "charge_stage": (
                 block_result_payload(exact_result)
                 if exact_mode == "charge_only" else None
@@ -21414,9 +26877,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "mcs_process": (
                 None if coherent_result is None
                 else (
-                    fast12_profile_payload(coherent_result)
-                    if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
-                    else coherent_fisher_payload(coherent_result)
+                    physics_profile_payload(coherent_result)
+                    if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                    else (
+                        fast12_profile_payload(coherent_result)
+                        if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+                        else coherent_fisher_payload(coherent_result)
+                    )
                 )
             ),
             "initial_t0_profile": (
@@ -21554,15 +27021,22 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         return events
 
 
-    def load_input_events():
+    def load_input_events(*, max_events_override=None):
         global WCTE_DATA_LOADER_METADATA
+        max_events = (
+            MAX_EVENTS_TO_FIT
+            if max_events_override is None
+            else max_events_override
+        )
+        if max_events is not None:
+            max_events = max(0, int(max_events))
         if EVENT_SOURCE == "selection":
             config = WCTESelectionConfig(
                 run=int(RUN),
                 root_file=str(CONFIG_ROOT_FILE),
                 particle=str(PARTICLE_SELECTION_LABEL),
                 max_root_entries=int(N_ROOT_ENTRIES),
-                max_selected_events=MAX_EVENTS_TO_FIT,
+                max_selected_events=max_events,
                 step_size=SELECTION_STEP_SIZE,
                 apply_mpmt_data_quality_cuts=bool(APPLY_MPMT_DATA_QUALITY_CUTS),
                 apply_vme_event_quality_cuts=bool(APPLY_VME_EVENT_QUALITY_CUTS),
@@ -21604,7 +27078,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "adapter": "user_event_file",
             "path": str(USER_EVENT_FILE),
         }
-        return load_user_event_file(USER_EVENT_FILE, max_events=MAX_EVENTS_TO_FIT)
+        return load_user_event_file(USER_EVENT_FILE, max_events=max_events)
 
 
     def _source_event_id(event, fallback_index):
@@ -21763,7 +27237,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)
                 coherent_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
-                if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                _coherent_warmup = coherent_warmup_action(
+                    MCS_COHERENT_IMPLEMENTATION
+                )
+                if _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -21788,7 +27265,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         ),
                         numba_threads=MCS_COHERENT_NUMBA_THREADS,
                     )
-                else:
+                elif _coherent_warmup == "legacy_fisher":
                     _ = run_coherent_fisher_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -21806,6 +27283,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         apply_expected_contraction=(
                             MCS_COHERENT_APPLY_EXPECTED_CONTRACTION
                         ),
+                    )
+                else:
+                    raise AssertionError(
+                        f"unsupported coherent warm-up action {_coherent_warmup!r} "
+                        "in this engine"
                     )
 
         finally:
@@ -21830,6 +27312,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         GOOD_WCTE_PMTS_SET = load_good_wcte_pmts()
         ACTIVE_WCTE_PMT_IDS, PMT_ID_TO_POSITION = _build_active_channel_maps()
         configure_relative_efficiency()
+        _validate_realized_wcte_absolute_light_context(
+            relative_efficiency_metadata=REL_EFF_CALIBRATION_METADATA,
+            adc_per_pe=CHARGE_ADC_PER_PE,
+            geometry_placement=WCTE_PLACEMENT_KEY,
+            detector_summary=DETECTOR_SUMMARY,
+            active_pmt_ids=ACTIVE_WCTE_PMT_IDS,
+        )
 
         configured_wcte = bool(WCTE)
         geometry_wcte = bool(DETECTOR_SUMMARY.is_wcte_like)
@@ -22128,6 +27617,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             or OBS_PROMPT_MAX_ALL is None
             or OBS_SOURCE_EVENT_ID_ALL is None
             or OBS_SOURCE_ROOT_ENTRY_INDEX_ALL is None
+            or OBS_SOURCE_INPUT_INDEX_ALL is None
             or OBS_TIME_OFFSET_ALL is None
             or OBS_RAW_HIT_COUNT_ALL is None
             or OBS_PROMPT_HIT_COUNT_ALL is None
@@ -22139,10 +27629,18 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         PMT_MODEL.first_arrival_prompt_min_ns = prompt_lo
         PMT_MODEL.first_arrival_prompt_max_ns = prompt_hi
 
-        result = fit_event(OBS_PES_ALL[index], OBS_TS_ALL[index])
+        result = _fit_event_with_failure_record(
+            fit_event,
+            OBS_PES_ALL[index],
+            OBS_TS_ALL[index],
+            event_index=index,
+            prompt_time_min_ns=prompt_lo,
+            prompt_time_max_ns=prompt_hi,
+        )
         result["event_index"] = index
         result["source_event_id"] = int(OBS_SOURCE_EVENT_ID_ALL[index])
         result["source_root_entry_index"] = int(OBS_SOURCE_ROOT_ENTRY_INDEX_ALL[index])
+        result["source_event_index"] = int(OBS_SOURCE_INPUT_INDEX_ALL[index])
         result["global_time_offset_ns"] = float(OBS_TIME_OFFSET_ALL[index])
         result["raw_hit_count"] = int(OBS_RAW_HIT_COUNT_ALL[index])
         result["prompt_active_hit_count"] = int(OBS_PROMPT_HIT_COUNT_ALL[index])
@@ -22374,7 +27872,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "fit_particle": FIT_PARTICLE,
                 "fit_particle_raw": FIT_PARTICLE_RAW,
                 "expected_ke_mev_seed_guidance": float(ENERGY_TRUE),
-                "fit_mode": FIT_MODE,
+                "fit_mode": _PUBLIC_FIT_MODE,
+                "optical_track_end_mode": FIT_MODE,
                 "full_length_semantics": (
                     {
                         "fitted_coordinate": "remaining_csda_range",
@@ -22456,8 +27955,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "max_events_to_fit": (
                     None if MAX_EVENTS_TO_FIT is None else int(MAX_EVENTS_TO_FIT)
                 ),
+                "n_selected_events_available": int(INPUT_EVENTS_AVAILABLE_COUNT),
                 "n_selected_events_loaded": int(INPUT_EVENTS_LOADED_COUNT),
                 "n_events_prepared": int(INPUT_EVENTS_PREPARED_COUNT),
+                "source_event_start_index": int(INPUT_SOURCE_START_INDEX),
+                "source_event_stop_exclusive": int(INPUT_SOURCE_STOP_EXCLUSIVE),
                 "n_events_skipped_during_preparation": int(len(SKIPPED_EVENT_RECORDS)),
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
@@ -22610,9 +28112,20 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         TIME_REFERENCE_LOCAL_HALF_WIDTH_NS
                     ),
                     "charge_normalization_mode": str(CHARGE_NORMALIZATION_MODE),
+                    "charge_likelihood_mode": str(CHARGE_LIKELIHOOD_MODE),
+                    "pmt_spe_response_model": str(PMT_MODEL.spe_response_model),
+                    "pmt_charge_response": _runtime_pmt_charge_response_metadata(
+                        PMT_MODEL
+                    ),
                     "global_charge_scale": (
                         None if GLOBAL_CHARGE_SCALE is None
                         else float(GLOBAL_CHARGE_SCALE)
+                    ),
+                    "global_charge_calibration_id": str(
+                        GLOBAL_CHARGE_CALIBRATION_ID
+                    ) or None,
+                    "absolute_light_calibration": (
+                        _absolute_light_calibration_metadata("WCTE")
                     ),
                     "user_event_apply_prompt_window": (
                         bool(USER_EVENT_APPLY_PROMPT_WINDOW)
@@ -22701,6 +28214,23 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     ADAPTIVE_EXACT_POLISH_MIN_LAST_IMPROVEMENT
                 ),
                 "adaptive_exact_polish_sweeps": int(ADAPTIVE_EXACT_POLISH_SWEEPS),
+                "adaptive_exact_polish_max_total_sweeps": int(
+                    ADAPTIVE_EXACT_POLISH_MAX_TOTAL_SWEEPS
+                ),
+                "adaptive_exact_polish_legacy_extra_sweeps_override": (
+                    None
+                    if ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS is None
+                    else int(ADAPTIVE_EXACT_POLISH_LEGACY_EXTRA_SWEEPS)
+                ),
+                "adaptive_exact_polish_backend": str(
+                    ADAPTIVE_EXACT_POLISH_BACKEND
+                ),
+                "adaptive_exact_cobyqa_max_evaluations_per_attempt": int(
+                    ADAPTIVE_EXACT_COBYQA_MAX_EVALUATIONS
+                ),
+                "adaptive_exact_cobyqa_max_restarts": int(
+                    ADAPTIVE_EXACT_COBYQA_MAX_RESTARTS
+                ),
                 "timing_sweeps": int(TIMING_SWEEPS),
                 # Parallel wall time measures throughput. Intrinsic event_fit_wall_s
                 # remains the single-worker latency metric used for the <1 s target.
@@ -22771,6 +28301,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "source_root_entry_index": [
                 int(result["source_root_entry_index"]) for result in ordered
             ],
+            "source_event_index": [
+                int(result["source_event_index"]) for result in ordered
+            ],
             "global_time_offset_ns": [
                 float(result["global_time_offset_ns"]) for result in ordered
             ],
@@ -22790,7 +28323,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 result["event_fit_wall_s"] for result in ordered
             ],
             "total_nfcn": [result["total_nfcn"] for result in ordered],
+            "adaptive_exact_convergence": [
+                dict(result.get("adaptive_exact_convergence", {}))
+                for result in ordered
+            ],
         }
+        _append_event_status_columns(output, ordered)
         if SAVE_DETAILED_EVENT_RESULTS:
             output["results"] = ordered
             output["errors"] = [dict(result.get("errors", {})) for result in ordered]
@@ -22846,37 +28384,68 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
     def main():
         global OBS_PES_ALL, OBS_TS_ALL, OBS_PROMPT_MIN_ALL, OBS_PROMPT_MAX_ALL
-        global OBS_SOURCE_EVENT_ID_ALL, OBS_SOURCE_ROOT_ENTRY_INDEX_ALL, OBS_TIME_OFFSET_ALL
+        global OBS_SOURCE_EVENT_ID_ALL, OBS_SOURCE_ROOT_ENTRY_INDEX_ALL
+        global OBS_SOURCE_INPUT_INDEX_ALL, OBS_TIME_OFFSET_ALL
         global OBS_RAW_HIT_COUNT_ALL, OBS_PROMPT_HIT_COUNT_ALL
-        global SKIPPED_EVENT_RECORDS, INPUT_EVENTS_LOADED_COUNT, INPUT_EVENTS_PREPARED_COUNT
+        global SKIPPED_EVENT_RECORDS, INPUT_EVENTS_AVAILABLE_COUNT
+        global INPUT_EVENTS_LOADED_COUNT, INPUT_EVENTS_PREPARED_COUNT
+        global INPUT_SOURCE_START_INDEX, INPUT_SOURCE_STOP_EXCLUSIVE
 
         setup_wall0 = time.perf_counter()
         initialize()
-        input_events = load_input_events()
+        source_start_requested = int(EVENT_START_INDEX)
+        if MAX_EVENTS_TO_FIT is None:
+            load_limit = None
+        else:
+            load_limit = source_start_requested + max(0, int(MAX_EVENTS_TO_FIT))
+        input_events_all = load_input_events(max_events_override=load_limit)
+        INPUT_EVENTS_AVAILABLE_COUNT = int(len(input_events_all))
+        event_window = resolve_event_window(
+            INPUT_EVENTS_AVAILABLE_COUNT,
+            source_start_requested,
+            MAX_EVENTS_TO_FIT,
+            source_label=(
+                f"WCTE selected run {RUN}"
+                if EVENT_SOURCE == "selection"
+                else f"WCTE user event file {USER_EVENT_FILE}"
+            ),
+        )
+        source_start = int(event_window.start)
+        source_stop = int(event_window.stop)
+        input_events = input_events_all[source_start:source_stop]
+        INPUT_SOURCE_START_INDEX = source_start
+        INPUT_SOURCE_STOP_EXCLUSIVE = source_stop
         INPUT_EVENTS_LOADED_COUNT = int(len(input_events))
 
         prepared = []
+        prepared_source_indices = []
         SKIPPED_EVENT_RECORDS = []
-        for input_index, raw_event in enumerate(input_events):
-            item = prepare_event_observables(raw_event, input_index)
+        for source_input_index, raw_event in enumerate(
+            input_events, start=source_start
+        ):
+            item = prepare_event_observables(raw_event, source_input_index)
             if item is None:
                 try:
                     array = _coerce_event_array(
-                        raw_event, event_label=f"selected_event[{input_index}]"
+                        raw_event,
+                        event_label=f"selected_event[{source_input_index}]",
                     )
-                    source_id = _source_event_id(array, input_index)
-                    root_entry_index = _source_root_entry_index(array, input_index)
+                    source_id = _source_event_id(array, source_input_index)
+                    root_entry_index = _source_root_entry_index(
+                        array, source_input_index
+                    )
                 except Exception:
-                    source_id = int(input_index)
-                    root_entry_index = int(input_index)
+                    source_id = int(source_input_index)
+                    root_entry_index = int(source_input_index)
                 SKIPPED_EVENT_RECORDS.append({
-                    "input_index": int(input_index),
+                    "input_index": int(source_input_index),
                     "source_event_id": int(source_id),
                     "source_root_entry_index": int(root_entry_index),
                     "reason": "no finite active prompt PE after real-data preparation",
                 })
                 continue
             prepared.append(item)
+            prepared_source_indices.append(int(source_input_index))
 
         INPUT_EVENTS_PREPARED_COUNT = int(len(prepared))
         if not prepared:
@@ -22892,6 +28461,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         OBS_SOURCE_EVENT_ID_ALL = np.asarray([item[4] for item in prepared], dtype=np.int64)
         OBS_SOURCE_ROOT_ENTRY_INDEX_ALL = np.asarray(
             [item[5] for item in prepared], dtype=np.int64
+        )
+        OBS_SOURCE_INPUT_INDEX_ALL = np.asarray(
+            prepared_source_indices, dtype=np.int64
         )
         OBS_TIME_OFFSET_ALL = np.asarray([item[6] for item in prepared], dtype=np.float64)
         OBS_RAW_HIT_COUNT_ALL = np.asarray([item[7] for item in prepared], dtype=np.int64)
@@ -22913,7 +28485,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         setup_wall_s = float(time.perf_counter() - setup_wall0)
 
         print("LicketyFit real-WCTE batch run")
-        print("  driver release:", DRIVER_RELEASE)
+        print(
+            "  public release:",
+            os.environ.get("LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE),
+        )
+        print("  embedded engine revision:", DRIVER_RELEASE)
         print("  run / nominal beam momentum [MeV/c]:", int(RUN), float(BEAM_P))
         print("  particle hypothesis:", FIT_PARTICLE)
         print("  expected KE for seed guidance [MeV]:", float(WCTE_EXPECTED_KE_MEV))
@@ -22948,8 +28524,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         print("  prompt window / time reference:", PROMPT_WINDOW_MODE, TIME_REFERENCE_MODE)
         print("  output:", OUTPUT_FILE)
         print(
-            "  selected loaded / prepared / skipped:",
-            INPUT_EVENTS_LOADED_COUNT, INPUT_EVENTS_PREPARED_COUNT, len(SKIPPED_EVENT_RECORDS),
+            "  selected available / source start / loaded / prepared / skipped:",
+            INPUT_EVENTS_AVAILABLE_COUNT, INPUT_SOURCE_START_INDEX,
+            INPUT_EVENTS_LOADED_COUNT, INPUT_EVENTS_PREPARED_COUNT,
+            len(SKIPPED_EVENT_RECORDS),
         )
         print("  event workers / events per batch:", int(NPROC), int(N_EVENTS_PER_BATCH))
         if VERBOSE_SETUP:
@@ -23003,7 +28581,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         fit_loop_wall_s=elapsed,
                     )
                     checkpoint["metadata"]["checkpoint"] = bool(batch_end < n_events)
-                    checkpoint["metadata"]["last_completed_event_exclusive"] = int(batch_end)
+                    completed_source_indices = [
+                        int(result["source_event_index"]) for result in results
+                    ]
+                    checkpoint["metadata"]["last_completed_event_exclusive"] = (
+                        max(completed_source_indices) + 1
+                        if completed_source_indices else INPUT_SOURCE_START_INDEX
+                    )
                     save_output(checkpoint)
                     if PRINT_CHECKPOINT_MESSAGES:
                         print(f"  checkpoint saved: {OUTPUT_FILE}", flush=True)
@@ -23021,7 +28605,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             fit_loop_wall_s=total_wall,
         )
         output["metadata"]["checkpoint"] = False
-        output["metadata"]["last_completed_event_exclusive"] = int(n_events)
+        output["metadata"]["last_completed_event_exclusive"] = int(
+            INPUT_SOURCE_STOP_EXCLUSIVE
+        )
         save_output(output)
 
         intrinsic = np.asarray(output["event_fit_wall_s"], dtype=np.float64)
@@ -23071,9 +28657,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
     Physics-process selection is intentionally not duplicated here.  Edit the
     ``DEFAULT_ENABLE_*`` switches at the top of ``LicketyFit/Emitter.py``.  In
-    particular, ``DEFAULT_ENABLE_PRIMARY_MCS`` remains the sole MCS on/off switch;
-    turning it off disables both the optical MCS mean and every FE/KL continuation
-    stage while retaining all MCS functionality in this driver.
+    ``DEFAULT_ENABLE_PRIMARY_MCS`` selects the ordinary contained/full-length
+    primary-MCS model. ``DEFAULT_COSMIC_MCS_CONTINUATION`` independently selects
+    the geometry-clipped cosmic continuation. Both live at the top of Emitter.py.
     """
 
     # =============================================================================
@@ -23081,7 +28667,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # Physics switches live in LicketyFit/Emitter.py; this file controls fitting,
     # detector setup, input/output, seed navigation, optimization, and workers.
     # =============================================================================
-    DRIVER_RELEASE = "2026-08-10-wcte-cosmic-v20-authoritative-pmt"
+    DRIVER_RELEASE = "2026-08-21-wcte-cosmic-v23-adaptive-latency"
 
     import hashlib
     import json
@@ -23172,6 +28758,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # LicketyFit/Emitter.py:
     #   DEFAULT_ENABLE_DELTA_E
     #   DEFAULT_ENABLE_PRIMARY_MCS
+    #   DEFAULT_COSMIC_MCS_CONTINUATION
     #   DEFAULT_ENABLE_RAYLEIGH
     #   DEFAULT_ENABLE_BLACKSHEET_REFLECTION
     # The driver prints the resolved process state at startup.
@@ -23232,7 +28819,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         "cosmic", "cosmic_muon", "auto", "auto_clipped", "range_clipped",
         "geometry_clipped", "universal", "universal_muon", "cosmic_auto",
     }
-    LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_only").strip().lower().replace("-", "_")
+    LIKELIHOOD_MODE = os.environ.get("LIKELIHOOD_MODE", "charge_time").strip().lower().replace("-", "_")
     USE_T0_PRIOR = _env_bool("USE_T0_PRIOR", False)
     T0_PRIOR_SIGMA_NS = _env_optional_float("T0_PRIOR_SIGMA_NS", None)
     # This is seed guidance, not truth.  Beam momentum and kinetic energy are kept
@@ -23424,6 +29011,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     GLOBAL_CHARGE_SCALE = _env_optional_float(
         "WCTE_GLOBAL_CHARGE_SCALE", DEFAULT_WCTE_GLOBAL_CHARGE_SCALE
     )
+    GLOBAL_CHARGE_CALIBRATION_ID = os.environ.get(
+        "WCTE_GLOBAL_CHARGE_CALIBRATION_ID",
+        DEFAULT_WCTE_GLOBAL_CHARGE_CALIBRATION_ID,
+    ).strip()
 
     # Run-channel and data/MC relative-efficiency calibration.
     REL_EFF_MODE = os.environ.get("REL_EFF_MODE", "slot").strip().lower().replace("-", "_")
@@ -23495,10 +29086,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # The mandatory seed bank is detector-wide and does not depend on this value.
     # A known beam energy may be added only as an optional prioritization hint.
     WCTE_USE_EXPECTED_ENERGY_HINT = _env_bool("WCTE_USE_EXPECTED_ENERGY_HINT", False)
-    WCTE_UNIVERSAL_LENGTH_FRACTIONS = _env_float_list(
-        "WCTE_UNIVERSAL_SEED_LENGTH_FRACTIONS",
-        (0.02, 0.04, 0.08, 0.16, 0.24, 0.34, 0.48, 0.65, 0.82, 0.97),
-    )
     WCTE_BEAM_ENTRY_MM = _env_vector3("WCTE_BEAM_ENTRY_MM", (0.0, 0.0, -1350.0))
     WCTE_BEAM_DIRECTION = _env_vector3("WCTE_BEAM_DIRECTION", (0.0, 0.0, 1.0))
     WCTE_LENGTH_FACTORS = _env_float_list(
@@ -23520,19 +29107,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # the smallest beam-only proxy library.
     WCTE_INCLUDE_ORIENTATION_GUARD = _env_bool("WCTE_INCLUDE_ORIENTATION_GUARD", True)
     WCTE_GUARD_DIRECTION_FIBONACCI = _env_int("WCTE_GUARD_DIRECTION_FIBONACCI", 14)
-    WCTE_GUARD_ENTRY_INSETS_MM = tuple(_env_float_list(
-        "WCTE_GUARD_ENTRY_INSETS_MM", (0.5, 25.0, 150.0, 350.0)
-    ))
-    WCTE_GUARD_TRANSVERSE_OFFSETS_MM = (
-        (0.0, 0.0),
-        (450.0, 0.0), (-450.0, 0.0),
-        (0.0, 450.0), (0.0, -450.0),
-        (900.0, 0.0), (-900.0, 0.0),
-        (0.0, 900.0), (0.0, -900.0),
-    )
-    WCTE_GUARD_CHORD_FRACTIONS = _env_float_list(
-        "WCTE_GUARD_CHORD_FRACTIONS", (0.20, 0.45, 0.70, 0.90, 0.985, 1.0)
-    )
     ABSORPTION_FULL_RANGE_FACTORS = _env_float_list(
         "ABSORPTION_FULL_RANGE_FACTORS", (1.0, 1.15, 2.0)
     )
@@ -23600,9 +29174,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     AUTO_EXACT_RERANK_PER_TOPOLOGY = max(
         1, _env_int("AUTO_EXACT_RERANK_PER_TOPOLOGY", 6)
     )
-    AUTO_BOUNDARY_DIRECTION_FIBONACCI = _env_int(
-        "AUTO_BOUNDARY_DIRECTION_FIBONACCI", 26
-    )
     AUTO_TOPOLOGY_EXACT_PROBE_SWEEPS = max(
         1, _env_int("AUTO_TOPOLOGY_EXACT_PROBE_SWEEPS", 1)
     )
@@ -23626,8 +29197,17 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_TOURNAMENT_MAX_PROBES = max(
         1, _env_int("COSMIC_TOURNAMENT_MAX_PROBES", 6)
     )
+    COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL = max(
+        0.0,
+        _env_float(
+            "COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL", 150.0
+        ),
+    )
+    COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY = _env_bool(
+        "COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY", False
+    )
     COSMIC_TOURNAMENT_MAX_CONTINUATIONS = max(
-        1, _env_int("COSMIC_TOURNAMENT_MAX_CONTINUATIONS", 3)
+        1, _env_int("COSMIC_TOURNAMENT_MAX_CONTINUATIONS", 2)
     )
     COSMIC_TOURNAMENT_PROBE_GATE_NLL = _env_float(
         "COSMIC_TOURNAMENT_PROBE_GATE_NLL", 18.0
@@ -23717,7 +29297,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     WCTE_INCLUDE_DETECTOR_GLOBAL = _env_bool("WCTE_INCLUDE_DETECTOR_GLOBAL", True)
     WCTE_GLOBAL_VERTEX_SPACING_MM = _env_float("WCTE_GLOBAL_SEED_SPACING_MM", 700.0)
     WCTE_GLOBAL_WALL_MARGIN_MM = _env_float("WCTE_GLOBAL_SEED_WALL_MARGIN_MM", 100.0)
-    WCTE_GLOBAL_MAX_SEEDS = _env_int("WCTE_GLOBAL_MAX_SEEDS", 20_000)
     WCTE_GLOBAL_DIRECTION_FIBONACCI = _env_int("WCTE_GLOBAL_DIRECTION_FIBONACCI", 14)
     WCTE_GLOBAL_LENGTH_FACTORS = _env_float_list(
         "WCTE_GLOBAL_SEED_LENGTH_FACTORS", (0.25, 0.50, 0.75, 1.00, 1.25, 1.50)
@@ -23901,8 +29480,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # use the validated four-thread compiled FALI kernel. In multiprocessing mode
     # explicitly force the generic GNU OpenMP pool to one thread as well; the pool
     # is created before any OpenMP-backed kernel is executed in the parent.
-    os.environ.setdefault(
-        "NUMBA_NUM_THREADS", str(int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED))
+    _MCS_COHERENT_NUMBA_THREADS_REQUESTED = _prepare_numba_thread_budget(
+        _MCS_COHERENT_NUMBA_THREADS_REQUESTED
     )
     if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -23946,7 +29525,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     # regression tests. The coherent-Fisher controls are numerical quadrature and
     # local trust-region choices, not empirical MCS scales.
     MCS_TIMING_POLICY = os.environ.get("MCS_PROCESS_TIMING_POLICY", "fe_prior_transverse").strip().lower().replace("-", "_")
-    MCS_PROCESS_MODES_PER_PLANE = _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+    _MCS_PROCESS_MODES_PER_PLANE_TEXT = os.environ.get(
+        "MCS_PROCESS_MODES_PER_PLANE", ""
+    ).strip()
     MCS_PROCESS_GRID_POINTS = _env_int("MCS_PROCESS_GRID_POINTS", 41)
     MCS_FD_XYZ_MM = _env_float("MCS_PROCESS_CHARGE_FD_XYZ_MM", 1.0)
     MCS_FD_DIRECTION = _env_float("MCS_PROCESS_CHARGE_FD_DIRECTION", 2.0e-4)
@@ -23975,10 +29556,18 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     MCS_COHERENT_IMPLEMENTATION = os.environ.get(
         "MCS_COHERENT_IMPLEMENTATION", "fast12_profile"
     ).strip().lower().replace("-", "_")
-    if MCS_COHERENT_IMPLEMENTATION not in {"fast12_profile", "legacy_fisher"}:
+    if MCS_COHERENT_IMPLEMENTATION not in {
+        "physics_reference", "fast12_profile", "legacy_fisher"
+    }:
         raise ValueError(
-            "MCS_COHERENT_IMPLEMENTATION must be fast12_profile or legacy_fisher"
+            "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
+            "fast12_profile, or legacy_fisher"
         )
+    MCS_PROCESS_MODES_PER_PLANE = (
+        _env_int("MCS_PROCESS_MODES_PER_PLANE", 12)
+        if _MCS_PROCESS_MODES_PER_PLANE_TEXT
+        else default_coherent_modes_per_plane(MCS_COHERENT_IMPLEMENTATION)
+    )
     MCS_COHERENT_LATENT_MAX_ITERATIONS = _env_int(
         "MCS_COHERENT_LATENT_MAX_ITERATIONS", 4
     )
@@ -24059,6 +29648,138 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS = max(1, _env_int(
         "COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS", 2
     ))
+
+    # Detector-safe point-multilateration navigator.  Hybrid is the default:
+    # compact independent timing families are used only when both physical
+    # start hypotheses are covered; otherwise the immutable complete cosmic
+    # bank is restored.
+    # The point-source fit is deliberately used only to nominate detector-safe
+    # track lines; it never changes the production likelihood or supplies a
+    # covariance for the charged-particle fit.
+    COSMIC_MULTILATERATION_SEED_MODE = os.environ.get(
+        "COSMIC_MULTILATERATION_SEED_MODE", "hybrid"
+    ).strip().lower()
+    if COSMIC_MULTILATERATION_SEED_MODE not in {
+        "off", "additive", "primary", "hybrid", "guided"
+    }:
+        raise ValueError(
+            "COSMIC_MULTILATERATION_SEED_MODE must be off, additive, primary, "
+            "hybrid, or guided"
+        )
+    if (
+        LIKELIHOOD_MODE == "charge_only"
+        and COSMIC_MULTILATERATION_SEED_MODE != "off"
+    ):
+        raise ValueError(
+            "Cosmic multilateration/causal seeding uses hit timing and is not "
+            "active in charge_only fits; set "
+            "COSMIC_MULTILATERATION_SEED_MODE=off"
+        )
+    if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+        # Validated compact defaults: one causal candidate per physical start
+        # hypothesis.  Explicit expert environment settings still win.
+        if "COSMIC_CAUSAL_MAX_SEEDS" not in os.environ:
+            COSMIC_CAUSAL_MAX_SEEDS = 2
+        if "COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS" not in os.environ:
+            COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS = 1
+    COSMIC_MULTILATERATION_GROUP_INDEX = _env_float(
+        "COSMIC_MULTILATERATION_GROUP_INDEX", 1.373
+    )
+    COSMIC_MULTILATERATION_MIN_HITS = max(4, _env_int(
+        "COSMIC_MULTILATERATION_MIN_HITS", 8
+    ))
+    COSMIC_MULTILATERATION_MAX_HITS = max(0, _env_int(
+        "COSMIC_MULTILATERATION_MAX_HITS", 0
+    ))
+    COSMIC_MULTILATERATION_MAX_NFEV = max(8, _env_int(
+        "COSMIC_MULTILATERATION_MAX_NFEV", 64
+    ))
+    COSMIC_MULTILATERATION_POOL_SEEDS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_POOL_SEEDS", 16
+    ))
+    COSMIC_MULTILATERATION_MAX_SEEDS = max(0, _env_int(
+        "COSMIC_MULTILATERATION_MAX_SEEDS", 6
+    ))
+    COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS", 4
+    ))
+    COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS", 3
+    ))
+    COSMIC_MULTILATERATION_TOURNAMENT_PROBES = max(2, _env_int(
+        "COSMIC_MULTILATERATION_TOURNAMENT_PROBES", 4
+    ))
+    COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS = max(1, _env_int(
+        "COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS", 2
+    ))
+    if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+        # Match the independently validated four-start/two-probe policy when a
+        # user selects hybrid mode without expert overrides.  The four starts
+        # are one causal and one multilateration realization for each topology;
+        # only one start per topology enters the ordinary optimizer tournament.
+        if "COSMIC_MULTILATERATION_MAX_SEEDS" not in os.environ:
+            COSMIC_MULTILATERATION_MAX_SEEDS = 2
+        if "COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS" not in os.environ:
+            COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS = 1
+        if "COSMIC_MULTILATERATION_TOURNAMENT_PROBES" not in os.environ:
+            COSMIC_MULTILATERATION_TOURNAMENT_PROBES = 2
+        if "COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS" not in os.environ:
+            COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS = 2
+    COSMIC_MULTILATERATION_INCLUDE_REVERSE = _env_bool(
+        "COSMIC_MULTILATERATION_INCLUDE_REVERSE", False
+    )
+    COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD = max(
+        0.0,
+        _env_float(
+            "COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD", 0.15
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG = min(
+        180.0,
+        max(1.0, _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG", 20.0
+        )),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION = min(
+        1.0,
+        max(1.0e-3, _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION", 0.12
+        )),
+    )
+    COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS = max(
+        4,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS",
+            512,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS", 2
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES",
+            4,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES = max(
+        1,
+        _env_int(
+            "COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES",
+            2,
+        ),
+    )
+    COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER = max(
+        0.0,
+        _env_float(
+            "COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER",
+            1.0,
+        ),
+    )
 
     COSMIC_TWO_ANCHOR_REFINEMENT = _env_bool(
         "COSMIC_TWO_ANCHOR_REFINEMENT", True
@@ -24243,20 +29964,112 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         ),
     }
 
-    # Retained research continuations; both remain off by default and are
-    # isolated from the validated straight cosmic production path.
-    COSMIC_FERMI_EYGES_ENABLED = _env_bool(
-        "COSMIC_FERMI_EYGES_ENABLED", False
+    # The cosmic continuation family is selected only by
+    # DEFAULT_COSMIC_MCS_CONTINUATION at the top of LicketyFit/Emitter.py. It is
+    # resolved after importing Emitter below. The remaining values here are
+    # numerical/research controls, not competing model on/off switches.
+    COSMIC_COHERENT_FIXED_KE0_MEV = _env_optional_float(
+        "COSMIC_COHERENT_FIXED_KE0_MEV", None
     )
-    COSMIC_COHERENT_PROFILE_ENABLED = _env_bool(
-        "COSMIC_COHERENT_PROFILE_ENABLED", False
+    COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES = max(0, _env_int(
+        "COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES", 0
+    ))
+    COSMIC_JOINT_ENERGY_MIN_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_MIN_MEV", 60.0
     )
-    if COSMIC_FERMI_EYGES_ENABLED and COSMIC_COHERENT_PROFILE_ENABLED:
+    COSMIC_JOINT_ENERGY_MAX_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_MAX_MEV", 650.0
+    )
+    COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV = tuple(_env_float_list(
+        "COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV", []
+    ))
+    COSMIC_JOINT_ENERGY_STRATUM_REPLICATES = max(1, _env_int(
+        "COSMIC_JOINT_ENERGY_STRATUM_REPLICATES", 1
+    ))
+    COSMIC_JOINT_PARTICLES = max(2, _env_int(
+        "COSMIC_JOINT_PARTICLES", 32
+    ))
+    COSMIC_JOINT_RANDOM_SEED = _env_int(
+        "COSMIC_JOINT_RANDOM_SEED", 41873
+    )
+    COSMIC_JOINT_TARGET_ESS_FRACTION = _env_float(
+        "COSMIC_JOINT_TARGET_ESS_FRACTION", 0.80
+    )
+    COSMIC_JOINT_RESAMPLE_ESS_FRACTION = _env_float(
+        "COSMIC_JOINT_RESAMPLE_ESS_FRACTION", 0.55
+    )
+    COSMIC_JOINT_MAX_TEMPERATURES = max(1, _env_int(
+        "COSMIC_JOINT_MAX_TEMPERATURES", 64
+    ))
+    COSMIC_JOINT_REJUVENATION_STEPS = max(0, _env_int(
+        "COSMIC_JOINT_REJUVENATION_STEPS", 3
+    ))
+    COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS = max(0, _env_int(
+        "COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS", 12
+    ))
+    COSMIC_JOINT_ENERGY_RW_MEV = _env_float(
+        "COSMIC_JOINT_ENERGY_RW_MEV", 30.0
+    )
+    COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY", 0.15
+    )
+    COSMIC_JOINT_RANGE_PCN_RHO = _env_float(
+        "COSMIC_JOINT_RANGE_PCN_RHO", 0.80
+    )
+    COSMIC_JOINT_PATH_PCN_RHO = _env_float(
+        "COSMIC_JOINT_PATH_PCN_RHO", 0.92
+    )
+    COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC = _env_bool(
+        "COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC", False
+    )
+    COSMIC_MIXED_INFERENCE_ENGINE = os.environ.get(
+        "COSMIC_MIXED_INFERENCE_ENGINE", "smc"
+    ).strip().lower().replace("-", "_")
+    if COSMIC_MIXED_INFERENCE_ENGINE not in {"smc", "importance"}:
         raise ValueError(
-            "Enable only one cosmic MCS continuation: linear FE or nonlinear coherent profile"
+            "COSMIC_MIXED_INFERENCE_ENGINE must be 'smc' or 'importance'"
         )
+    COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED = _env_bool(
+        "COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED", False
+    )
+    COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED = _env_bool(
+        "COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED", False
+    )
+    COSMIC_JOINT_PATH_GUIDE_RHO = _env_float(
+        "COSMIC_JOINT_PATH_GUIDE_RHO", 0.75
+    )
+    COSMIC_JOINT_PATH_GUIDE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_PATH_GUIDE_PROBABILITY", 0.50
+    )
+    COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY", 0.20
+    )
+    COSMIC_JOINT_GUIDE_INITIAL_BETA = _env_float(
+        "COSMIC_JOINT_GUIDE_INITIAL_BETA", 0.0
+    )
+    COSMIC_JOINT_GUIDE_ITERATIONS = max(1, _env_int(
+        "COSMIC_JOINT_GUIDE_ITERATIONS", 80
+    ))
+    COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION = _env_float(
+        "COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION", 4.0
+    )
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS", 128
+    ))
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS", 3
+    ))
+    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED = _env_int(
+        "COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED", 20260816
+    )
+    COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY = _env_float(
+        "COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY", 0.10
+    )
+    COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES = max(0, _env_int(
+        "COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES", 2
+    ))
     COSMIC_COHERENT_MODES_PER_PLANE = max(1, _env_int(
-        "COSMIC_COHERENT_MODES_PER_PLANE", 4
+        "COSMIC_COHERENT_MODES_PER_PLANE", 12
     ))
     COSMIC_COHERENT_GRID_POINTS = max(17, _env_int(
         "COSMIC_COHERENT_GRID_POINTS", 41
@@ -24273,6 +30086,53 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_COHERENT_TRACK_CYCLES = max(1, _env_int(
         "COSMIC_COHERENT_TRACK_CYCLES", 2
     ))
+    COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM = _env_float(
+        "COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM", 30.0
+    )
+    COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM = _env_float(
+        "COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM", 2.0
+    )
+    COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES = max(1, _env_int(
+        "COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES", 8
+    ))
+    COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS = max(0, _env_int(
+        "COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS", 2
+    ))
+    COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS = max(
+        0,
+        _env_int(
+            "COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS",
+            1,
+        ),
+    )
+    if not (
+        math.isfinite(COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM)
+        and math.isfinite(COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM)
+        and 0.0 < COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+        <= COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+    ):
+        raise ValueError(
+            "coherent joint-timing range steps must be finite, positive, and "
+            "ordered"
+        )
+    COSMIC_COHERENT_TRACK_TRUST = _env_float(
+        "COSMIC_COHERENT_TRACK_TRUST", 1.0
+    )
+    if (
+        not math.isfinite(COSMIC_COHERENT_TRACK_TRUST)
+        or COSMIC_COHERENT_TRACK_TRUST <= 0.0
+    ):
+        raise ValueError("COSMIC_COHERENT_TRACK_TRUST must be positive and finite")
+    COSMIC_COHERENT_SELECTION_OBJECTIVE = os.environ.get(
+        "COSMIC_COHERENT_SELECTION_OBJECTIVE", "laplace_surrogate"
+    ).strip().lower()
+    if COSMIC_COHERENT_SELECTION_OBJECTIVE not in {
+        "posterior", "laplace_surrogate"
+    }:
+        raise ValueError(
+            "COSMIC_COHERENT_SELECTION_OBJECTIVE must be posterior or "
+            "laplace_surrogate"
+        )
     COSMIC_FE_MODES_PER_PLANE = max(1, _env_int(
         "COSMIC_FE_MODES_PER_PLANE", 4
     ))
@@ -24378,7 +30238,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         run_cosmic_fermi_eyges_update,
     )
     from LicketyFit.cosmic_coherent_mcs import (
+        run_cosmic_coherent_joint_length_update,
+        run_cosmic_joint_energy_range_update,
         run_cosmic_coherent_profile_update,
+    )
+    from LicketyFit.mcs_curved_path import (
+        preload_coherent_charge_numba_kernels,
     )
     from LicketyFit.cosmic_track_fit import (
         BlockOptimizerResult,
@@ -24404,6 +30269,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         seed_values_from_mapping,
         select_diverse_seed_indices,
         track_aligned_block_optimize,
+        two_anchor_stationarity_probe,
         two_anchor_block_optimize,
     )
     from LicketyFit.cosmic_navigation import (
@@ -24411,6 +30277,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         range_stratum_from_ratio,
         select_range_stratified_positions,
         select_range_stratified_seed_indices,
+        select_cosmic_topology_primary_positions,
         select_cosmic_tournament_positions,
         select_cosmic_continuation_positions,
         validate_range_ratio_edges,
@@ -24420,6 +30287,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         build_tangent_direction_fan,
         pivot_reference_for_direction_fan,
         refine_local_causal_timing_lines,
+    )
+    from LicketyFit.multilateration_seeding import (
+        build_multilateration_timing_seed_guard,
+        fit_point_multilateration,
+        rank_multilateration_seed_bank,
+        select_guided_seed_bank_indices,
     )
     from LicketyFit.detector_geometry import (
         DetectorGeometrySummary,
@@ -24497,15 +30370,15 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     AUTO_CLIPPED_TRACK = bool(_AUTO_CLIPPED_MODE_REQUESTED)
     if not AUTO_CLIPPED_TRACK:
         raise ValueError(
-            "The cosmic engine only accepts FIT_MODE=cosmic. "
+            "The general engine only accepts FIT_MODE=general. "
             "Historical aliases auto_clipped, range_clipped and universal are "
             "accepted for compatibility."
         )
     # The internal optical coordinate is the CSDA range to Cherenkov threshold.
-    # The public mode label remains cosmic and the visible segment is derived by
+    # The public mode label is general and the visible segment is derived by
     # clipping the finite-range track to the detector water boundary.
     FIT_MODE = "full_length"
-    FIT_MODE_LABEL = "cosmic"
+    FIT_MODE_LABEL = "general"
     if LIKELIHOOD_MODE not in {"charge_only", "charge_time", "timing_only"}:
         raise ValueError("LIKELIHOOD_MODE must be charge_only, charge_time, or timing_only")
     if PROXY_GROUP_MODE not in {"mpmt", "pmt"}:
@@ -24559,6 +30432,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "WCTE_CHARGE_NORMALIZATION_MODE=global_scale requires a positive "
             "WCTE_GLOBAL_CHARGE_SCALE calibrated independently of the fitted event"
         )
+    CHARGE_LIKELIHOOD_MODE = _validate_charge_likelihood_calibration(
+        normalization_mode=CHARGE_NORMALIZATION_MODE,
+        global_scale=GLOBAL_CHARGE_SCALE,
+        calibration_id=GLOBAL_CHARGE_CALIBRATION_ID,
+        environment_prefix="WCTE",
+    )
     if EVENT_SOURCE == "file" and not USER_EVENT_FILE:
         raise ValueError("EVENT_SOURCE=file requires USER_EVENT_FILE")
 
@@ -24578,6 +30457,68 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     _EMITTER_SWITCHES = emitter_switch_summary_from_env()
     PRIMARY_MCS_ENABLED = bool(_EMITTER_SWITCHES["enable_primary_mcs"])
     PRIMARY_MCS_MODEL = str(_EMITTER_SWITCHES["primary_mcs_model"]).strip().lower().replace("-", "_")
+    _COSMIC_MODEL_SWITCHES = _cosmic_model_switches_from_emitter(
+        _EMITTER_SWITCHES
+    )
+    COSMIC_MCS_CONTINUATION = str(_COSMIC_MODEL_SWITCHES["model"])
+    COSMIC_FERMI_EYGES_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["linear_fermi_eyges"]
+    )
+    COSMIC_COHERENT_PROFILE_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["coherent_fermi_eyges"]
+    )
+    COSMIC_JOINT_ENERGY_RANGE_ENABLED = bool(
+        _COSMIC_MODEL_SWITCHES["joint_energy_range"]
+    )
+    COHERENT_NUMBA_PRELOAD = (
+        preload_coherent_charge_numba_kernels()
+        if (
+            COSMIC_COHERENT_PROFILE_ENABLED
+            or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+        )
+        else {"enabled": False, "reason": "coherent continuation disabled"}
+    )
+    if PRIMARY_MCS_ENABLED and COSMIC_MCS_CONTINUATION != "off":
+        raise ValueError(
+            "A cosmic MCS continuation is selected while "
+            "DEFAULT_ENABLE_PRIMARY_MCS=True. Set it to False in Emitter.py "
+            "to prevent double-counting primary MCS."
+        )
+    if (
+        COSMIC_COHERENT_FIXED_KE0_MEV is not None
+        and not COSMIC_COHERENT_PROFILE_ENABLED
+    ):
+        raise ValueError(
+            "COSMIC_COHERENT_FIXED_KE0_MEV requires a coherent cosmic "
+            "continuation selected in Emitter.py"
+        )
+    if (
+        COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES > 0
+        and not (
+            COSMIC_COHERENT_PROFILE_ENABLED
+            and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+        )
+    ):
+        raise ValueError(
+            "COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES requires "
+            "DEFAULT_COSMIC_MCS_CONTINUATION="
+            "'coherent_then_joint_k0_range_gaussian_fe'"
+        )
+    if COSMIC_JOINT_ENERGY_RANGE_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The joint K0/range/path continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
+    if COSMIC_COHERENT_PROFILE_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The coherent FE path continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
+    if COSMIC_FERMI_EYGES_ENABLED and LIKELIHOOD_MODE == "timing_only":
+        raise ValueError(
+            "The linear FE continuation requires charge; use "
+            "LIKELIHOOD_MODE='charge_only' or 'charge_time'"
+        )
     _FE_MCS_MODE_ALIASES = {"fermi_eyges_process", "fe_process", "process", "gee"}
     _COHERENT_MCS_MODE_ALIASES = {
         "coherent_fisher", "fali_fisher", "coherent_fe", "coherent_path"
@@ -24600,6 +30541,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     USE_COHERENT_FISHER = MCS_RECONSTRUCTION_MODE == "coherent_fisher"
     USE_FERMI_EYGES = MCS_RECONSTRUCTION_MODE == "fermi_eyges_process"
     USE_LEGACY_MCS = MCS_RECONSTRUCTION_MODE == "legacy"
+    if USE_COHERENT_FISHER:
+        MCS_COHERENT_IMPLEMENTATION = validate_coherent_configuration(
+            MCS_COHERENT_IMPLEMENTATION,
+            MCS_PROCESS_MODES_PER_PLANE,
+            MCS_PROCESS_GRID_POINTS,
+            MCS_COHERENT_GRID_POINTS,
+        )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and FIT_MODE != "full_length":
         raise ValueError("Fermi--Eyges reconstruction currently requires full_length mode")
     if AUTO_CLIPPED_TRACK and (USE_FERMI_EYGES or USE_COHERENT_FISHER):
@@ -25710,6 +31658,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 fixed_direction=FIXED_DIRECTION,
                 full_range_limits=full_range_limits,
                 allow_boundary_clipping=bool(AUTO_CLIPPED_TRACK),
+                prevalidated=True,
             )
             auto_boundary_seeds: list[dict[str, object]] = []
             if AUTO_CLIPPED_TRACK:
@@ -25798,6 +31747,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             fixed_direction=FIXED_DIRECTION,
             full_range_limits=full_range_limits,
             allow_boundary_clipping=bool(AUTO_CLIPPED_TRACK),
+            prevalidated=True,
         )
         auto_boundary_seeds: list[dict[str, object]] = []
         if AUTO_CLIPPED_TRACK:
@@ -28227,8 +34177,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         if (
             not ADAPTIVE_EXACT_POLISH
             or int(ADAPTIVE_EXACT_POLISH_SWEEPS) <= 0
-            or len(result.history) < 2
         ):
+            return result, False, math.nan
+        if len(result.history) < 2:
             return result, False, math.nan
         previous = float(result.history[-2]["fval"])
         current_fval = float(result.history[-1]["fval"])
@@ -28619,6 +34570,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         }
         causal_timing_wall_s = 0.0
         causal_timing_failure = None
+        multilateration_seed_records = []
+        multilateration_line_records = []
+        multilateration_point_record = None
+        multilateration_point_fit = None
+        multilateration_pool_count = 0
+        multilateration_prefilter_nfcn = 0
+        multilateration_prefilter_wall_s = 0.0
+        multilateration_prefilter_failures = []
+        cosmic_multilateration_indices_by_hypothesis = {
+            "internal_start": set(), "boundary_entry": set()
+        }
+        multilateration_wall_s = 0.0
+        multilateration_failure = None
+        multilateration_primary_fallback_used = False
+        multilateration_primary_fallback_reason = None
+        multilateration_guided_full_bank_fallback = False
+        multilateration_guided_bank_records = []
+        multilateration_guided_bank_neighbourhood_count = 0
+        multilateration_guided_proxy_quantization_uncertainty_nll = 0.0
+        multilateration_guided_bank_wall_s = 0.0
+        multilateration_guided_bank_failure = None
         boundary_primary_indices = []
         cosmic_baseline_indices_by_hypothesis = {
             "internal_start": set(), "boundary_entry": set()
@@ -28718,9 +34690,91 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             global_candidate_indices = []
             candidate_indices = [int(x) for x in local_candidate_indices]
 
+        # In primary mode, retain a complete but dormant copy of the established
+        # candidate selection.  The event-specific multilateration family is the
+        # only family evaluated when its navigation succeeds; a numerical,
+        # geometry, or hit-count failure restores this exact incumbent selection.
+        # This fail-safe is truth-blind and does not mix a partial challenger with
+        # a partially deleted baseline bank.
+        multilateration_primary_fallback_indices = list(candidate_indices)
+        multilateration_primary_fallback_baseline_sets = {
+            hypothesis: set(indices)
+            for hypothesis, indices
+            in cosmic_baseline_indices_by_hypothesis.items()
+        }
+        multilateration_primary_fallback_range_sets = {
+            hypothesis: set(indices)
+            for hypothesis, indices
+            in cosmic_range_guard_indices_by_hypothesis.items()
+        }
+        if COSMIC_MULTILATERATION_SEED_MODE in {
+            "primary", "hybrid", "guided"
+        }:
+            candidate_indices = []
+            cosmic_baseline_indices_by_hypothesis = {
+                "internal_start": set(), "boundary_entry": set()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                "internal_start": set(), "boundary_entry": set()
+            }
+
+        causal_timing_lazy_beam_skip = False
+        causal_timing_lazy_beam_diagnostics = {}
+        causal_lazy_beam_dominance_nll = max(
+            0.0,
+            _env_float(
+                "COSMIC_CAUSAL_LAZY_BEAM_DOMINANCE_NLL",
+                0.0,
+            ),
+        )
+        if (
+            AUTO_CLIPPED_TRACK
+            and WCTE
+            and causal_lazy_beam_dominance_nll > 0.0
+            and internal_candidate_indices
+            and boundary_candidate_indices
+        ):
+            best_internal_index = min(
+                internal_candidate_indices,
+                key=lambda index: float(scores[int(index)]),
+            )
+            best_boundary_index = min(
+                boundary_candidate_indices,
+                key=lambda index: float(scores[int(index)]),
+            )
+            best_internal_score = float(scores[int(best_internal_index)])
+            best_boundary_score = float(scores[int(best_boundary_index)])
+            proxy_dominance = best_boundary_score - best_internal_score
+            best_internal_family = str(
+                event_seeds[int(best_internal_index)].get("seed_family", "")
+            )
+            causal_timing_lazy_beam_skip = bool(
+                best_internal_family == "wcte_beam_cluster"
+                and math.isfinite(proxy_dominance)
+                and proxy_dominance >= causal_lazy_beam_dominance_nll
+            )
+            causal_timing_lazy_beam_diagnostics = {
+                "enabled": True,
+                "threshold_nll": float(causal_lazy_beam_dominance_nll),
+                "best_internal_seed_index": int(best_internal_index),
+                "best_internal_seed_family": best_internal_family,
+                "best_internal_proxy_nll": best_internal_score,
+                "best_boundary_seed_index": int(best_boundary_index),
+                "best_boundary_proxy_nll": best_boundary_score,
+                "internal_dominance_nll": float(proxy_dominance),
+                "causal_guard_skipped": bool(causal_timing_lazy_beam_skip),
+            }
+
         if (
             AUTO_CLIPPED_TRACK
             and COSMIC_CAUSAL_TIMING_GUARD
+            # Guided bank restriction inherits the established truth-blind
+            # causal certificate.  Certified nominal events still skip this
+            # work; ambiguous events retain the independent timing topology
+            # guard additively.  Direct analytic-primary mode remains isolated;
+            # hybrid mode intentionally retains this independent line estimator.
+            and COSMIC_MULTILATERATION_SEED_MODE != "primary"
+            and not causal_timing_lazy_beam_skip
             and int(COSMIC_CAUSAL_MAX_SEEDS) > 0
             and LIKELIHOOD_MODE != "charge_only"
             and int(np.count_nonzero(np.isfinite(obs_ts) & (np.asarray(obs_pes) > 0.0))) >= 8
@@ -28821,36 +34875,97 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     current = best_by_line_hypothesis.get(key)
                     if current is None or row[:2] < current[:2]:
                         best_by_line_hypothesis[key] = row
-                causal_selected_rows = sorted(
-                    best_by_line_hypothesis.values(),
-                    key=lambda row: (float(row[0]), float(row[1]), int(row[2]), str(row[3])),
-                )
-                selected_signatures = {
-                    (int(row[2]), str(row[3]), float(row[4].start_fraction),
-                     float(row[4].end_fraction))
-                    for row in causal_selected_rows
-                }
-                if len(causal_selected_rows) < int(COSMIC_CAUSAL_MAX_SEEDS):
-                    for row in sorted(
-                        causal_scored,
-                        key=lambda item: (
-                            float(item[0]), float(item[1]), int(item[2]), str(item[3])
+                if COSMIC_MULTILATERATION_SEED_MODE == "hybrid":
+                    # Hybrid navigation requires both independent estimators to
+                    # cover both physical start hypotheses.  Allocate the small
+                    # causal family symmetrically before ranking within a
+                    # hypothesis; a global NLL truncation can otherwise spend
+                    # every slot on boundary entry and trigger an avoidable full-
+                    # bank fallback.  This changes hybrid mode only and leaves the
+                    # established cosmic seed policy byte-for-byte equivalent.
+                    maximum_selected = int(COSMIC_CAUSAL_MAX_SEEDS)
+                    topology_quota = {
+                        "internal_start": (maximum_selected + 1) // 2,
+                        "boundary_entry": maximum_selected // 2,
+                    }
+                    causal_selected_rows = []
+                    selected_signatures = set()
+                    for hypothesis in ("internal_start", "boundary_entry"):
+                        quota = int(topology_quota[hypothesis])
+                        if quota <= 0:
+                            continue
+                        hypothesis_rows = sorted(
+                            (
+                                row for row in causal_scored
+                                if str(row[3]) == hypothesis
+                            ),
+                            key=lambda item: (
+                                float(item[0]), float(item[1]), int(item[2])
+                            ),
+                        )
+                        best_by_line = {}
+                        for row in hypothesis_rows:
+                            best_by_line.setdefault(int(row[2]), row)
+                        prioritized = sorted(
+                            best_by_line.values(),
+                            key=lambda item: (
+                                float(item[0]), float(item[1]), int(item[2])
+                            ),
+                        ) + hypothesis_rows
+                        retained = 0
+                        for row in prioritized:
+                            signature = (
+                                int(row[2]), str(row[3]),
+                                float(row[4].start_fraction),
+                                float(row[4].end_fraction),
+                            )
+                            if signature in selected_signatures:
+                                continue
+                            selected_signatures.add(signature)
+                            causal_selected_rows.append(row)
+                            retained += 1
+                            if retained >= quota:
+                                break
+                else:
+                    causal_selected_rows = sorted(
+                        best_by_line_hypothesis.values(),
+                        key=lambda row: (
+                            float(row[0]), float(row[1]), int(row[2]), str(row[3])
                         ),
-                    ):
-                        signature = (
+                    )
+                    selected_signatures = {
+                        (
                             int(row[2]), str(row[3]),
                             float(row[4].start_fraction),
                             float(row[4].end_fraction),
                         )
-                        if signature in selected_signatures:
-                            continue
-                        selected_signatures.add(signature)
-                        causal_selected_rows.append(row)
-                        if len(causal_selected_rows) >= int(COSMIC_CAUSAL_MAX_SEEDS):
-                            break
-                causal_selected_rows = causal_selected_rows[
-                    : int(COSMIC_CAUSAL_MAX_SEEDS)
-                ]
+                        for row in causal_selected_rows
+                    }
+                    if len(causal_selected_rows) < int(COSMIC_CAUSAL_MAX_SEEDS):
+                        for row in sorted(
+                            causal_scored,
+                            key=lambda item: (
+                                float(item[0]), float(item[1]),
+                                int(item[2]), str(item[3])
+                            ),
+                        ):
+                            signature = (
+                                int(row[2]), str(row[3]),
+                                float(row[4].start_fraction),
+                                float(row[4].end_fraction),
+                            )
+                            if signature in selected_signatures:
+                                continue
+                            selected_signatures.add(signature)
+                            causal_selected_rows.append(row)
+                            if (
+                                len(causal_selected_rows)
+                                >= int(COSMIC_CAUSAL_MAX_SEEDS)
+                            ):
+                                break
+                    causal_selected_rows = causal_selected_rows[
+                        : int(COSMIC_CAUSAL_MAX_SEEDS)
+                    ]
 
                 for charge_score, _, _, _, candidate, seed in causal_selected_rows:
                     index = int(len(event_seeds))
@@ -28872,6 +34987,518 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 }
             causal_timing_wall_s = float(time.perf_counter() - causal_start)
 
+        # The full immutable proxy bank supplies an independent, already
+        # validated certificate for when the nominal internal-start family
+        # decisively dominates the boundary family.  A failed certificate is
+        # evidence that the point-source restriction is not safe, not merely a
+        # reason to add another narrow timing family.  Restore the complete
+        # incumbent bank in that case and retain any causal seeds additively.
+        # This rule has no truth, beam direction, or energy input.  Detectors
+        # without the WCTE-specific certificate therefore fall back safely.
+        multilateration_guided_full_bank_fallback = bool(
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not causal_timing_lazy_beam_skip
+        )
+        if multilateration_guided_full_bank_fallback:
+            causal_navigation_indices = list(candidate_indices)
+            candidate_indices = []
+            fallback_seen = set()
+            for index in (
+                list(multilateration_primary_fallback_indices)
+                + causal_navigation_indices
+            ):
+                if int(index) not in fallback_seen:
+                    fallback_seen.add(int(index))
+                    candidate_indices.append(int(index))
+            cosmic_baseline_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_baseline_sets.items()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_range_sets.items()
+            }
+            multilateration_primary_fallback_used = True
+            multilateration_primary_fallback_reason = (
+                "guided_full_bank_certificate_failed"
+            )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE != "off"
+            and not multilateration_guided_full_bank_fallback
+            and int(COSMIC_MULTILATERATION_MAX_SEEDS) > 0
+            and LIKELIHOOD_MODE != "charge_only"
+            and int(np.count_nonzero(
+                np.isfinite(obs_ts) & (np.asarray(obs_pes) > 0.0)
+            )) >= int(COSMIC_MULTILATERATION_MIN_HITS)
+            and FIXED_DIRECTION is None
+        ):
+            multilateration_start = time.perf_counter()
+            try:
+                if COSMIC_MULTILATERATION_SEED_MODE == "guided":
+                    # Guided mode uses the point solution only to restrict the
+                    # immutable calibrated seed bank.  Building finite-track
+                    # segment hypotheses and charge-scoring them here cannot
+                    # affect that bank, so doing so would be pure event-time
+                    # overhead.  Additive/direct-primary modes still construct
+                    # the full analytic pool below.
+                    point_fit = fit_point_multilateration(
+                        DETECTOR,
+                        P_LOCATIONS,
+                        np.asarray(obs_pes, dtype=np.float64),
+                        np.asarray(obs_ts, dtype=np.float64),
+                        timing_sigma_ns=float(
+                            getattr(PMT_MODEL, "single_pe_time_std", 1.0)
+                        ),
+                        group_refractive_index=float(
+                            COSMIC_MULTILATERATION_GROUP_INDEX
+                        ),
+                        minimum_hits=int(COSMIC_MULTILATERATION_MIN_HITS),
+                        maximum_hits=(
+                            None
+                            if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                            else int(COSMIC_MULTILATERATION_MAX_HITS)
+                        ),
+                        maximum_nfev=int(COSMIC_MULTILATERATION_MAX_NFEV),
+                    )
+                    multilateration_pool = []
+                    multilateration_lines = []
+                else:
+                    multilateration_pool, multilateration_lines, point_fit = (
+                        build_multilateration_timing_seed_guard(
+                            DETECTOR,
+                            P_LOCATIONS,
+                            np.asarray(obs_pes, dtype=np.float64),
+                            np.asarray(obs_ts, dtype=np.float64),
+                            timing_sigma_ns=float(
+                                getattr(PMT_MODEL, "single_pe_time_std", 1.0)
+                            ),
+                            group_refractive_index=float(
+                                COSMIC_MULTILATERATION_GROUP_INDEX
+                            ),
+                            phase_refractive_index=float(
+                                getattr(EMITTER_TEMPLATE, "n", 1.344)
+                            ),
+                            maximum_full_range_mm=float(
+                                RANGE_LOOKUP.overall_distances_mm[-1]
+                            ),
+                            boundary_inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            minimum_hits=int(COSMIC_MULTILATERATION_MIN_HITS),
+                            maximum_hits=(
+                                None
+                                if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                                else int(COSMIC_MULTILATERATION_MAX_HITS)
+                            ),
+                            maximum_nfev=int(COSMIC_MULTILATERATION_MAX_NFEV),
+                            include_reverse_directions=bool(
+                                COSMIC_MULTILATERATION_INCLUDE_REVERSE
+                            ),
+                            reverse_if_resultant_below=float(
+                                COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD
+                            ),
+                            maximum_per_line_hypothesis=int(
+                                COSMIC_MULTILATERATION_MAX_PER_LINE_HYPOTHESIS
+                            ),
+                            maximum_pool_seeds=int(
+                                COSMIC_MULTILATERATION_POOL_SEEDS
+                            ),
+                        )
+                    )
+                multilateration_point_record = point_fit.metadata()
+                multilateration_point_fit = point_fit
+                multilateration_pool_count = int(len(multilateration_pool))
+                multilateration_line_records = [
+                    {
+                        "score": float(line.score),
+                        "t0_ns": float(line.t0_ns),
+                        "reference_mm": np.asarray(line.reference_mm).tolist(),
+                        "direction": np.asarray(line.direction).tolist(),
+                        "entry_mm": np.asarray(line.entry_mm).tolist(),
+                        "exit_mm": np.asarray(line.exit_mm).tolist(),
+                        "chord_length_mm": float(line.chord_length_mm),
+                        "n_hits": int(line.n_hits),
+                        "n_inliers": int(line.n_inliers),
+                    }
+                    for line in multilateration_lines
+                ]
+
+                # Point timing is weak along the track.  Retain several causal
+                # longitudinal/range realizations, score each once with the same
+                # direct-primary proxy used by the incumbent timing guard, and
+                # keep the best realization for each line/start hypothesis.
+                prefilter_start = time.perf_counter()
+                multilateration_scored = []
+                for candidate in multilateration_pool:
+                    seed = dict(candidate.seed)
+                    hypothesis = str(candidate.track_start_hypothesis)
+                    try:
+                        seed_values, seed_chart = seed_values_and_chart_for_fit(
+                            seed
+                        )
+                        for name, value in FIXED_PARAMS.items():
+                            if name != "direction" and name in seed_values:
+                                seed_values[name] = float(value)
+                        proxy_charge_objective = make_objective(
+                            obs_pes,
+                            obs_ts,
+                            seed_chart,
+                            "charge_only",
+                            proxy=True,
+                            start_hypothesis=hypothesis,
+                        )
+                        charge_score = float(
+                            proxy_charge_objective(seed_values)
+                        )
+                        multilateration_prefilter_nfcn += int(
+                            proxy_charge_objective.evaluations
+                        )
+                        if not math.isfinite(charge_score):
+                            raise RuntimeError(
+                                "non-finite multilateration charge prefilter"
+                            )
+                        seed["multilateration_proxy_charge_nll"] = float(
+                            charge_score
+                        )
+                        multilateration_scored.append((
+                            float(charge_score),
+                            float(candidate.score),
+                            int(candidate.line_rank),
+                            str(hypothesis),
+                            candidate,
+                            seed,
+                        ))
+                    except Exception as exc:
+                        multilateration_prefilter_failures.append({
+                            "line_rank": int(candidate.line_rank),
+                            "track_start_hypothesis": str(hypothesis),
+                            "topology": str(candidate.topology),
+                            "start_fraction": float(candidate.start_fraction),
+                            "end_fraction": float(candidate.end_fraction),
+                            "error": repr(exc),
+                        })
+                multilateration_prefilter_wall_s = float(
+                    time.perf_counter() - prefilter_start
+                )
+
+                # Allocate the compact final pool symmetrically between the two
+                # physical start hypotheses.  Within each hypothesis preserve one
+                # seed per independent line, then spend any remaining slot on a
+                # distinct longitudinal/range realization selected by charge.
+                # This is the intended "small set along the track" rather than a
+                # direction-only contest that accidentally deletes longitudinal
+                # uncertainty.
+                maximum_selected = int(COSMIC_MULTILATERATION_MAX_SEEDS)
+                topology_quota = {
+                    "internal_start": (maximum_selected + 1) // 2,
+                    "boundary_entry": maximum_selected // 2,
+                }
+                multilateration_selected_rows = []
+                selected_signatures = set()
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    hypothesis_rows = sorted(
+                        (
+                            row for row in multilateration_scored
+                            if str(row[3]) == hypothesis
+                        ),
+                        key=lambda item: (
+                            float(item[0]), float(item[1]), int(item[2])
+                        ),
+                    )
+                    best_by_line = {}
+                    for row in hypothesis_rows:
+                        best_by_line.setdefault(int(row[2]), row)
+                    prioritized = sorted(
+                        best_by_line.values(),
+                        key=lambda item: (
+                            float(item[0]), float(item[1]), int(item[2])
+                        ),
+                    ) + hypothesis_rows
+                    retained = 0
+                    for row in prioritized:
+                        signature = (
+                            int(row[2]), str(row[3]),
+                            float(row[4].start_fraction),
+                            float(row[4].end_fraction),
+                        )
+                        if signature in selected_signatures:
+                            continue
+                        selected_signatures.add(signature)
+                        multilateration_selected_rows.append(row)
+                        retained += 1
+                        if retained >= int(topology_quota[hypothesis]):
+                            break
+                if len(multilateration_selected_rows) < maximum_selected:
+                    for row in sorted(
+                        multilateration_scored,
+                        key=lambda item: (
+                            float(item[0]), float(item[1]),
+                            int(item[2]), str(item[3])
+                        ),
+                    ):
+                        signature = (
+                            int(row[2]), str(row[3]),
+                            float(row[4].start_fraction),
+                            float(row[4].end_fraction),
+                        )
+                        if signature in selected_signatures:
+                            continue
+                        selected_signatures.add(signature)
+                        multilateration_selected_rows.append(row)
+                        if len(multilateration_selected_rows) >= maximum_selected:
+                            break
+
+                for (
+                    charge_score, _, _, _, candidate, seed
+                ) in multilateration_selected_rows:
+                    if COSMIC_MULTILATERATION_SEED_MODE == "guided":
+                        metadata = candidate.metadata()
+                        metadata["seed"] = dict(seed)
+                        multilateration_seed_records.append({
+                            "seed_index": None,
+                            "evaluated_as_track_candidate": False,
+                            "multilateration_proxy_charge_nll": float(
+                                charge_score
+                            ),
+                            **metadata,
+                        })
+                        continue
+                    index = int(len(event_seeds))
+                    event_seeds.append(dict(seed))
+                    candidate_indices.append(index)
+                    hypothesis = str(candidate.track_start_hypothesis)
+                    cosmic_multilateration_indices_by_hypothesis[
+                        hypothesis
+                    ].add(index)
+                    metadata = candidate.metadata()
+                    metadata["seed"] = dict(seed)
+                    multilateration_seed_records.append({
+                        "seed_index": index,
+                        "evaluated_as_track_candidate": True,
+                        "multilateration_proxy_charge_nll": float(
+                            charge_score
+                        ),
+                        **metadata,
+                    })
+            except Exception as exc:
+                multilateration_failure = {
+                    "stage": "multilateration_navigation",
+                    "error": repr(exc),
+                }
+            multilateration_wall_s = float(
+                time.perf_counter() - multilateration_start
+            )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not multilateration_guided_full_bank_fallback
+            and multilateration_point_fit is not None
+        ):
+            guided_start = time.perf_counter()
+            try:
+                detector_diagonal_mm = float(np.linalg.norm(
+                    np.asarray(DETECTOR.axis_hi, dtype=np.float64)
+                    - np.asarray(DETECTOR.axis_lo, dtype=np.float64)
+                ))
+                maximum_transverse_mm = float(
+                    COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION
+                    * detector_diagonal_mm
+                )
+                guided_neighbourhood = rank_multilateration_seed_bank(
+                    PROXY_LIBRARY.seed_matrix,
+                    [_seed_start_hypothesis(seed) for seed in SEEDS],
+                    multilateration_point_fit,
+                    maximum_angle_deg=float(
+                        COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG
+                    ),
+                    maximum_transverse_distance_mm=maximum_transverse_mm,
+                    maximum_per_hypothesis=int(
+                        COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS
+                    ),
+                )
+                multilateration_guided_bank_neighbourhood_count = int(
+                    len(guided_neighbourhood)
+                )
+                by_index = {
+                    int(row.seed_index): row for row in guided_neighbourhood
+                }
+                proxy_group_index = np.asarray(
+                    PROXY_LIBRARY.group_index, dtype=np.int64
+                )
+                proxy_observed_charge = np.asarray(
+                    obs_pes, dtype=np.float64
+                )
+                proxy_valid = (
+                    (proxy_group_index >= 0)
+                    & np.isfinite(proxy_observed_charge)
+                )
+                proxy_grouped_charge = np.bincount(
+                    proxy_group_index[proxy_valid],
+                    weights=proxy_observed_charge[proxy_valid],
+                    minlength=int(PROXY_LIBRARY.group_counts.size),
+                ).astype(np.float64, copy=False)
+                proxy_quantized_charge = float(np.sum(
+                    proxy_grouped_charge[proxy_grouped_charge > 0.0]
+                ))
+                # Each stored log shape is uncertain by at most half a code
+                # spacing.  A difference of two proxy scores is consequently
+                # unresolved within delta_log * sum(q).  Retain a few distinct
+                # geometries inside that analytic bound for exact screening.
+                multilateration_guided_proxy_quantization_uncertainty_nll = (
+                    float(PROXY_LIBRARY.log_scale)
+                    * proxy_quantized_charge
+                    * float(
+                        COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER
+                    )
+                )
+                selected_by_hypothesis = {}
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    eligible = [
+                        int(row.seed_index)
+                        for row in guided_neighbourhood
+                        if row.track_start_hypothesis == hypothesis
+                    ]
+                    if not eligible:
+                        raise RuntimeError(
+                            "guided seed bank has no " + hypothesis + " candidates"
+                        )
+                    selected = select_guided_seed_bank_indices(
+                        guided_neighbourhood,
+                        np.asarray(scores, dtype=np.float64),
+                        SEEDS,
+                        COSMIC_SEED_RANGE_CLASSIFICATION.strata,
+                        start_hypothesis=hypothesis,
+                        range_representatives=min(
+                            int(
+                                COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS
+                            ),
+                            len(eligible),
+                        ),
+                        proxy_geometry_representatives=int(
+                            COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES
+                        ),
+                        maximum_proxy_geometry_gap_nll=float(
+                            COSMIC_TOURNAMENT_BASELINE_START_GATE_NLL
+                        ),
+                        maximum_quantization_tie_representatives=int(
+                            COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES
+                        ),
+                        proxy_quantization_uncertainty_nll=float(
+                            multilateration_guided_proxy_quantization_uncertainty_nll
+                        ),
+                    )
+                    if not selected:
+                        raise RuntimeError(
+                            "guided charge ranking selected no "
+                            + hypothesis + " candidates"
+                        )
+                    selected_by_hypothesis[hypothesis] = [
+                        int(index) for index in selected
+                    ]
+
+                for hypothesis in ("internal_start", "boundary_entry"):
+                    selected = selected_by_hypothesis[hypothesis]
+                    for rank, index in enumerate(selected):
+                        if int(index) not in candidate_indices:
+                            candidate_indices.append(int(index))
+                        cosmic_baseline_indices_by_hypothesis[hypothesis].add(
+                            int(index)
+                        )
+                        if rank > 0:
+                            cosmic_range_guard_indices_by_hypothesis[
+                                hypothesis
+                            ].add(int(index))
+                        row = by_index[int(index)]
+                        multilateration_guided_bank_records.append({
+                            **row.metadata(),
+                            "proxy_charge_score": float(scores[int(index)]),
+                            "seed_family": str(
+                                SEEDS[int(index)].get("seed_family", "")
+                            ),
+                            "range_stratum": int(
+                                COSMIC_SEED_RANGE_CLASSIFICATION.strata[
+                                    int(index)
+                                ]
+                            ),
+                        })
+            except Exception as exc:
+                candidate_indices = []
+                cosmic_baseline_indices_by_hypothesis = {
+                    "internal_start": set(), "boundary_entry": set()
+                }
+                cosmic_range_guard_indices_by_hypothesis = {
+                    "internal_start": set(), "boundary_entry": set()
+                }
+                multilateration_guided_bank_records = []
+                multilateration_guided_bank_failure = {
+                    "stage": "multilateration_guided_seed_bank",
+                    "error": repr(exc),
+                }
+            multilateration_guided_bank_wall_s = float(
+                time.perf_counter() - guided_start
+            )
+
+        guided_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "guided"
+            and not multilateration_guided_full_bank_fallback
+            and not multilateration_guided_bank_records
+        )
+        primary_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "primary"
+            and not candidate_indices
+        )
+        hybrid_bank_missing = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "hybrid"
+            and any(
+                not cosmic_timing_guard_indices_by_hypothesis[hypothesis]
+                or not cosmic_multilateration_indices_by_hypothesis[hypothesis]
+                for hypothesis in ("internal_start", "boundary_entry")
+            )
+        )
+        if guided_bank_missing or primary_bank_missing or hybrid_bank_missing:
+            multilateration_primary_fallback_used = True
+            multilateration_primary_fallback_reason = (
+                "guided_bank_failure"
+                if multilateration_guided_bank_failure is not None
+                else "hybrid_independent_navigation_incomplete"
+                if hybrid_bank_missing
+                else "navigation_failure"
+                if multilateration_failure is not None
+                else "no_valid_prefiltered_seeds"
+            )
+            additive_navigation_indices = (
+                list(candidate_indices)
+                if COSMIC_MULTILATERATION_SEED_MODE == "guided"
+                else []
+            )
+            candidate_indices = []
+            fallback_seen = set()
+            for index in (
+                list(multilateration_primary_fallback_indices)
+                + additive_navigation_indices
+            ):
+                if int(index) not in fallback_seen:
+                    fallback_seen.add(int(index))
+                    candidate_indices.append(int(index))
+            cosmic_baseline_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_baseline_sets.items()
+            }
+            cosmic_range_guard_indices_by_hypothesis = {
+                hypothesis: set(indices)
+                for hypothesis, indices
+                in multilateration_primary_fallback_range_sets.items()
+            }
+        hybrid_navigation_active = bool(
+            COSMIC_MULTILATERATION_SEED_MODE == "hybrid"
+            and not hybrid_bank_missing
+        )
+
         length_limits = track_length_limits()
         full_range_limits = (
             (1.0, float(RANGE_LOOKUP.overall_distances_mm[-1]))
@@ -28882,6 +35509,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         candidate_failures = []
         if causal_timing_failure is not None:
             candidate_failures.append(dict(causal_timing_failure))
+        if multilateration_failure is not None:
+            candidate_failures.append(dict(multilateration_failure))
+        if multilateration_guided_bank_failure is not None:
+            candidate_failures.append(dict(multilateration_guided_bank_failure))
         proxy_nfcn = 0
         exact_rerank_nfcn = 0
         joint_candidate_range_diagnostics = []
@@ -28909,7 +35540,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         and not BOUNDARY_CLIPPED_TRACK
                         and start_hypothesis == "internal_start"
                         and WCTE_SKIP_BROAD_PROXY_OPTIMIZATION
-                        and seed_family != "wcte_detector_global"
+                        and seed_family not in {
+                            "wcte_detector_global", "multilateration_timing"
+                        }
                     )
                 )
                 if skip_broad:
@@ -29016,6 +35649,45 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             if row is not None:
                 candidate_rows.append(row)
 
+        if hybrid_navigation_active:
+            successful_hypotheses = {
+                _seed_start_hypothesis(event_seeds[int(row[1])])
+                for row in candidate_rows
+            }
+            missing_hypotheses = {
+                "internal_start", "boundary_entry"
+            }.difference(successful_hypotheses)
+            if missing_hypotheses:
+                # Construction-time coverage is not enough: a compact seed can
+                # still fail its first exact evaluation. Restore the dormant
+                # immutable bank before topology arbitration in that case.
+                multilateration_primary_fallback_used = True
+                multilateration_primary_fallback_reason = (
+                    "hybrid_exact_candidate_incomplete"
+                )
+                hybrid_navigation_active = False
+                cosmic_baseline_indices_by_hypothesis = {
+                    hypothesis: set(indices)
+                    for hypothesis, indices
+                    in multilateration_primary_fallback_baseline_sets.items()
+                }
+                cosmic_range_guard_indices_by_hypothesis = {
+                    hypothesis: set(indices)
+                    for hypothesis, indices
+                    in multilateration_primary_fallback_range_sets.items()
+                }
+                evaluated_indices = {int(row[1]) for row in candidate_rows}
+                for index in multilateration_primary_fallback_indices:
+                    index = int(index)
+                    if index in evaluated_indices:
+                        continue
+                    if index not in candidate_indices:
+                        candidate_indices.append(index)
+                    row = evaluate_candidate(index)
+                    if row is not None:
+                        candidate_rows.append(row)
+                        evaluated_indices.add(index)
+
         if AUTO_CLIPPED_TRACK and exact_mode != "charge_only" and candidate_rows:
             # Charge determines the coarse geometric basin. Profiling t0 for every
             # diverse proxy candidate is unnecessarily expensive, especially for
@@ -29062,14 +35734,38 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             )
                     row_ratios.append(float(ratio))
                     row_strata.append(int(stratum))
-                range_positions = select_range_stratified_positions(
-                    [float(row[0]) for row in rows],
-                    row_strata,
-                    n_keep=min(
-                        int(AUTO_EXACT_RERANK_PER_TOPOLOGY), len(rows)
-                    ),
-                    raw_top=2,
+                multilateration_set = (
+                    cosmic_multilateration_indices_by_hypothesis[hypothesis]
                 )
+                # Preserve the exact incumbent range-stratified selection when
+                # the additive challenger is enabled.  Multilateration rows are
+                # closed separately below and therefore cannot consume one of
+                # the established cosmic candidate slots.
+                incumbent_positions = [
+                    int(position) for position, row in enumerate(rows)
+                    if int(row[1]) not in multilateration_set
+                ]
+                range_positions = []
+                if incumbent_positions:
+                    incumbent_range_positions = select_range_stratified_positions(
+                        [
+                            float(rows[position][0])
+                            for position in incumbent_positions
+                        ],
+                        [
+                            int(row_strata[position])
+                            for position in incumbent_positions
+                        ],
+                        n_keep=min(
+                            int(AUTO_EXACT_RERANK_PER_TOPOLOGY),
+                            len(incumbent_positions),
+                        ),
+                        raw_top=2,
+                    )
+                    range_positions = [
+                        int(incumbent_positions[int(position)])
+                        for position in incumbent_range_positions
+                    ]
                 baseline_set = cosmic_baseline_indices_by_hypothesis[hypothesis]
                 baseline_positions = [
                     int(position) for position, row in enumerate(rows)
@@ -29095,13 +35791,31 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 timing_positions = timing_positions_all[
                     : int(COSMIC_CAUSAL_EXACT_PER_HYPOTHESIS)
                 ]
+                multilateration_positions_all = [
+                    int(position) for position, row in enumerate(rows)
+                    if int(row[1]) in multilateration_set
+                ]
+                multilateration_positions_all.sort(key=lambda position: (
+                    float(rows[int(position)][0]),
+                    int(event_seeds[int(rows[int(position)][1])].get(
+                        "multilateration_line_rank", 10**9
+                    )),
+                ))
+                multilateration_positions = multilateration_positions_all[
+                    : int(COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS)
+                ]
                 # Exact-joint close the complete candidate budget used by the
                 # pre-range-guard cosmic fitter, then add the geometry/range and
                 # causal-timing guards.  Every extra family is additive rather than
                 # substitutive, so a successful charge basin cannot be deleted.
                 positions = []
                 seen_positions = set()
-                for position in baseline_positions + list(range_positions) + timing_positions:
+                for position in (
+                    baseline_positions
+                    + list(range_positions)
+                    + timing_positions
+                    + multilateration_positions
+                ):
                     position = int(position)
                     if position not in seen_positions:
                         seen_positions.add(position)
@@ -29124,6 +35838,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     "baseline_positions": [int(x) for x in baseline_positions],
                     "range_guard_positions": [int(x) for x in range_positions],
                     "causal_timing_positions": [int(x) for x in timing_positions],
+                    "multilateration_positions": [
+                        int(x) for x in multilateration_positions
+                    ],
                     "selected_origins": [
                         {
                             "baseline": bool(int(rows[int(position)][1]) in baseline_set),
@@ -29134,13 +35851,17 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             "causal_timing": bool(
                                 int(rows[int(position)][1]) in timing_set
                             ),
+                            "multilateration": bool(
+                                int(rows[int(position)][1])
+                                in multilateration_set
+                            ),
                         }
                         for position in positions
                     ],
                 })
 
-            joint_rows = []
-            for row in selected_for_joint:
+            def close_joint_candidate(row, *, stage):
+                nonlocal exact_rerank_nfcn
                 _, index, proxy_result, start_values, start_chart, _ = row
                 hypothesis = _seed_start_hypothesis(event_seeds[int(index)])
                 try:
@@ -29193,14 +35914,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     exact_rerank_nfcn += int(joint_objective.evaluations)
                     if not math.isfinite(joint_fval):
                         raise RuntimeError("non-finite exact joint candidate NLL")
-                    joint_rows.append((
+                    return (
                         joint_fval,
                         int(index),
                         proxy_result,
                         closed_values,
                         start_chart,
                         profiled,
-                    ))
+                    )
                 except Exception as exc:
                     candidate_failures.append({
                         "seed_index": int(index),
@@ -29208,9 +35929,73 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             event_seeds[int(index)].get("seed_family", "")
                         ),
                         "track_start_hypothesis": str(hypothesis),
-                        "stage": "auto_exact_joint_rerank",
+                        "stage": str(stage),
                         "error": repr(exc),
                     })
+                    return None
+
+            joint_rows = []
+            for row in selected_for_joint:
+                closed_row = close_joint_candidate(
+                    row, stage="auto_exact_joint_rerank"
+                )
+                if closed_row is not None:
+                    joint_rows.append(closed_row)
+
+            if hybrid_navigation_active:
+                successful_hypotheses = {
+                    _seed_start_hypothesis(event_seeds[int(row[1])])
+                    for row in joint_rows
+                }
+                missing_hypotheses = {
+                    "internal_start", "boundary_entry"
+                }.difference(successful_hypotheses)
+                if missing_hypotheses:
+                    # A compact candidate may pass charge closure and still fail
+                    # the exact joint likelihood.  Retry the missing topology from
+                    # the dormant full cosmic bank before accepting arbitration.
+                    multilateration_primary_fallback_used = True
+                    multilateration_primary_fallback_reason = (
+                        "hybrid_exact_joint_closure_incomplete"
+                    )
+                    hybrid_navigation_active = False
+                    cosmic_baseline_indices_by_hypothesis = {
+                        hypothesis: set(indices)
+                        for hypothesis, indices
+                        in multilateration_primary_fallback_baseline_sets.items()
+                    }
+                    cosmic_range_guard_indices_by_hypothesis = {
+                        hypothesis: set(indices)
+                        for hypothesis, indices
+                        in multilateration_primary_fallback_range_sets.items()
+                    }
+                    charge_rows_by_index = {
+                        int(row[1]): row for row in charge_rows
+                    }
+                    closed_indices = {int(row[1]) for row in joint_rows}
+                    for index in multilateration_primary_fallback_indices:
+                        index = int(index)
+                        hypothesis = _seed_start_hypothesis(event_seeds[index])
+                        if (
+                            hypothesis not in missing_hypotheses
+                            or index in closed_indices
+                        ):
+                            continue
+                        fallback_row = charge_rows_by_index.get(index)
+                        if fallback_row is None:
+                            fallback_row = evaluate_candidate(index)
+                        if fallback_row is None:
+                            continue
+                        closed_row = close_joint_candidate(
+                            fallback_row,
+                            stage="hybrid_full_bank_exact_joint_fallback",
+                        )
+                        if closed_row is not None:
+                            joint_rows.append(closed_row)
+                            closed_indices.add(index)
+                            missing_hypotheses.discard(hypothesis)
+                            if not missing_hypotheses:
+                                break
             candidate_rows = joint_rows
 
         if not candidate_rows:
@@ -29244,6 +36029,33 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             two_anchor_gain_nll = 0.0
             two_anchor_sweeps = 0
             two_anchor_error = None
+            tournament_probe_gain = float(
+                fit_payload.get("tournament_anchor_probe_gain_nll", math.inf)
+            )
+            tournament_continuation_gain = float(
+                fit_payload.get("tournament_continuation_gain_nll", math.inf)
+            )
+            two_anchor_skipped_by_probe_certificate = bool(
+                allow_adaptive
+                and _env_bool("COSMIC_TWO_ANCHOR_LAZY_PROBE_CERTIFICATE", False)
+                and fit_payload.get("tournament_anchor_probe_used", False)
+                and math.isfinite(tournament_probe_gain)
+                and math.isfinite(tournament_continuation_gain)
+                and tournament_probe_gain
+                < max(
+                    0.0,
+                    _env_float(
+                        "COSMIC_TWO_ANCHOR_LAZY_MAX_PROBE_GAIN_NLL", 0.75
+                    ),
+                )
+                and tournament_continuation_gain
+                < max(
+                    0.0,
+                    _env_float(
+                        "COSMIC_TWO_ANCHOR_LAZY_MAX_CONTINUATION_GAIN_NLL", 8.0
+                    ),
+                )
+            )
 
             # For a long oblique track the physical start and direction are almost
             # singular in the ordinary local chart.  Refine the selected basin in
@@ -29279,6 +36091,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         inset_mm=float(BOUNDARY_CLIP_INSET_MM),
                     )
             if (
+                not two_anchor_skipped_by_probe_certificate
+                and
                 anchor_resolved is not None
                 and float(anchor_resolved.visible_length_mm)
                 >= float(COSMIC_TWO_ANCHOR_MIN_VISIBLE_MM)
@@ -29346,7 +36160,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             **_adaptive_optimizer_topology_options(start_hypothesis),
                         )
                     )
-            elif allow_adaptive:
+            elif allow_adaptive and not two_anchor_skipped_by_probe_certificate:
                 exact_result, adaptive_polish_used, pre_polish_last_improvement = (
                     _maybe_continue_exact_optimizer(
                         exact_objective,
@@ -29392,6 +36206,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             fit_payload["two_anchor_gain_nll"] = float(two_anchor_gain_nll)
             fit_payload["two_anchor_sweeps"] = int(two_anchor_sweeps)
             fit_payload["two_anchor_error"] = two_anchor_error
+            fit_payload["two_anchor_skipped_by_probe_certificate"] = bool(
+                two_anchor_skipped_by_probe_certificate
+            )
             fit_payload["final_t0_profile"] = final_t0_profile
             return fit_payload
 
@@ -29476,7 +36293,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 continuation_row,
                 sweeps_override=sweeps,
                 full_cross_override=(
-                    1 if exact_mode == "charge_only"
+                    1
+                    if exact_mode == "charge_only"
                     else min(sweeps, max(1, int(JOINT_FULL_CROSS_SWEEPS)))
                 ),
                 allow_adaptive=False,
@@ -29518,6 +36336,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             if (
                 not AUTO_CLIPPED_TRACK
                 or not COSMIC_TWO_ANCHOR_REFINEMENT
+                or not _env_bool("COSMIC_TOURNAMENT_ANCHOR_PROBE", True)
             ):
                 return fit_payload
             start_hypothesis = str(fit_payload["track_start_hypothesis"])
@@ -29558,6 +36377,51 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 full_range_mm=max(80.0, continuation_steps.full_range_mm),
                 t0_ns=max(0.08, continuation_steps.t0_ns),
             )
+            if _env_bool("COSMIC_TWO_ANCHOR_STATIONARITY_PROBE", True):
+                try:
+                    stationarity = two_anchor_stationarity_probe(
+                        fit_payload["objective"],
+                        source.values,
+                        fixed_params=fixed_for_candidate,
+                        initial_steps=anchor_steps,
+                        length_limits=length_limits,
+                    )
+                except Exception as exc:
+                    fit_payload["tournament_anchor_stationarity_error"] = repr(exc)
+                else:
+                    source.nfcn += int(stationarity.nfcn)
+                    source.wall_s += float(stationarity.wall_s)
+                    source.invalid_evaluations += int(
+                        stationarity.invalid_evaluations
+                    )
+                    fit_payload["tournament_anchor_stationarity_probe_used"] = True
+                    fit_payload[
+                        "tournament_anchor_stationarity_predicted_gain_nll"
+                    ] = float(stationarity.predicted_gain_nll)
+                    fit_payload[
+                        "tournament_anchor_stationarity_observed_gain_nll"
+                    ] = float(stationarity.observed_gain_nll)
+                    fit_payload["tournament_anchor_stationarity_nfcn"] = int(
+                        stationarity.nfcn
+                    )
+                    fit_payload["tournament_anchor_stationarity_directions"] = [
+                        dict(row) for row in stationarity.directions
+                    ]
+                    certificate_limit = max(
+                        0.0,
+                        _env_float(
+                            "COSMIC_TWO_ANCHOR_STATIONARITY_MAX_GAIN_NLL",
+                            0.05,
+                        ),
+                    )
+                    if (
+                        math.isfinite(stationarity.predicted_gain_nll)
+                        and stationarity.predicted_gain_nll < certificate_limit
+                    ):
+                        fit_payload[
+                            "tournament_anchor_probe_skipped_converged"
+                        ] = True
+                        return fit_payload
             try:
                 probe = two_anchor_block_optimize(
                     fit_payload["objective"],
@@ -30990,10 +37854,31 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 for row in auto_rows[hypothesis]
             ]
             tournament_records = []
+            causal_primary_substitutions = ()
+            certified_internal_only = False
             same_topology_challenges = 0
             same_topology_improvements = 0
             topology_probe_used = False
             topology_probe_continued = False
+            hybrid_boundary_fairness_triggered = False
+            hybrid_boundary_alternate_probed = False
+            hybrid_boundary_equalized = False
+            max_tournament_probes = int(
+                COSMIC_MULTILATERATION_TOURNAMENT_PROBES
+                if (
+                    COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                    or hybrid_navigation_active
+                )
+                else COSMIC_TOURNAMENT_MAX_PROBES
+            )
+            max_tournament_continuations = int(
+                COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS
+                if (
+                    COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                    or hybrid_navigation_active
+                )
+                else COSMIC_TOURNAMENT_MAX_CONTINUATIONS
+            )
 
             if COSMIC_TOURNAMENT_ENABLED:
                 adjusted_start_scores = [auto_row_score(row) for row in all_auto_rows]
@@ -31001,9 +37886,38 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     _seed_start_hypothesis(event_seeds[int(row[1])])
                     for row in all_auto_rows
                 ]
-                baseline_flags = [
+                bank_baseline_flags = [
                     int(row[1]) in cosmic_baseline_indices_by_hypothesis[hypotheses[i]]
                     for i, row in enumerate(all_auto_rows)
+                ]
+                multilateration_flags = [
+                    int(row[1])
+                    in cosmic_multilateration_indices_by_hypothesis[hypotheses[i]]
+                    for i, row in enumerate(all_auto_rows)
+                ]
+                # A successful primary-mode multilateration family is the active
+                # navigation baseline for the ordinary symmetric tournament.  In
+                # additive mode, only the immutable charge-bank candidates retain
+                # baseline status, so challengers cannot evict an incumbent slot.
+                baseline_flags = [
+                    bool(
+                        bank_baseline_flags[i]
+                        or (
+                            COSMIC_MULTILATERATION_SEED_MODE == "primary"
+                            and multilateration_flags[i]
+                        )
+                        or (
+                            hybrid_navigation_active
+                            and (
+                                multilateration_flags[i]
+                                or int(all_auto_rows[i][1])
+                                in cosmic_timing_guard_indices_by_hypothesis[
+                                    hypotheses[i]
+                                ]
+                            )
+                        )
+                    )
+                    for i in range(len(bank_baseline_flags))
                 ]
                 range_guard_flags = [
                     int(row[1]) in cosmic_range_guard_indices_by_hypothesis[hypotheses[i]]
@@ -31026,34 +37940,42 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 # prediction-seeded t0 gives a lower unoptimized joint NLL.  Keep
                 # one actual charge-bank baseline from each start hypothesis, then
                 # add at most one directionally distinct causal line per hypothesis.
-                max_tournament_probes = int(COSMIC_TOURNAMENT_MAX_PROBES)
                 tournament_positions = []
                 selected_positions = set()
-                primary_by_hypothesis = {}
+                (
+                    primary_by_hypothesis,
+                    causal_primary_substitutions,
+                ) = select_cosmic_topology_primary_positions(
+                    adjusted_start_scores,
+                    hypotheses,
+                    baseline_flags,
+                    causal_timing_flags,
+                    max_probes=max_tournament_probes,
+                    strong_causal_gain_nll=float(
+                        COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL
+                    ),
+                )
 
-                for hypothesis in sorted(set(hypotheses)):
-                    positions = [
-                        i for i, value in enumerate(hypotheses)
-                        if value == hypothesis
-                    ]
-                    baseline_positions_for_hypothesis = [
-                        i for i in positions if baseline_flags[i]
-                    ]
-                    noncausal_positions = [
-                        i for i in positions if not causal_timing_flags[i]
-                    ]
-                    pool = (
-                        baseline_positions_for_hypothesis
-                        or noncausal_positions
-                        or positions
-                    )
-                    if not pool:
-                        continue
-                    position = min(
-                        pool,
-                        key=lambda i: (float(adjusted_start_scores[i]), int(i)),
-                    )
-                    primary_by_hypothesis[hypothesis] = int(position)
+                # The same strong, truth-blind proxy certificate that makes the
+                # causal timing guard redundant also certifies the internal-start
+                # topology.  On those nominal beam-like events, avoid paying for
+                # a boundary-entry probe that cannot be continued.  Ambiguous
+                # events retain the complete two-topology tournament; notably,
+                # the recovered long-z-tail event does not satisfy this gate.
+                certified_internal_only = bool(
+                    COSMIC_TOURNAMENT_CERTIFIED_INTERNAL_ONLY
+                    and COSMIC_MULTILATERATION_SEED_MODE != "primary"
+                    and not hybrid_navigation_active
+                    and causal_timing_lazy_beam_skip
+                    and "internal_start" in primary_by_hypothesis
+                )
+                if certified_internal_only:
+                    max_tournament_probes = 1
+                    primary_by_hypothesis = {
+                        "internal_start": int(
+                            primary_by_hypothesis["internal_start"]
+                        )
+                    }
 
                 for position in sorted(
                     primary_by_hypothesis.values(),
@@ -31063,6 +37985,59 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         break
                     tournament_positions.append(int(position))
                     selected_positions.add(int(position))
+
+                if COSMIC_MULTILATERATION_SEED_MODE == "primary":
+                    # Probe one additional longitudinal/range realization in
+                    # each topology before spending any leftover budget.  A point
+                    # source is intrinsically weak along the particle line, so
+                    # ranking all such starts solely by their unoptimized NLL
+                    # would defeat the purpose of retaining longitudinal seeds.
+                    for hypothesis in ("internal_start", "boundary_entry"):
+                        alternatives = sorted(
+                            (
+                                int(position)
+                                for position, is_multilateration
+                                in enumerate(multilateration_flags)
+                                if (
+                                    is_multilateration
+                                    and hypotheses[position] == hypothesis
+                                    and position not in selected_positions
+                                )
+                            ),
+                            key=lambda position: (
+                                float(adjusted_start_scores[position]),
+                                int(position),
+                            ),
+                        )
+                        if (
+                            alternatives
+                            and len(tournament_positions) < max_tournament_probes
+                        ):
+                            position = int(alternatives[0])
+                            selected_positions.add(position)
+                            tournament_positions.append(position)
+                    if len(tournament_positions) < max_tournament_probes:
+                        remaining_multilateration = sorted(
+                            (
+                                int(position)
+                                for position, is_multilateration
+                                in enumerate(multilateration_flags)
+                                if is_multilateration
+                                and position not in selected_positions
+                            ),
+                            key=lambda position: (
+                                float(adjusted_start_scores[position]),
+                                int(position),
+                            ),
+                        )
+                        for position in remaining_multilateration:
+                            selected_positions.add(int(position))
+                            tournament_positions.append(int(position))
+                            if (
+                                len(tournament_positions)
+                                >= max_tournament_probes
+                            ):
+                                break
 
                 def _seed_direction_for_position(position):
                     seed = event_seeds[int(all_auto_rows[int(position)][1])]
@@ -31106,8 +38081,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             separation = math.degrees(math.acos(float(np.clip(
                                 np.dot(primary_direction, direction), -1.0, 1.0
                             ))))
-                        if separation < float(
-                            COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
+                        if (
+                            not hybrid_navigation_active
+                            and separation < float(
+                                COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
+                            )
                         ):
                             continue
                         seed = event_seeds[int(all_auto_rows[position][1])]
@@ -31163,6 +38141,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         origin_parts.append("range_guard")
                     if is_causal:
                         origin_parts.append("causal_timing")
+                    if multilateration_flags[int(position)]:
+                        origin_parts.append("multilateration")
                     origin = (
                         "_and_".join(origin_parts)
                         if origin_parts else "diverse_exact_candidate"
@@ -31200,6 +38180,98 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     terminal_payloads[int(all_auto_rows[pos][1])]
                     for pos in tournament_positions
                 ]
+
+                # The internal-start model contains one additional longitudinal
+                # coordinate.  In compact hybrid mode it may therefore be
+                # accepted only after the nested boundary-entry model has been
+                # given equivalent basin diversity and optimization depth.  If
+                # the first probe leader is internal, probe the untested boundary
+                # seed from the other independent timing navigator.  This costs
+                # nothing on clear boundary events and uses no event truth,
+                # detector axis, or assumed energy.
+                probe_payloads.sort(key=auto_payload_score)
+                if (
+                    hybrid_navigation_active
+                    and probe_payloads
+                    and str(probe_payloads[0]["track_start_hypothesis"])
+                    == "internal_start"
+                ):
+                    hybrid_boundary_fairness_triggered = True
+                    unprobed_boundary_positions = sorted(
+                        (
+                            int(position)
+                            for position, row in enumerate(all_auto_rows)
+                            if hypotheses[position] == "boundary_entry"
+                            and int(row[1]) not in terminal_payloads
+                            and (
+                                bool(causal_timing_flags[position])
+                                or bool(multilateration_flags[position])
+                            )
+                        ),
+                        key=lambda position: (
+                            float(auto_row_score(all_auto_rows[position])),
+                            int(position),
+                        ),
+                    )
+                    if unprobed_boundary_positions:
+                        position = int(unprobed_boundary_positions[0])
+                        row = all_auto_rows[position]
+                        seed_index = int(row[1])
+                        is_causal = bool(causal_timing_flags[position])
+                        is_multilateration = bool(
+                            multilateration_flags[position]
+                        )
+                        origin_parts = ["hybrid_boundary_fairness"]
+                        if is_causal:
+                            origin_parts.append("causal_timing")
+                        if is_multilateration:
+                            origin_parts.append("multilateration")
+                        origin = "_and_".join(origin_parts)
+                        probe = optimize_candidate_row(
+                            row,
+                            sweeps_override=int(
+                                COSMIC_TOURNAMENT_PROBE_SWEEPS
+                            ),
+                            full_cross_override=1,
+                            allow_adaptive=False,
+                            run_final_t0_profile=False,
+                        )
+                        probe["basin_kind"] = (
+                            "cosmic_tournament_hybrid_boundary_fairness_probe"
+                        )
+                        probe["tournament_origin"] = origin
+                        probe["tournament_probe_fval"] = float(
+                            probe["result"].fval
+                        )
+                        probe["tournament_probe_model_score"] = (
+                            auto_payload_score(probe)
+                        )
+                        probe["tournament_probe_descent_nll"] = float(
+                            row[0] - probe["result"].fval
+                        )
+                        terminal_payloads[seed_index] = probe
+                        probe_payloads.append(probe)
+                        tournament_records.append({
+                            "seed_index": seed_index,
+                            "track_start_hypothesis": "boundary_entry",
+                            "origin": origin,
+                            "exact_start_fval": float(row[0]),
+                            "exact_start_model_score": float(
+                                auto_row_score(row)
+                            ),
+                            "probe_fval": float(probe["result"].fval),
+                            "probe_model_score": float(
+                                auto_payload_score(probe)
+                            ),
+                            "probe_descent_nll": float(
+                                row[0] - probe["result"].fval
+                            ),
+                            "continued": False,
+                            "finalized": False,
+                            "selected_winner": False,
+                        })
+                        hybrid_boundary_alternate_probed = True
+
                 total_scheduled_sweeps = int(
                     EXACT_CHARGE_SWEEPS
                     if exact_mode == "charge_only" else JOINT_EXACT_SWEEPS
@@ -31261,14 +38333,58 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     # ordered first, followed by large projected descents.  Every
                     # continuation still uses the unchanged exact likelihood.
                     continuation_slots = max(
-                        0, int(COSMIC_TOURNAMENT_MAX_CONTINUATIONS) - 1
+                        0, int(max_tournament_continuations) - 1
                     )
-                    for challenger_row in challenger_rows[:continuation_slots]:
+                    selected_challenger_rows = list(
+                        challenger_rows[:continuation_slots]
+                    )
+                    if (
+                        hybrid_navigation_active
+                        and str(best_probe["track_start_hypothesis"])
+                        == "internal_start"
+                    ):
+                        boundary_payloads = sorted(
+                            (
+                                payload for payload in probe_payloads[1:]
+                                if str(payload["track_start_hypothesis"])
+                                == "boundary_entry"
+                            ),
+                            key=lambda payload: (
+                                float(auto_payload_score(payload)),
+                                int(payload["seed_index"]),
+                            ),
+                        )
+                        if boundary_payloads:
+                            forced_payload = boundary_payloads[0]
+                            if all(
+                                int(row[-1]["seed_index"])
+                                != int(forced_payload["seed_index"])
+                                for row in selected_challenger_rows
+                            ):
+                                selected_challenger_rows.append((
+                                    -1,
+                                    float(auto_payload_score(forced_payload)),
+                                    0.0,
+                                    float(auto_payload_score(forced_payload)),
+                                    int(forced_payload["seed_index"]),
+                                    forced_payload,
+                                ))
+                            hybrid_boundary_equalized = True
+                    for challenger_row in selected_challenger_rows:
                         challenger_payload = challenger_row[-1]
                         challenger = continue_candidate_payload(
                             challenger_payload,
                             sweeps=remaining_sweeps,
                             basin_kind=(
+                                "cosmic_tournament_hybrid_boundary_fairness_continuation"
+                                if (
+                                    hybrid_navigation_active
+                                    and hybrid_boundary_equalized
+                                    and str(challenger_payload[
+                                        "track_start_hypothesis"
+                                    ]) == "boundary_entry"
+                                )
+                                else
                                 "cosmic_tournament_causal_direction_continuation"
                                 if "causal_timing" in str(
                                     challenger_payload.get("tournament_origin", "")
@@ -31306,6 +38422,54 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         )
                         record["tournament_anchor_probe_gain_nll"] = float(
                             payload.get("tournament_anchor_probe_gain_nll", 0.0)
+                        )
+                        record["tournament_anchor_stationarity_probe_used"] = bool(
+                            payload.get(
+                                "tournament_anchor_stationarity_probe_used", False
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_predicted_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_predicted_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_observed_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_observed_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record["tournament_anchor_stationarity_nfcn"] = int(
+                            payload.get("tournament_anchor_stationarity_nfcn", 0)
+                        )
+                        record["tournament_anchor_stationarity_probe_used"] = bool(
+                            payload.get(
+                                "tournament_anchor_stationarity_probe_used", False
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_predicted_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_predicted_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record[
+                            "tournament_anchor_stationarity_observed_gain_nll"
+                        ] = float(
+                            payload.get(
+                                "tournament_anchor_stationarity_observed_gain_nll",
+                                0.0,
+                            )
+                        )
+                        record["tournament_anchor_stationarity_nfcn"] = int(
+                            payload.get("tournament_anchor_stationarity_nfcn", 0)
                         )
 
                 scheduled_payloads = list(terminal_payloads.values())
@@ -31432,13 +38596,32 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "topology_probe_continued": bool(topology_probe_continued),
                 "same_topology_challenges": int(same_topology_challenges),
                 "same_topology_improvements": int(same_topology_improvements),
+                "hybrid_boundary_fairness_triggered": bool(
+                    hybrid_boundary_fairness_triggered
+                ),
+                "hybrid_boundary_alternate_probed": bool(
+                    hybrid_boundary_alternate_probed
+                ),
+                "hybrid_boundary_equalized": bool(
+                    hybrid_boundary_equalized
+                ),
                 "tournament_probe_sweeps": int(COSMIC_TOURNAMENT_PROBE_SWEEPS),
                 "tournament_max_probes": int(COSMIC_TOURNAMENT_MAX_PROBES),
+                "tournament_effective_max_probes": int(max_tournament_probes),
+                "tournament_certified_internal_only": bool(
+                    certified_internal_only
+                ),
+                "tournament_causal_substitution_gain_nll": float(
+                    COSMIC_TOURNAMENT_CAUSAL_SUBSTITUTION_GAIN_NLL
+                ),
+                "tournament_causal_primary_substitutions": [
+                    dict(record) for record in causal_primary_substitutions
+                ],
                 "tournament_causal_direction_separation_deg": float(
                     COSMIC_TOURNAMENT_CAUSAL_DIRECTION_SEPARATION_DEG
                 ),
                 "tournament_max_continuations": int(
-                    COSMIC_TOURNAMENT_MAX_CONTINUATIONS
+                    max_tournament_continuations
                 ),
                 "tournament_probe_gate_nll": float(
                     COSMIC_TOURNAMENT_PROBE_GATE_NLL
@@ -31588,6 +38771,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         auto_topology_range_closure_invalid = 0
         auto_topology_range_closure_challenges = 0
         auto_topology_range_closure_improvements = 0
+        auto_topology_reusable_profile = None
+        auto_topology_reusable_payload = None
         if (
             AUTO_CLIPPED_TRACK
             and AUTO_ENABLE_RANGE_PROFILE
@@ -31731,8 +38916,22 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 chosen_fit = min(
                     topology_finalists.values(), key=auto_payload_score
                 )
+                selected_hypothesis = str(
+                    chosen_fit["track_start_hypothesis"]
+                )
+                selected_record = topology_records[selected_hypothesis]
+                if not bool(selected_record.get("challenge_used", False)):
+                    # The ordinary post-tournament range profile below asks the
+                    # same fixed-line stop/exit question.  Reuse this exact
+                    # profile when no later stage replaces the finalist; doing
+                    # the identical 20-point charge/time bracket twice cost
+                    # roughly 200 objective evaluations per event.
+                    auto_topology_reusable_profile = dict(
+                        selected_record["profile"]
+                    )
+                    auto_topology_reusable_payload = chosen_fit
                 chosen_fit["auto_topology_penalty_nll"] = auto_topology_penalty(
-                    str(chosen_fit["track_start_hypothesis"])
+                    selected_hypothesis
                 )
                 chosen_fit["auto_topology_model_score"] = auto_payload_score(
                     chosen_fit
@@ -31885,9 +39084,18 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             auto_range_profile_nfcn = 0
             auto_range_profile_invalid = 0
 
-            cycle_profile, cycle_nfcn, cycle_invalid = profile_auto_full_range(
-                chosen_fit
-            )
+            if (
+                auto_topology_reusable_profile is not None
+                and chosen_fit is auto_topology_reusable_payload
+            ):
+                cycle_profile = dict(auto_topology_reusable_profile)
+                cycle_profile["reused_from_topology_range_closure"] = True
+                cycle_nfcn = 0
+                cycle_invalid = 0
+            else:
+                cycle_profile, cycle_nfcn, cycle_invalid = (
+                    profile_auto_full_range(chosen_fit)
+                )
             cycle_profile = dict(cycle_profile)
             cycle_profile["cycle_index"] = 0
             cycle_profile["source_fval"] = float(chosen_fit["result"].fval)
@@ -31981,52 +39189,150 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         cosmic_coherent_result = None
         cosmic_coherent_charge_result = None
         cosmic_coherent_timing_result = None
+        cosmic_coherent_joint_length_result = None
         cosmic_coherent_post_stage_nfcn = 0
+        cosmic_joint_energy_range_result = None
+        cosmic_joint_global_feedback_history = []
 
-        if AUTO_CLIPPED_TRACK and COSMIC_COHERENT_PROFILE_ENABLED:
-            # Nonlinear coherent path continuation for geometry-clipped tracks.
-            # The ordinary topology tournament remains authoritative.  Within
-            # the selected smooth topology branch, charge is first closed with
-            # the sharp mean, then a coherent FE path and nearby global track
-            # are profiled with the Fisher--Laplace objective.  Timing is
-            # conditional on that charge solution and may refine only transverse
-            # line placement, direction and t0.
-            charge_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                exact_result.chart,
-                "charge_only",
-                proxy=False,
+        # Select any explicit mPMT entry/exit subclass on the accepted straight
+        # topology before an MCS continuation.  The discrete geometry class is
+        # then held fixed while the curved FE path and global track are fitted;
+        # its local non-negative charge fractions are reprofiled inside every
+        # coherent prediction.  This preserves the ordinary water-only MCS
+        # model exactly at zero hardware fraction and prevents a later straight
+        # hardware fit from overwriting an MCS result.
+        mpmt_boundary_winner = None
+        mpmt_boundary_summary = {
+            "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
+            "used": False,
+            "accepted": False,
+            "reason": "not_run",
+            "nfcn": 0,
+            "invalid_evaluations": 0,
+            "wall_s": 0.0,
+        }
+        active_mpmt_boundary_model = None
+        mcs_obs_ts = np.asarray(obs_ts, dtype=np.float64)
+        mcs_continuation_requested = bool(
+            COSMIC_COHERENT_PROFILE_ENABLED
+            or COSMIC_FERMI_EYGES_ENABLED
+            or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            or USE_COHERENT_FISHER
+        )
+        if AUTO_CLIPPED_TRACK:
+            try:
+                mpmt_boundary_winner, mpmt_boundary_summary = (
+                    _run_mpmt_boundary_challenge(
+                        obs_pes=obs_pes,
+                        obs_ts=obs_ts,
+                        baseline_result=exact_result,
+                        baseline_start_hypothesis=chosen_start_hypothesis,
+                        topology_penalty=auto_topology_penalty,
+                        length_limits=length_limits,
+                        # MCS performs the final charge-time continuation.  Its
+                        # crossed-module timestamps are masked below, so avoid a
+                        # redundant straight-path timing polish here.
+                        requested_mode=(
+                            "charge_only"
+                            if mcs_continuation_requested
+                            else LIKELIHOOD_MODE
+                        ),
+                    )
+                )
+            except Exception as exc:
+                # One malformed optional hardware hypothesis must never abort
+                # the established water-only production fit.
+                mpmt_boundary_winner = None
+                mpmt_boundary_summary = {
+                    "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
+                    "used": False,
+                    "accepted": False,
+                    "reason": "challenge_exception",
+                    "error": repr(exc),
+                    "nfcn": 0,
+                    "invalid_evaluations": 0,
+                    "wall_s": 0.0,
+                }
+
+        if mpmt_boundary_winner is not None:
+            exact_result = mpmt_boundary_winner["result"]
+            chosen_start_hypothesis = str(
+                mpmt_boundary_winner["start_hypothesis"]
+            )
+            active_mpmt_boundary_model = mpmt_boundary_winner["model"]
+            if (
+                COSMIC_FERMI_EYGES_ENABLED
+                or COSMIC_JOINT_ENERGY_RANGE_ENABLED
+                or USE_COHERENT_FISHER
+            ):
+                raise RuntimeError(
+                    "an explicit mPMT-hardware winner requires the default "
+                    "coherent_fermi_eyges continuation; legacy linear-FE, "
+                    "legacy coherent-Fisher, and joint K0/range continuations "
+                    "do not yet expose the nested hardware nuisance profile"
+                )
+            selected_slots = [
+                int(interface.slot)
+                for interface in mpmt_boundary_winner.get("interfaces", ())
+            ]
+            if (
+                LIKELIHOOD_MODE != "charge_only"
+                and str(COSMIC_MPMT_TIMING_POLICY) == "mask_module"
+            ):
+                mcs_obs_ts = masked_module_times(
+                    obs_ts, PMT_SLOTS, selected_slots
+                )
+            errors = _materialize_output_errors(
+                exact_result.errors,
                 start_hypothesis=chosen_start_hypothesis,
             )
-            topology_options = _optimizer_topology_options(
-                chosen_start_hypothesis
-            )
-            cosmic_coherent_charge_result = track_aligned_block_optimize(
-                charge_objective,
+            final_values = _materialize_output_values(
                 exact_result.values,
-                fixed_params=_optimizer_fixed_params(
-                    chosen_start_hypothesis
-                ),
-                sweeps=max(1, int(COSMIC_FE_CHARGE_SWEEPS)),
-                initial_steps=EXACT_STEPS,
-                length_limits=length_limits,
-                full_range_limits=None,
-                full_cross_sweeps=1,
-                allow_longitudinal=bool(
-                    topology_options["allow_longitudinal"]
-                ),
-                project_vertex_steps=bool(
-                    topology_options["project_vertex_steps"]
-                ),
+                exact_result.chart,
+                start_hypothesis=chosen_start_hypothesis,
             )
-            coherent_values, coherent_chart = reanchor_result(
-                cosmic_coherent_charge_result
-            )
-            cosmic_coherent_result = run_cosmic_coherent_profile_update(
+            final_fval = float(exact_result.fval)
+            if bool(
+                mpmt_boundary_winner.get("timing_metadata", {}).get(
+                    "accepted", False
+                )
+            ):
+                fval_definition = (
+                    "explicit geometry-constrained mPMT boundary subclass; "
+                    "class selected by penalized common charge likelihood and "
+                    "final charge-plus-time NLL uses timestamps outside the "
+                    "crossed module"
+                )
+            else:
+                fval_definition = (
+                    "explicit geometry-constrained mPMT boundary subclass; "
+                    "penalized common charge likelihood with locally profiled "
+                    "nonnegative hardware-light modes"
+                )
+            mpmt_boundary_summary["mcs_compatibility"] = {
+                "continuation_requested": bool(mcs_continuation_requested),
+                "nested_profile_enabled": bool(mcs_continuation_requested),
+                "timing_policy": str(COSMIC_MPMT_TIMING_POLICY),
+                "masked_slots": selected_slots,
+                "masked_pmt_count": int(np.count_nonzero(np.isin(
+                    np.asarray(PMT_SLOTS, dtype=np.int64), selected_slots
+                ))),
+            }
+
+        def _run_joint_energy_range_stage(
+            stage_values,
+            stage_chart,
+            *,
+            initial_path_coefficients=None,
+        ):
+            """Run the exact joint posterior on a supplied fitted line geometry."""
+            return run_cosmic_joint_energy_range_update(
                 EMITTER_TEMPLATE,
-                values=coherent_values,
-                chart=coherent_chart,
+                inference_method=str(
+                    _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                ),
+                values=stage_values,
+                chart=stage_chart,
                 detector=DETECTOR,
                 range_lookup=RANGE_LOOKUP,
                 wcd=WCD,
@@ -32038,129 +39344,882 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 starts_at_boundary=(
                     chosen_start_hypothesis == "boundary_entry"
                 ),
+                kinetic_energy_bounds_mev=(
+                    float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                    float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                ),
+                mixed_energy_stratum_edges_mev=(
+                    COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                ),
+                mixed_energy_stratum_replicates=int(
+                    COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                ),
+                random_seed=int(COSMIC_JOINT_RANDOM_SEED),
                 mpmt_types=MPMT_TYPE_CODES,
                 inset_mm=float(BOUNDARY_CLIP_INSET_MM),
                 range_limits=length_limits,
                 t0_limits=T0_LIMITS,
+                charge_only=(LIKELIHOOD_MODE == "charge_only"),
                 modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
                 grid_points=int(COSMIC_COHERENT_GRID_POINTS),
-                latent_fd=float(COSMIC_COHERENT_LATENT_FD),
-                latent_max_iterations=int(
-                    COSMIC_COHERENT_LATENT_ITERATIONS
+                particles=int(COSMIC_JOINT_PARTICLES),
+                target_ess_fraction=float(
+                    COSMIC_JOINT_TARGET_ESS_FRACTION
                 ),
-                candidate_latent_max_iterations=int(
-                    COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                resample_ess_fraction=float(
+                    COSMIC_JOINT_RESAMPLE_ESS_FRACTION
                 ),
-                track_cycles=int(COSMIC_COHERENT_TRACK_CYCLES),
-                transverse_step_mm=12.0,
-                longitudinal_step_mm=12.0,
-                direction_step=0.010,
-                range_step_mm=30.0,
-                latent_trust_max_component=1.0,
-                track_trust_max_scaled_component=1.0,
-                sparse_neighbor_radius_mm=100.0,
+                max_temperatures=int(COSMIC_JOINT_MAX_TEMPERATURES),
+                rejuvenation_steps=int(
+                    COSMIC_JOINT_REJUVENATION_STEPS
+                ),
+                posterior_rejuvenation_steps=int(
+                    COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS
+                ),
+                energy_random_walk_mev=float(
+                    COSMIC_JOINT_ENERGY_RW_MEV
+                ),
+                energy_independence_probability=float(
+                    COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY
+                ),
+                range_pcn_rho=float(COSMIC_JOINT_RANGE_PCN_RHO),
+                path_pcn_rho=float(COSMIC_JOINT_PATH_PCN_RHO),
+                mixed_allow_underpowered_diagnostic=bool(
+                    COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                ),
+                mixed_inference_engine=str(
+                    COSMIC_MIXED_INFERENCE_ENGINE
+                ),
+                mixed_global_precondition_enabled=bool(
+                    COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                ),
+                joint_global_precondition_enabled=bool(
+                    COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                ),
+                path_guide_rho=float(COSMIC_JOINT_PATH_GUIDE_RHO),
+                path_guide_probability=float(
+                    COSMIC_JOINT_PATH_GUIDE_PROBABILITY
+                ),
+                joint_guide_prior_mixture_probability=float(
+                    COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY
+                ),
+                joint_guide_initial_beta=float(
+                    COSMIC_JOINT_GUIDE_INITIAL_BETA
+                ),
+                guide_latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                guide_latent_iterations=int(
+                    COSMIC_JOINT_GUIDE_ITERATIONS
+                ),
+                guide_covariance_inflation=float(
+                    COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION
+                ),
+                guide_prior_screen_draws=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS
+                ),
+                guide_prior_screen_refits=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS
+                ),
+                guide_prior_screen_random_seed=int(
+                    COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED
+                ),
+                guide_laplace_uniform_mixture_probability=float(
+                    COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY
+                ),
+                guide_range_profile_cycles=int(
+                    COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES
+                ),
+                sparse_neighbor_radius_mm=float(
+                    MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                ),
+                initial_path_coefficients=initial_path_coefficients,
             )
+
+        if (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            and not COSMIC_COHERENT_PROFILE_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
+            # Truth-blind configured-data posterior in the non-centred physical
+            # state (K0, z_R, coherent FE path). The current controlled gate
+            # conditions on the input line geometry.  With the measured beam
+            # coordinates fixed in FIXED_PARAMS, no event-truth quantity enters
+            # either the target or its proposal guide.
+            joint_values, joint_chart = reanchor_result(exact_result)
+            cosmic_joint_energy_range_result = (
+                run_cosmic_joint_energy_range_update(
+                    EMITTER_TEMPLATE,
+                    inference_method=str(
+                        _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                    ),
+                    values=joint_values,
+                    chart=joint_chart,
+                    detector=DETECTOR,
+                    range_lookup=RANGE_LOOKUP,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    obs_ts=obs_ts,
+                    starts_at_boundary=(
+                        chosen_start_hypothesis == "boundary_entry"
+                    ),
+                    kinetic_energy_bounds_mev=(
+                        float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                        float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                    ),
+                    mixed_energy_stratum_edges_mev=(
+                        COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                    ),
+                    mixed_energy_stratum_replicates=int(
+                        COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                    ),
+                    random_seed=int(COSMIC_JOINT_RANDOM_SEED),
+                    mpmt_types=MPMT_TYPE_CODES,
+                    inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                    range_limits=length_limits,
+                    t0_limits=T0_LIMITS,
+                    charge_only=(LIKELIHOOD_MODE == "charge_only"),
+                    modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
+                    grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                    particles=int(COSMIC_JOINT_PARTICLES),
+                    target_ess_fraction=float(
+                        COSMIC_JOINT_TARGET_ESS_FRACTION
+                    ),
+                    resample_ess_fraction=float(
+                        COSMIC_JOINT_RESAMPLE_ESS_FRACTION
+                    ),
+                    max_temperatures=int(COSMIC_JOINT_MAX_TEMPERATURES),
+                    rejuvenation_steps=int(
+                        COSMIC_JOINT_REJUVENATION_STEPS
+                    ),
+                    posterior_rejuvenation_steps=int(
+                        COSMIC_JOINT_POSTERIOR_REJUVENATION_STEPS
+                    ),
+                    energy_random_walk_mev=float(
+                        COSMIC_JOINT_ENERGY_RW_MEV
+                    ),
+                    energy_independence_probability=float(
+                        COSMIC_JOINT_ENERGY_INDEPENDENCE_PROBABILITY
+                    ),
+                    range_pcn_rho=float(COSMIC_JOINT_RANGE_PCN_RHO),
+                    path_pcn_rho=float(COSMIC_JOINT_PATH_PCN_RHO),
+                    mixed_allow_underpowered_diagnostic=bool(
+                        COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                    ),
+                    mixed_inference_engine=str(
+                        COSMIC_MIXED_INFERENCE_ENGINE
+                    ),
+                    mixed_global_precondition_enabled=bool(
+                        COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    joint_global_precondition_enabled=bool(
+                        COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    path_guide_rho=float(COSMIC_JOINT_PATH_GUIDE_RHO),
+                    path_guide_probability=float(
+                        COSMIC_JOINT_PATH_GUIDE_PROBABILITY
+                    ),
+                    joint_guide_prior_mixture_probability=float(
+                        COSMIC_JOINT_GUIDE_PRIOR_MIXTURE_PROBABILITY
+                    ),
+                    joint_guide_initial_beta=float(
+                        COSMIC_JOINT_GUIDE_INITIAL_BETA
+                    ),
+                    guide_latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                    guide_latent_iterations=int(
+                        COSMIC_JOINT_GUIDE_ITERATIONS
+                    ),
+                    guide_covariance_inflation=float(
+                        COSMIC_JOINT_GUIDE_COVARIANCE_INFLATION
+                    ),
+                    guide_prior_screen_draws=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_DRAWS
+                    ),
+                    guide_prior_screen_refits=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_REFITS
+                    ),
+                    guide_prior_screen_random_seed=int(
+                        COSMIC_JOINT_GUIDE_PRIOR_SCREEN_RANDOM_SEED
+                    ),
+                    guide_laplace_uniform_mixture_probability=float(
+                        COSMIC_JOINT_GUIDE_LAPLACE_UNIFORM_MIXTURE_PROBABILITY
+                    ),
+                    guide_range_profile_cycles=int(
+                        COSMIC_JOINT_GUIDE_RANGE_PROFILE_CYCLES
+                    ),
+                    sparse_neighbor_radius_mm=float(
+                        MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                    ),
+                )
+            )
+            joint_summary = cosmic_joint_energy_range_result.summary()
+            final_values = _materialize_output_values(
+                cosmic_joint_energy_range_result.updated_values,
+                cosmic_joint_energy_range_result.updated_chart,
+                start_hypothesis=chosen_start_hypothesis,
+            )
+            # Keep the old deterministic inverse-range energy explicitly as a
+            # diagnostic.  It is not the fitted physical K0 estimate.
+            final_values["range_equivalent_ke_mev"] = float(
+                final_values.get("fit_onset_ke_mev", math.nan)
+            )
+            final_values["initial_kinetic_energy_mev"] = float(
+                joint_summary["initial_kinetic_energy_mev_mean"]
+            )
+            final_values["z_range"] = float(joint_summary["z_range_mean"])
+            errors = dict(straight_errors)
+            errors.update({
+                "full_range": float(joint_summary["realized_range_mm_sd"]),
+                "initial_kinetic_energy_mev": float(
+                    joint_summary["initial_kinetic_energy_mev_sd"]
+                ),
+                "z_range": float(joint_summary["z_range_sd"]),
+            })
+            final_fval = float(
+                cosmic_joint_energy_range_result.map_charge_nll
+            )
+            fval_definition = (
+                "exact configured data NLL at the highest-posterior sampled "
+                "continuous (K0,z_R,FE-path) state; reported K0 and range are "
+                "separately marginalized posterior means; "
+                + (
+                    "no timing"
+                    if LIKELIHOOD_MODE == "charge_only"
+                    else "includes prompt first-arrival timing"
+                )
+            )
+
+        elif (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_COHERENT_PROFILE_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
+            # Nonlinear coherent path continuation for geometry-clipped tracks.
+            # The ordinary topology tournament remains authoritative.  Within
+            # the selected smooth topology branch, charge is first closed with
+            # the sharp mean, then a coherent FE path and nearby global track
+            # are profiled with the Fisher--Laplace objective.  In charge_time
+            # mode the selected charge line seeds an exact coherent profile of
+            # the global line, range, FE path, and t0 under the complete
+            # configured data likelihood. Timing can therefore move geometry
+            # and range without discarding charge.
+            topology_options = _optimizer_topology_options(
+                chosen_start_hypothesis
+            )
+            coherent_basin_count = max(1, _env_int(
+                "COSMIC_COHERENT_BASIN_CANDIDATES", 2
+            ))
+            coherent_basin_gate_nll = _env_float(
+                "COSMIC_COHERENT_BASIN_GATE_NLL", 1.0
+            )
+            if active_mpmt_boundary_model is not None:
+                # The selected hardware subclass is a discrete topology.  Do
+                # not compare it to water-only basins inside the continuous FE
+                # continuation; that penalized comparison has already been
+                # made by the hardware challenge above.
+                hardware_source_fit = dict(chosen_fit)
+                hardware_source_fit.update({
+                    "result": exact_result,
+                    "track_start_hypothesis": chosen_start_hypothesis,
+                    "seed_family": (
+                        str(chosen_fit.get("seed_family", "accepted"))
+                        + "+mpmt_hardware"
+                    ),
+                })
+                coherent_basin_payloads = [hardware_source_fit]
+            else:
+                coherent_basin_payloads = select_coherent_basin_payloads(
+                    optimized_basins,
+                    chosen_fit,
+                    start_hypothesis=chosen_start_hypothesis,
+                    score=auto_payload_score,
+                    max_candidates=coherent_basin_count,
+                    gate_nll=coherent_basin_gate_nll,
+                )
+            coherent_basin_trials = []
+            coherent_basin_failures = []
+            for coherent_source_fit in coherent_basin_payloads:
+                coherent_source_result = coherent_source_fit["result"]
+                try:
+                    charge_objective = make_objective(
+                        obs_pes,
+                        mcs_obs_ts,
+                        coherent_source_result.chart,
+                        "charge_only",
+                        proxy=False,
+                        start_hypothesis=chosen_start_hypothesis,
+                        boundary_interface_model=active_mpmt_boundary_model,
+                        boundary_interface_timing_policy="baseline",
+                    )
+                    candidate_charge_result = track_aligned_block_optimize(
+                        charge_objective,
+                        coherent_source_result.values,
+                        fixed_params=_optimizer_fixed_params(
+                            chosen_start_hypothesis
+                        ),
+                        sweeps=max(1, int(COSMIC_FE_CHARGE_SWEEPS)),
+                        initial_steps=EXACT_STEPS,
+                        length_limits=length_limits,
+                        full_range_limits=None,
+                        full_cross_sweeps=1,
+                        allow_longitudinal=bool(
+                            topology_options["allow_longitudinal"]
+                        ),
+                        project_vertex_steps=bool(
+                            topology_options["project_vertex_steps"]
+                        ),
+                    )
+                    candidate_values, candidate_chart = reanchor_result(
+                        candidate_charge_result
+                    )
+                    candidate_coherent_result = (
+                        run_cosmic_coherent_profile_update(
+                            EMITTER_TEMPLATE,
+                            values=candidate_values,
+                            chart=candidate_chart,
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=mcs_obs_ts,
+                            starts_at_boundary=(
+                                chosen_start_hypothesis == "boundary_entry"
+                            ),
+                            mpmt_types=MPMT_TYPE_CODES,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=length_limits,
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                            latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            track_cycles=int(COSMIC_COHERENT_TRACK_CYCLES),
+                            adaptive_track_max_cycles=max(
+                                int(COSMIC_COHERENT_TRACK_CYCLES),
+                                _env_int(
+                                    "COSMIC_COHERENT_ADAPTIVE_MAX_CYCLES",
+                                    max(
+                                        12,
+                                        int(COSMIC_COHERENT_TRACK_CYCLES),
+                                    ),
+                                ),
+                            ),
+                            adaptive_track_trigger_gain_nll=_env_float(
+                                "COSMIC_COHERENT_ADAPTIVE_TRIGGER_GAIN_NLL",
+                                5.0,
+                            ),
+                            adaptive_track_stop_gain_nll=_env_float(
+                                "COSMIC_COHERENT_ADAPTIVE_STOP_GAIN_NLL",
+                                0.5,
+                            ),
+                            adaptive_track_stop_patience=max(
+                                1,
+                                _env_int(
+                                    "COSMIC_COHERENT_ADAPTIVE_STOP_PATIENCE",
+                                    2,
+                                ),
+                            ),
+                            transverse_step_mm=12.0,
+                            longitudinal_step_mm=12.0,
+                            direction_step=0.010,
+                            range_step_mm=30.0,
+                            latent_trust_max_component=1.0,
+                            track_trust_max_scaled_component=float(
+                                COSMIC_COHERENT_TRACK_TRUST
+                            ),
+                            sparse_neighbor_radius_mm=100.0,
+                            fixed_initial_kinetic_energy_mev=(
+                                None
+                                if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                                else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                            ),
+                            profile_selection_objective=str(
+                                COSMIC_COHERENT_SELECTION_OBJECTIVE
+                            ),
+                            track_one_sided_half_step=_env_bool(
+                                "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP",
+                                False,
+                            ),
+                            boundary_interface_model=(
+                                active_mpmt_boundary_model
+                            ),
+                            boundary_interface_timing_policy="mask_module",
+                        )
+                    )
+                except Exception as exc:
+                    coherent_basin_failures.append({
+                        "seed_index": int(
+                            coherent_source_fit.get("seed_index", -1)
+                        ),
+                        "error": repr(exc),
+                    })
+                    continue
+                coherent_model_score = float(
+                    candidate_coherent_result.selection_nll
+                    + auto_topology_penalty(chosen_start_hypothesis)
+                )
+                coherent_basin_trials.append({
+                    "source_fit": coherent_source_fit,
+                    "source_result": coherent_source_result,
+                    "charge_result": candidate_charge_result,
+                    "coherent_result": candidate_coherent_result,
+                    "model_score": coherent_model_score,
+                })
+            if not coherent_basin_trials:
+                raise _CosmicMCSContinuationFailure(
+                    "all MCS-aware coherent basin continuations failed: "
+                    f"{coherent_basin_failures!r}"
+                )
+            coherent_basin_trials.sort(key=lambda row: (
+                float(row["model_score"]),
+                int(row["source_fit"].get("seed_index", -1)),
+            ))
+            coherent_basin_winner = coherent_basin_trials[0]
+            cosmic_coherent_charge_result = coherent_basin_winner[
+                "charge_result"
+            ]
+            cosmic_coherent_result = coherent_basin_winner[
+                "coherent_result"
+            ]
+            coherent_source_result = coherent_basin_winner["source_result"]
+            basin_rows = []
+            for trial in coherent_basin_trials:
+                source_fit = trial["source_fit"]
+                source_result = trial["source_result"]
+                candidate_result = trial["coherent_result"]
+                basin_rows.append({
+                    "seed_index": int(source_fit.get("seed_index", -1)),
+                    "seed_family": str(source_fit.get("seed_family", "")),
+                    "straight_nll": float(source_result.fval),
+                    "straight_model_score": float(
+                        auto_payload_score(source_fit)
+                    ),
+                    "coherent_selection_nll": float(
+                        candidate_result.selection_nll
+                    ),
+                    "coherent_model_score": float(trial["model_score"]),
+                    "coherent_length_mm": float(
+                        candidate_result.updated_values["length"]
+                    ),
+                    "coherent_wall_s": float(candidate_result.wall_s),
+                    "selected": bool(trial is coherent_basin_winner),
+                })
+            cosmic_coherent_result.diagnostics[
+                "global_basin_arbitration"
+            ] = {
+                "enabled": bool(coherent_basin_count > 1),
+                "maximum_candidates": int(coherent_basin_count),
+                "straight_model_gate_nll": float(
+                    coherent_basin_gate_nll
+                ),
+                "line_geometry_marginalized": False,
+                "line_geometry_profiled_over_discrete_basins": bool(
+                    len(coherent_basin_trials) > 1
+                ),
+                "candidate_rows": basin_rows,
+                "failures": coherent_basin_failures,
+                "selected_seed_index": int(
+                    coherent_basin_winner["source_fit"].get(
+                        "seed_index", -1
+                    )
+                ),
+            }
             coherent_values = dict(cosmic_coherent_result.updated_values)
             coherent_chart = cosmic_coherent_result.updated_chart
             coherent_values["t0"] = float(
-                exact_result.values.get("t0", 0.0)
+                coherent_source_result.values.get("t0", 0.0)
             )
-            timing_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                coherent_chart,
-                "timing_only",
-                proxy=False,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            timing_fixed = _optimizer_fixed_params(
-                chosen_start_hypothesis
-            )
-            timing_fixed["length"] = float(coherent_values["length"])
-            if "t0" not in timing_fixed:
-                profiled = profile_t0(
-                    timing_objective,
+            if (
+                LIKELIHOOD_MODE == "charge_only"
+                and COSMIC_JOINT_ENERGY_RANGE_ENABLED
+            ):
+                # The coherent MAP stage supplies a data-derived global line
+                # geometry only.  Report energy and realized range from the
+                # subsequent exact continuous posterior, which retains the
+                # full declared K0 support and normalized proposal bridge.
+                cosmic_joint_energy_range_result = (
+                    _run_joint_energy_range_stage(
+                        coherent_values,
+                        coherent_chart,
+                        initial_path_coefficients=(
+                            cosmic_coherent_result.coefficients_mean
+                        ),
+                    )
+                )
+                for feedback_cycle in range(
+                    int(COSMIC_JOINT_GLOBAL_FEEDBACK_CYCLES)
+                ):
+                    feedback_summary = (
+                        cosmic_joint_energy_range_result.summary()
+                    )
+                    feedback_energy = float(
+                        feedback_summary[
+                            "initial_kinetic_energy_mev_mean"
+                        ]
+                    )
+                    feedback_coherent = (
+                        run_cosmic_coherent_profile_update(
+                            EMITTER_TEMPLATE,
+                            values=(
+                                cosmic_joint_energy_range_result
+                                .updated_values
+                            ),
+                            chart=(
+                                cosmic_joint_energy_range_result
+                                .updated_chart
+                            ),
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=mcs_obs_ts,
+                            starts_at_boundary=(
+                                chosen_start_hypothesis
+                                == "boundary_entry"
+                            ),
+                            mpmt_types=MPMT_TYPE_CODES,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=length_limits,
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(
+                                COSMIC_COHERENT_GRID_POINTS
+                            ),
+                            latent_fd=float(
+                                COSMIC_COHERENT_LATENT_FD
+                            ),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            track_cycles=int(
+                                COSMIC_COHERENT_TRACK_CYCLES
+                            ),
+                            transverse_step_mm=12.0,
+                            longitudinal_step_mm=12.0,
+                            direction_step=0.010,
+                            range_step_mm=30.0,
+                            latent_trust_max_component=1.0,
+                            track_trust_max_scaled_component=float(
+                                COSMIC_COHERENT_TRACK_TRUST
+                            ),
+                            sparse_neighbor_radius_mm=100.0,
+                            fixed_initial_kinetic_energy_mev=(
+                                feedback_energy
+                            ),
+                            profile_selection_objective=str(
+                                COSMIC_COHERENT_SELECTION_OBJECTIVE
+                            ),
+                            initial_path_coefficients=(
+                                cosmic_joint_energy_range_result
+                                .coefficients_mean
+                            ),
+                            track_one_sided_half_step=_env_bool(
+                                "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP",
+                                False,
+                            ),
+                            boundary_interface_model=(
+                                active_mpmt_boundary_model
+                            ),
+                            boundary_interface_timing_policy="mask_module",
+                        )
+                    )
+                    cosmic_joint_global_feedback_history.append({
+                        "cycle": int(feedback_cycle),
+                        "conditional_energy_mev": feedback_energy,
+                        "range_before_mm": float(
+                            feedback_summary[
+                                "realized_range_mm_mean"
+                            ]
+                        ),
+                        "range_after_global_mm": float(
+                            feedback_coherent.updated_values["length"]
+                        ),
+                        "posterior_nll_after_global": float(
+                            feedback_coherent.posterior_nll
+                        ),
+                        "accepted_global_steps": int(sum(
+                            bool(row.accepted)
+                            for row in feedback_coherent.iterations
+                        )),
+                    })
+                    cosmic_coherent_result = feedback_coherent
+                    cosmic_joint_energy_range_result = (
+                        _run_joint_energy_range_stage(
+                            feedback_coherent.updated_values,
+                            feedback_coherent.updated_chart,
+                            initial_path_coefficients=(
+                                feedback_coherent.coefficients_mean
+                            ),
+                        )
+                    )
+                joint_summary = cosmic_joint_energy_range_result.summary()
+                final_values = _materialize_output_values(
+                    cosmic_joint_energy_range_result.updated_values,
+                    cosmic_joint_energy_range_result.updated_chart,
+                    start_hypothesis=chosen_start_hypothesis,
+                )
+                final_values["range_equivalent_ke_mev"] = float(
+                    final_values.get("fit_onset_ke_mev", math.nan)
+                )
+                final_values["initial_kinetic_energy_mev"] = float(
+                    joint_summary["initial_kinetic_energy_mev_mean"]
+                )
+                final_values["z_range"] = float(
+                    joint_summary["z_range_mean"]
+                )
+                errors = dict(straight_errors)
+                errors.update({
+                    "full_range": float(
+                        joint_summary["realized_range_mm_sd"]
+                    ),
+                    "initial_kinetic_energy_mev": float(
+                        joint_summary["initial_kinetic_energy_mev_sd"]
+                    ),
+                    "z_range": float(joint_summary["z_range_sd"]),
+                })
+                final_fval = float(
+                    cosmic_joint_energy_range_result.map_charge_nll
+                )
+                fval_definition = (
+                    "exact configured data NLL at the highest-posterior "
+                    "sampled continuous (K0,z_R,FE-path) state after a "
+                    "coherent global-geometry update; reported K0 and range "
+                    "are separately marginalized posterior means; "
+                    + (
+                        "no timing"
+                        if LIKELIHOOD_MODE == "charge_only"
+                        else "includes prompt first-arrival timing"
+                    )
+                )
+            elif LIKELIHOOD_MODE == "charge_only":
+                final_values = _materialize_output_values(
                     coherent_values,
-                    limits=T0_LIMITS,
-                    coarse_step_ns=T0_PROFILE_COARSE_STEP_NS,
-                    refine_levels=T0_PROFILE_REFINE_LEVELS,
-                    refine_factor=T0_PROFILE_REFINE_FACTOR,
-                    max_global_points=T0_PROFILE_MAX_GLOBAL_POINTS,
-                    seed_half_width_ns=T0_PROFILE_SEED_HALF_WIDTH_NS,
+                    coherent_chart,
+                    start_hypothesis=chosen_start_hypothesis,
                 )
-                coherent_values = dict(profiled.values)
+                errors = dict(straight_errors)
+                final_fval = float(cosmic_coherent_result.selection_nll)
+                fval_definition = (
+                    "charge-only nonlinear coherent FE exact compound-SPE "
+                    "joint posterior NLL with physical FE/range priors; no timing"
+                    if COSMIC_COHERENT_SELECTION_OBJECTIVE == "posterior"
+                    else
+                    "charge-only nonlinear coherent FE Poisson-information "
+                    "Laplace-surrogate NLL; no timing"
+                )
+            else:
+                coherent_fixed = _optimizer_fixed_params(
+                    chosen_start_hypothesis
+                )
+                coherent_joint_geometry_policy = os.environ.get(
+                    "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_GEOMETRY_POLICY",
+                    "straight_conditioned",
+                ).strip().lower()
+                if coherent_joint_geometry_policy not in {
+                    "straight_conditioned", "free"
+                }:
+                    raise ValueError(
+                        "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_GEOMETRY_POLICY "
+                        "must be straight_conditioned or free"
+                    )
+                coherent_joint_line_is_conditioned = (
+                    coherent_joint_geometry_policy == "straight_conditioned"
+                )
+                if coherent_joint_line_is_conditioned:
+                    coherent_joint_values, coherent_joint_chart = (
+                        reanchor_result(exact_result)
+                    )
+                    # Keep the charge-informed range seed while retaining the
+                    # sharply localized charge-time entrance line.  The common
+                    # posterior below remains free to update range, FE path,
+                    # and t0 together.
+                    coherent_joint_values["length"] = float(
+                        coherent_values["length"]
+                    )
+                else:
+                    coherent_joint_values = coherent_values
+                    coherent_joint_chart = coherent_chart
+                if "t0" in coherent_fixed:
+                    coherent_joint_values["t0"] = float(coherent_fixed["t0"])
+                coherent_track_controller = (
+                    cosmic_coherent_result.diagnostics.get(
+                        "track_cycle_controller", {}
+                    )
+                )
+                coherent_hard_event = bool(
+                    coherent_track_controller.get(
+                        "adaptive_extension_triggered", False
+                    )
+                )
+                coherent_joint_latent_iterations = int(
+                    COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                ) + (
+                    max(
+                        0,
+                        _env_int(
+                            "COSMIC_COHERENT_JOINT_TIMING_HARD_LATENT_BONUS",
+                            1,
+                        ),
+                    )
+                    if coherent_hard_event
+                    else 0
+                )
+                coherent_range_limits = length_limits
+                if "length" in coherent_fixed:
+                    fixed_length = float(coherent_fixed["length"])
+                    coherent_range_limits = (fixed_length, fixed_length)
+                cosmic_coherent_joint_length_result = (
+                    run_cosmic_coherent_joint_length_update(
+                        EMITTER_TEMPLATE,
+                        values=coherent_joint_values,
+                        chart=coherent_joint_chart,
+                        detector=DETECTOR,
+                        range_lookup=RANGE_LOOKUP,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        obs_ts=mcs_obs_ts,
+                        starts_at_boundary=(
+                            chosen_start_hypothesis == "boundary_entry"
+                        ),
+                        initial_path_coefficients=(
+                            cosmic_coherent_result.coefficients_mean
+                        ),
+                        mpmt_types=MPMT_TYPE_CODES,
+                        inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                        range_limits=coherent_range_limits,
+                        t0_limits=T0_LIMITS,
+                        modes_per_plane=int(
+                            COSMIC_COHERENT_MODES_PER_PLANE
+                        ),
+                        grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                        response_fd_step=float(COSMIC_COHERENT_LATENT_FD),
+                        latent_max_iterations=int(
+                            coherent_joint_latent_iterations
+                        ),
+                        final_latent_max_iterations=max(
+                            0,
+                            _env_int(
+                                "COSMIC_COHERENT_JOINT_TIMING_FINAL_LATENT_ITERATIONS",
+                                int(coherent_joint_latent_iterations),
+                            ),
+                        ),
+                        candidate_latent_max_iterations=int(
+                            COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS
+                        ),
+                        range_step_mm=float(
+                            COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+                        ),
+                        minimum_range_step_mm=float(
+                            COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+                        ),
+                        maximum_range_cycles=int(
+                            COSMIC_COHERENT_JOINT_TIMING_RANGE_CYCLES
+                        ),
+                        maximum_global_cycles=max(
+                            1,
+                            _env_int(
+                                "COSMIC_COHERENT_JOINT_TIMING_GLOBAL_CYCLES",
+                                4,
+                            ),
+                        ),
+                        transverse_step_mm=12.0,
+                        minimum_transverse_step_mm=1.0,
+                        longitudinal_step_mm=12.0,
+                        minimum_longitudinal_step_mm=1.0,
+                        direction_step=0.010,
+                        minimum_direction_step=5.0e-4,
+                        allow_longitudinal=bool(
+                            topology_options["allow_longitudinal"]
+                            and not coherent_joint_line_is_conditioned
+                        ),
+                        allow_transverse=not coherent_joint_line_is_conditioned,
+                        allow_direction=not coherent_joint_line_is_conditioned,
+                        fixed_parameter_names=tuple(coherent_fixed),
+                        path_trust_max_component=1.0,
+                        sparse_neighbor_radius_mm=float(
+                            MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                        ),
+                        fixed_initial_kinetic_energy_mev=(
+                            None
+                            if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                            else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                        ),
+                        profile_t0=("t0" not in coherent_fixed),
+                        t0_profile_coarse_step_ns=float(
+                            T0_PROFILE_COARSE_STEP_NS
+                        ),
+                        t0_profile_refine_levels=int(
+                            T0_PROFILE_REFINE_LEVELS
+                        ),
+                        t0_profile_global_points=int(
+                            T0_PROFILE_MAX_GLOBAL_POINTS
+                        ),
+                        t0_profile_seed_half_width_ns=float(
+                            T0_PROFILE_SEED_HALF_WIDTH_NS
+                        ),
+                        boundary_interface_model=(
+                            active_mpmt_boundary_model
+                        ),
+                        boundary_interface_timing_policy="mask_module",
+                    )
+                )
+                cosmic_coherent_joint_length_result.diagnostics[
+                    "global_geometry_policy"
+                ] = coherent_joint_geometry_policy
+                joint_values = dict(
+                    cosmic_coherent_joint_length_result.updated_values
+                )
+                final_values = _materialize_output_values(
+                    joint_values,
+                    cosmic_coherent_joint_length_result.updated_chart,
+                    start_hypothesis=chosen_start_hypothesis,
+                )
+                # The local joint profile supplies a conditional path/range
+                # covariance, not a validated all-global-coordinate covariance.
+                errors = dict(straight_errors)
                 cosmic_coherent_post_stage_nfcn += int(
-                    profiled.nll_evaluations
+                    cosmic_coherent_joint_length_result.diagnostics[
+                        "objective_evaluations"
+                    ]
                 )
-            cosmic_coherent_timing_result = track_aligned_block_optimize(
-                timing_objective,
-                coherent_values,
-                fixed_params=timing_fixed,
-                sweeps=max(1, int(COSMIC_FE_TIMING_SWEEPS)),
-                initial_steps=TIMING_STEPS,
-                length_limits=length_limits,
-                full_range_limits=None,
-                full_cross_sweeps=1,
-                allow_longitudinal=False,
-                allow_transverse=True,
-                allow_direction=True,
-                project_vertex_steps=bool(
-                    topology_options["project_vertex_steps"]
-                ),
-            )
-            timing_values = dict(cosmic_coherent_timing_result.values)
-            if "t0" not in timing_fixed:
-                profiled = profile_t0(
-                    timing_objective,
-                    timing_values,
-                    limits=T0_LIMITS,
-                    coarse_step_ns=T0_PROFILE_COARSE_STEP_NS,
-                    refine_levels=T0_PROFILE_REFINE_LEVELS,
-                    refine_factor=T0_PROFILE_REFINE_FACTOR,
-                    max_global_points=T0_PROFILE_MAX_GLOBAL_POINTS,
-                    seed_half_width_ns=T0_PROFILE_SEED_HALF_WIDTH_NS,
+                final_fval = float(
+                    cosmic_coherent_joint_length_result.data_nll
                 )
-                timing_values = dict(profiled.values)
-                cosmic_coherent_timing_result.values = timing_values
-                cosmic_coherent_timing_result.fval = float(profiled.fval)
-                cosmic_coherent_timing_result.nfcn += int(
-                    profiled.nll_evaluations
+                fval_definition = (
+                    "exact configured charge-plus-first-arrival data NLL at "
+                    "the geometry-clipped coherent FE path/range MAP; t0 is "
+                    "profiled for every continuous-state candidate and "
+                    "physical FE/range priors are stored separately"
                 )
-                cosmic_coherent_timing_result.wall_s += float(
-                    profiled.wall_s
-                )
-                cosmic_coherent_post_stage_nfcn += int(
-                    profiled.nll_evaluations
-                )
-            final_values = _materialize_output_values(
-                timing_values,
-                cosmic_coherent_timing_result.chart,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            # The coherent Laplace stage does not yet deliver a validated global
-            # covariance for the final conditional-timing geometry.  Preserve
-            # the accepted straight-fit errors rather than inventing one.
-            errors = dict(straight_errors)
-            final_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                cosmic_coherent_timing_result.chart,
-                LIKELIHOOD_MODE,
-                proxy=False,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            final_fval = float(final_objective(timing_values))
-            cosmic_coherent_post_stage_nfcn += int(
-                final_objective.evaluations
-            )
-            fval_definition = (
-                "ordinary production charge-plus-time NLL evaluated at the "
-                "geometry-clipped nonlinear coherent FE charge-profile estimate "
-                "after conditional first-arrival timing; coherent Fisher-Laplace "
-                "NLL stored separately"
-            )
 
-        elif AUTO_CLIPPED_TRACK and COSMIC_FERMI_EYGES_ENABLED:
+        elif (
+            AUTO_CLIPPED_TRACK
+            and COSMIC_FERMI_EYGES_ENABLED
+            and not _event_mcs_straight_fallback_active()
+        ):
             # Preserve the topology selected by the complete joint navigation,
             # but reconstruct the coherent stochastic trajectory using the
             # statistically correct staged estimator: sharp charge closure,
@@ -32335,7 +40394,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "first-arrival timing; FE quasi-NLL stored separately"
             )
 
-        if USE_COHERENT_FISHER:
+        if USE_COHERENT_FISHER and not _event_mcs_straight_fallback_active():
             if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
                 coherent_result = run_fast12_coherent_update(
                     EMITTER_TEMPLATE,
@@ -32348,7 +40407,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     pmt_normals=PMT_NORMALS,
                     obs_pes=obs_pes,
                     obs_ts=obs_ts,
-                    mpmt_types=MPMT_TYPE_CODES,
                     fixed_params=FIXED_PARAMS,
                     length_limits=length_limits,
                     t0_limits=T0_LIMITS,
@@ -32381,7 +40439,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     "profiled coherent-charge Fisher-Laplace NLL with 12 FE/KL "
                     "modes per transverse plane; straight-fit errors retained"
                 )
-            else:
+            elif MCS_COHERENT_IMPLEMENTATION == "legacy_fisher":
                 coherent_result = run_coherent_fisher_update(
                     EMITTER_TEMPLATE,
                     values=exact_result.values,
@@ -32393,7 +40451,6 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     pmt_normals=PMT_NORMALS,
                     obs_pes=obs_pes,
                     obs_ts=obs_ts,
-                    mpmt_types=MPMT_TYPE_CODES,
                     fixed_params=FIXED_PARAMS,
                     length_limits=length_limits,
                     t0_limits=T0_LIMITS,
@@ -32426,88 +40483,46 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     "accepted joint fit"
                 )
 
-        # ------------------------------------------------------------------
-        # Explicit mPMT-boundary subclasses.  This is deliberately a guarded
-        # post-tournament challenge: the validated ordinary cosmic solution is
-        # retained and can only be replaced by an independently optimized
-        # geometry-constrained mPMT entry/exit model that wins a penalized common
-        # charge-likelihood comparison.  Cosmic MCS continuations are currently
-        # forbidden above, so no latent-path result is bypassed here.
-        # ------------------------------------------------------------------
-        mpmt_boundary_winner = None
-        mpmt_boundary_summary = {
-            "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
-            "used": False,
-            "accepted": False,
-            "reason": "not_run",
-            "nfcn": 0,
-            "invalid_evaluations": 0,
-            "wall_s": 0.0,
-        }
+        # Attach the final nested hardware profile to the existing auditable
+        # challenge summary.  The coherent objective owns the final MCS result;
+        # the straight hardware fit above is only its discrete-topology seed.
+        if mpmt_boundary_winner is not None and mcs_continuation_requested:
+            mcs_hardware_diagnostics = None
+            if cosmic_coherent_joint_length_result is not None:
+                mcs_hardware_diagnostics = (
+                    cosmic_coherent_joint_length_result.diagnostics.get(
+                        "mpmt_hardware"
+                    )
+                )
+            elif cosmic_coherent_result is not None:
+                mcs_hardware_diagnostics = (
+                    cosmic_coherent_result.diagnostics.get("mpmt_hardware")
+                )
+            compatibility = mpmt_boundary_summary.setdefault(
+                "mcs_compatibility", {}
+            )
+            compatibility.update({
+                "continuation_completed": bool(
+                    cosmic_coherent_result is not None
+                    or cosmic_fe_result is not None
+                    or cosmic_joint_energy_range_result is not None
+                    or coherent_result is not None
+                ),
+                "coherent_nested_profile": mcs_hardware_diagnostics,
+            })
+            fval_definition = (
+                str(fval_definition)
+                + "; includes a nested explicit mPMT-hardware charge profile "
+                "with crossed-module timestamps masked"
+            )
+
         if (
             AUTO_CLIPPED_TRACK
             and cosmic_fe_result is None
             and cosmic_coherent_result is None
+            and cosmic_joint_energy_range_result is None
             and coherent_result is None
         ):
-            try:
-                mpmt_boundary_winner, mpmt_boundary_summary = (
-                    _run_mpmt_boundary_challenge(
-                        obs_pes=obs_pes,
-                        obs_ts=obs_ts,
-                        baseline_result=exact_result,
-                        baseline_start_hypothesis=chosen_start_hypothesis,
-                        topology_penalty=auto_topology_penalty,
-                        length_limits=length_limits,
-                        requested_mode=LIKELIHOOD_MODE,
-                    )
-                )
-            except Exception as exc:
-                # The ordinary topology result remains authoritative if the
-                # optional challenge encounters an event-specific numerical
-                # failure.  Record the failure rather than allowing one malformed
-                # module hypothesis to abort a production batch.
-                mpmt_boundary_winner = None
-                mpmt_boundary_summary = {
-                    "enabled": bool(COSMIC_MPMT_BOUNDARY_ENABLED),
-                    "used": False,
-                    "accepted": False,
-                    "reason": "challenge_exception",
-                    "error": repr(exc),
-                    "nfcn": 0,
-                    "invalid_evaluations": 0,
-                    "wall_s": 0.0,
-                }
-
-        if mpmt_boundary_winner is not None:
-            exact_result = mpmt_boundary_winner["result"]
-            chosen_start_hypothesis = str(
-                mpmt_boundary_winner["start_hypothesis"]
-            )
-            errors = _materialize_output_errors(
-                exact_result.errors,
-                start_hypothesis=chosen_start_hypothesis,
-            )
-            final_fval = float(exact_result.fval)
-            if bool(
-                mpmt_boundary_winner.get("timing_metadata", {}).get(
-                    "accepted", False
-                )
-            ):
-                fval_definition = (
-                    "explicit geometry-constrained mPMT boundary subclass; "
-                    "class selected by penalized common charge likelihood and "
-                    "final charge-plus-time NLL uses timestamps outside the "
-                    "crossed module"
-                )
-            else:
-                fval_definition = (
-                    "explicit geometry-constrained mPMT boundary subclass; "
-                    "penalized common charge likelihood with locally profiled "
-                    "nonnegative hardware-light modes"
-                )
-
-        if AUTO_CLIPPED_TRACK and cosmic_fe_result is None:
             final_values = _materialize_output_values(
                 exact_result.values,
                 exact_result.chart,
@@ -32517,11 +40532,46 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             final_values = _materialize_output_values(
                 exact_result.values, exact_result.chart
             )
-        elif FIT_MODE == "full_length":
+        elif FIT_MODE == "full_length" and not AUTO_CLIPPED_TRACK:
             final_values["visible_length"] = float(final_values["length"])
             final_values["full_range"] = float(final_values["length"])
         else:
             final_values["length"] = float(final_values["visible_length"])
+
+        # Every cosmic result exposes the same energy contract. Joint models
+        # carry an independently inferred K0; deterministic models use the
+        # inverse-range value for both fields rather than emitting a misleading
+        # NaN in ``initial_kinetic_energy_mev``.
+        range_equivalent_ke_mev = float(
+            RANGE_LOOKUP.range_mm_to_energy(final_values["full_range"])
+        )
+        final_values.setdefault(
+            "range_equivalent_ke_mev", range_equivalent_ke_mev
+        )
+        final_values.setdefault(
+            "initial_kinetic_energy_mev", range_equivalent_ke_mev
+        )
+        errors.setdefault(
+            "full_range", float(errors.get("length", math.nan))
+        )
+        full_range_error = float(errors.get("full_range", math.nan))
+        if (
+            "initial_kinetic_energy_mev" not in errors
+            and math.isfinite(full_range_error)
+            and full_range_error >= 0.0
+        ):
+            range_value = float(final_values["full_range"])
+            range_low = max(0.0, range_value - full_range_error)
+            range_high = min(
+                float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                range_value + full_range_error,
+            )
+            energy_low = float(RANGE_LOOKUP.range_mm_to_energy(range_low))
+            energy_high = float(RANGE_LOOKUP.range_mm_to_energy(range_high))
+            errors["initial_kinetic_energy_mev"] = max(
+                abs(range_equivalent_ke_mev - energy_low),
+                abs(energy_high - range_equivalent_ke_mev),
+            )
 
         # Record the selected interface subclass independently for entry and
         # exit.  Ordinary contained/clean-boundary events remain exactly in the
@@ -32551,6 +40601,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "boundary_exit_mpmt_slot": int(selected_exit_slot),
             "mpmt_boundary_selected": bool(mpmt_boundary_winner is not None),
         })
+        final_values, raw_values, longitudinal_gauge = (
+            _apply_internal_start_longitudinal_gauge(
+                final_values,
+                start_hypothesis=chosen_start_hypothesis,
+                refractive_index=float(getattr(EMITTER_TEMPLATE, "n", 1.344)),
+                range_lookup=RANGE_LOOKUP,
+            )
+        )
 
         exact_fit_nfcn = int(sum(item["result"].nfcn for item in optimized_basins))
         total_nfcn = int(
@@ -32565,6 +40623,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             + (0 if cosmic_fe_charge_result is None else int(cosmic_fe_charge_result.nfcn))
             + (0 if cosmic_fe_timing_result is None else int(cosmic_fe_timing_result.nfcn))
             + int(cosmic_fe_post_stage_nfcn)
+            + int(cosmic_coherent_post_stage_nfcn)
+            + (
+                0
+                if cosmic_joint_energy_range_result is None
+                else int(
+                    cosmic_joint_energy_range_result.smc.likelihood_evaluations
+                )
+            )
             + int(mpmt_boundary_summary.get("nfcn", 0))
         )
         basin_payload = [
@@ -32598,6 +40664,8 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "optimizer": "track_aligned_exact_joint_block_quadratic",
             "parameterization": "seed-centred normalized tangent chart",
             "values": final_values,
+            "raw_values": raw_values,
+            "longitudinal_gauge": longitudinal_gauge,
             "errors": errors,
             "fval": float(final_fval),
             "fval_definition": str(fval_definition),
@@ -32619,6 +40687,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             "straight_fit_values": dict(straight_values),
             "straight_fit_errors": dict(straight_errors),
             "fit_accepted": bool(np.isfinite(final_fval)),
+            "mcs_status": (
+                "straight_fallback_retry"
+                if _event_mcs_straight_fallback_active()
+                else (
+                    "applied"
+                    if any(stage is not None for stage in (
+                        cosmic_fe_result,
+                        cosmic_coherent_result,
+                        cosmic_joint_energy_range_result,
+                        coherent_result,
+                    ))
+                    else (
+                        "not_requested"
+                        if not mcs_continuation_requested else "not_applied"
+                    )
+                )
+            ),
+            "mcs_failure": None,
+            "multilateration_guided_full_bank_fallback": bool(
+                multilateration_guided_full_bank_fallback
+            ),
             "chosen_seed_index": int(chosen_index),
             "chosen_seed": dict(event_seeds[chosen_index]),
             "chosen_track_start_hypothesis": str(chosen_start_hypothesis),
@@ -32641,9 +40730,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 )
             ),
             "proxy_candidate_indices": [int(x) for x in candidate_indices],
-            # Event-specific causal seeds do not belong to the immutable quantized
-            # proxy library. Store NaN for those entries rather than indexing past
-            # the fixed score vector.
+            # Event-specific timing-navigation seeds do not belong to the
+            # immutable quantized proxy library. Store NaN for those entries
+            # rather than indexing past the fixed score vector.
             "proxy_scores": [
                 float(scores[x]) if 0 <= int(x) < int(len(scores)) else math.nan
                 for x in candidate_indices
@@ -32662,13 +40751,77 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 ),
                 "seed_count": int(len(causal_timing_seed_records)),
                 "line_count": int(len(causal_timing_line_records)),
+                "lazy_beam_gate": dict(
+                    causal_timing_lazy_beam_diagnostics
+                ),
                 "selected_seed_was_causal": bool(
-                    int(chosen_index) >= int(len(SEEDS))
-                    or str(event_seeds[int(chosen_index)].get("seed_family", ""))
+                    str(event_seeds[int(chosen_index)].get("seed_family", ""))
                     == "causal_timing_guard"
                 ),
                 "seeds": causal_timing_seed_records if SAVE_DETAILED_EVENT_RESULTS else [],
                 "lines": causal_timing_line_records if SAVE_DETAILED_EVENT_RESULTS else [],
+            },
+            "multilateration_seed_guard": {
+                "mode": str(COSMIC_MULTILATERATION_SEED_MODE),
+                "enabled": bool(
+                    COSMIC_MULTILATERATION_SEED_MODE != "off"
+                ),
+                "used": bool(multilateration_seed_records),
+                "wall_s": float(multilateration_wall_s),
+                "failure": multilateration_failure,
+                "primary_fallback_used": bool(
+                    multilateration_primary_fallback_used
+                ),
+                "primary_fallback_reason": (
+                    multilateration_primary_fallback_reason
+                ),
+                "guided_full_bank_fallback": bool(
+                    multilateration_guided_full_bank_fallback
+                ),
+                "point_fit": multilateration_point_record,
+                "guided_bank": {
+                    "enabled": bool(
+                        COSMIC_MULTILATERATION_SEED_MODE == "guided"
+                    ),
+                    "wall_s": float(multilateration_guided_bank_wall_s),
+                    "failure": multilateration_guided_bank_failure,
+                    "neighbourhood_count": int(
+                        multilateration_guided_bank_neighbourhood_count
+                    ),
+                    "proxy_quantization_uncertainty_nll": float(
+                        multilateration_guided_proxy_quantization_uncertainty_nll
+                    ),
+                    "selected_count": int(
+                        len(multilateration_guided_bank_records)
+                    ),
+                    "selected": (
+                        multilateration_guided_bank_records
+                        if SAVE_DETAILED_EVENT_RESULTS else []
+                    ),
+                },
+                "pool_seed_count": int(multilateration_pool_count),
+                "prefilter_nfcn": int(multilateration_prefilter_nfcn),
+                "prefilter_wall_s": float(
+                    multilateration_prefilter_wall_s
+                ),
+                "prefilter_failures": (
+                    multilateration_prefilter_failures
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
+                "seed_count": int(len(multilateration_seed_records)),
+                "line_count": int(len(multilateration_line_records)),
+                "selected_seed_was_multilateration": bool(
+                    str(event_seeds[int(chosen_index)].get("seed_family", ""))
+                    == "multilateration_timing"
+                ),
+                "seeds": (
+                    multilateration_seed_records
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
+                "lines": (
+                    multilateration_line_records
+                    if SAVE_DETAILED_EVENT_RESULTS else []
+                ),
             },
             "proxy_results": [
                 {
@@ -32801,20 +40954,301 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     else coherent_fisher_payload(coherent_result)
                 )
             ),
+            "cosmic_joint_energy_range": (
+                None
+                if cosmic_joint_energy_range_result is None
+                else {
+                    "enabled": True,
+                    "estimator": (
+                        (
+                            "charge-only"
+                            if LIKELIHOOD_MODE == "charge_only"
+                            else "charge-plus-time"
+                        )
+                        + " annealed SMC over continuous "
+                        "(K0,z_R,soft-Wentzel-FE,hard-Wentzel-marks)"
+                        if str(_EMITTER_SWITCHES[
+                            "cosmic_mcs_continuation"
+                        ]) == "joint_k0_range_mixed_mcs"
+                        else (
+                            (
+                                "charge-only"
+                                if LIKELIHOOD_MODE == "charge_only"
+                                else "charge-plus-time"
+                            )
+                            + " annealed SMC over continuous "
+                            "(K0,z_R,coherent-FE-path)"
+                            if str(_EMITTER_SWITCHES[
+                                "cosmic_joint_inference_method"
+                            ]) == "reference_smc"
+                            else (
+                                "charge-only"
+                                if LIKELIHOOD_MODE == "charge_only"
+                                else "charge-plus-time"
+                            )
+                            + " deterministic Laplace/Gauss-Hermite "
+                            "cubature over continuous (K0,z_R,coherent-FE-path)"
+                        )
+                    ),
+                    "posterior": cosmic_joint_energy_range_result.summary(),
+                    "global_feedback": list(
+                        cosmic_joint_global_feedback_history
+                    ),
+                    "guide": dict(
+                        cosmic_joint_energy_range_result.guide_diagnostics
+                    ),
+                    "coefficients_mean": (
+                        cosmic_joint_energy_range_result.coefficients_mean.tolist()
+                    ),
+                    "coefficients_covariance": (
+                        cosmic_joint_energy_range_result
+                        .coefficients_covariance.tolist()
+                    ),
+                    "temperature_stages": [
+                        {
+                            "beta_before": float(row.beta_before),
+                            "beta_after": float(row.beta_after),
+                            "ess_before_resampling": float(
+                                row.ess_before_resampling
+                            ),
+                            "resampled": bool(row.resampled),
+                            "energy_acceptance": float(row.energy_acceptance),
+                            "event_time_acceptance": float(
+                                getattr(row, "event_time_acceptance", 0.0)
+                            ),
+                            "range_acceptance": float(row.range_acceptance),
+                            "path_acceptance": float(row.path_acceptance),
+                            "guide_acceptance": float(row.guide_acceptance),
+                            "hard_acceptance": (
+                                None
+                                if not hasattr(row, "hard_acceptance")
+                                else float(row.hard_acceptance)
+                            ),
+                            "hard_local_acceptance": (
+                                None
+                                if not hasattr(row, "hard_local_acceptance")
+                                else float(row.hard_local_acceptance)
+                            ),
+                            "soft_pcn_attempts": int(
+                                getattr(row, "soft_pcn_attempts", 0)
+                            ),
+                            "soft_pcn_finite_proposals": int(
+                                getattr(row, "soft_pcn_finite_proposals", 0)
+                            ),
+                            "soft_pcn_jump_norm_median": float(
+                                getattr(row, "soft_pcn_jump_norm_median", math.nan)
+                            ),
+                            "soft_pcn_loglike_delta_median": float(
+                                getattr(
+                                    row,
+                                    "soft_pcn_loglike_delta_median",
+                                    math.nan,
+                                )
+                            ),
+                            "soft_pcn_log_ratio_median": float(
+                                getattr(row, "soft_pcn_log_ratio_median", math.nan)
+                            ),
+                            "soft_pcn_log_ratio_max": float(
+                                getattr(row, "soft_pcn_log_ratio_max", math.nan)
+                            ),
+                            "conditional_guide_attempts": int(
+                                getattr(row, "conditional_guide_attempts", 0)
+                            ),
+                            "conditional_guide_finite_proposals": int(
+                                getattr(
+                                    row,
+                                    "conditional_guide_finite_proposals",
+                                    0,
+                                )
+                            ),
+                            "conditional_guide_jump_norm_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_jump_norm_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_loglike_delta_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_loglike_delta_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_log_ratio_median": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_log_ratio_median",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_log_ratio_max": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_log_ratio_max",
+                                    math.nan,
+                                )
+                            ),
+                            "conditional_guide_effective_probability": float(
+                                getattr(
+                                    row,
+                                    "conditional_guide_effective_probability",
+                                    math.nan,
+                                )
+                            ),
+                        }
+                        for row in cosmic_joint_energy_range_result.smc.stages
+                    ],
+                    "samples": (
+                        {
+                            "initial_kinetic_energy_mev": (
+                                cosmic_joint_energy_range_result.smc
+                                .kinetic_energy_mev.tolist()
+                            ),
+                            "z_range": (
+                                cosmic_joint_energy_range_result.smc.z_range.tolist()
+                            ),
+                            "event_time_ns": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "event_time_ns",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .event_time_ns.tolist()
+                            ),
+                            "realized_range_mm": (
+                                cosmic_joint_energy_range_result.smc
+                                .realized_range_mm.tolist()
+                            ),
+                            "coefficients": (
+                                cosmic_joint_energy_range_result.smc
+                                .coefficients.tolist()
+                            ),
+                            "initial_lineage": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "initial_lineage",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .initial_lineage.tolist()
+                            ),
+                            "hard_scatters": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "latents",
+                                )
+                                else [
+                                    [
+                                        {
+                                            "s_mm": float(mark.s_mm),
+                                            "theta_rad": float(mark.theta_rad),
+                                            "azimuth_rad": float(mark.azimuth_rad),
+                                            "atomic_number": int(mark.atomic_number),
+                                            "target": str(mark.target),
+                                        }
+                                        for mark in latent.hard_scatters
+                                    ]
+                                    for latent in cosmic_joint_energy_range_result.smc.latents
+                                ]
+                            ),
+                            "log_likelihood": (
+                                cosmic_joint_energy_range_result.smc
+                                .log_likelihood.tolist()
+                            ),
+                            "log_prior_density": (
+                                None
+                                if not hasattr(
+                                    cosmic_joint_energy_range_result.smc,
+                                    "log_prior_density",
+                                )
+                                else cosmic_joint_energy_range_result.smc
+                                .log_prior_density.tolist()
+                            ),
+                            "weights": (
+                                cosmic_joint_energy_range_result.smc.weights.tolist()
+                            ),
+                        }
+                        if SAVE_DETAILED_EVENT_RESULTS else None
+                    ),
+                    "diagnostics": dict(
+                        cosmic_joint_energy_range_result.diagnostics
+                    ),
+                    "wall_s": float(
+                        cosmic_joint_energy_range_result.wall_s
+                    ),
+                    "updated_values": (
+                        cosmic_joint_energy_range_result.output_values()
+                    ),
+                }
+            ),
             "cosmic_coherent_fermi_eyges_profile": (
                 None if cosmic_coherent_result is None else {
                     "enabled": True,
-                    "estimator": "sharp_charge_then_clipped_nonlinear_FE_profile_then_conditional_timing",
+                    "estimator": (
+                        "sharp_charge_then_clipped_nonlinear_FE_profile"
+                        if cosmic_coherent_joint_length_result is None
+                        else (
+                            "sharp_charge_time_line_then_exact_coherent_"
+                            "path_range_time_profile"
+                            if coherent_joint_line_is_conditioned
+                            else "sharp_charge_then_exact_coherent_joint_"
+                            "global_charge_time_profile"
+                        )
+                    ),
                     "charge_stage": (None if cosmic_coherent_charge_result is None else block_result_payload(cosmic_coherent_charge_result)),
                     "timing_stage": (None if cosmic_coherent_timing_result is None else block_result_payload(cosmic_coherent_timing_result)),
+                    "joint_charge_time_range_stage": (
+                        None
+                        if cosmic_coherent_joint_length_result is None
+                        else {
+                            "updated_values": cosmic_coherent_joint_length_result.output_values(),
+                            "data_nll": float(cosmic_coherent_joint_length_result.data_nll),
+                            "path_prior_nll": float(cosmic_coherent_joint_length_result.path_prior_nll),
+                            "range_prior_nll": float(cosmic_coherent_joint_length_result.range_prior_nll),
+                            "posterior_nll": float(cosmic_coherent_joint_length_result.posterior_nll),
+                            "profiled_t0_ns": float(cosmic_coherent_joint_length_result.profiled_t0_ns),
+                            "coefficients_mean": cosmic_coherent_joint_length_result.coefficients_mean.tolist(),
+                            "coefficients_covariance": cosmic_coherent_joint_length_result.coefficients_covariance.tolist(),
+                            "converged": bool(cosmic_coherent_joint_length_result.converged),
+                            "iterations": [
+                                {
+                                    "cycle": int(row.cycle),
+                                    "step_mm": float(row.step_mm),
+                                    "length_before_mm": float(row.length_before_mm),
+                                    "posterior_before": float(row.posterior_before),
+                                    "candidate_lengths_mm": list(row.candidate_lengths_mm),
+                                    "candidate_posteriors": list(row.candidate_posteriors),
+                                    "length_after_mm": float(row.length_after_mm),
+                                    "posterior_after": float(row.posterior_after),
+                                    "accepted": bool(row.accepted),
+                                }
+                                for row in cosmic_coherent_joint_length_result.iterations
+                            ],
+                            "diagnostics": dict(cosmic_coherent_joint_length_result.diagnostics),
+                            "wall_s": float(cosmic_coherent_joint_length_result.wall_s),
+                        }
+                    ),
                     "post_stage_validation_nfcn": int(cosmic_coherent_post_stage_nfcn),
                     "initial_topology": str(cosmic_coherent_result.initial_resolved.topology),
                     "final_topology": str(cosmic_coherent_result.updated_resolved.topology),
                     "charge_nll": float(cosmic_coherent_result.charge_nll),
                     "posterior_nll": float(cosmic_coherent_result.posterior_nll),
                     "laplace_nll": float(cosmic_coherent_result.laplace_nll),
-                    "coefficients_mean": cosmic_coherent_result.coefficients_mean.tolist(),
-                    "coefficients_covariance": cosmic_coherent_result.coefficients_covariance.tolist(),
+                    "selection_nll": float(cosmic_coherent_result.selection_nll),
+                    "converged": bool(cosmic_coherent_result.converged),
+                    "coefficients_mean": (
+                        cosmic_coherent_result.coefficients_mean.tolist()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.coefficients_mean.tolist()
+                    ),
+                    "coefficients_covariance": (
+                        cosmic_coherent_result.coefficients_covariance.tolist()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.coefficients_covariance.tolist()
+                    ),
                     "profile_iterations": [
                         {
                             "cycle": int(row.cycle),
@@ -32830,7 +41264,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     ],
                     "diagnostics": dict(cosmic_coherent_result.diagnostics),
                     "wall_s": float(cosmic_coherent_result.wall_s),
-                    "updated_values": cosmic_coherent_result.output_values(),
+                    "updated_values": (
+                        cosmic_coherent_result.output_values()
+                        if cosmic_coherent_joint_length_result is None
+                        else cosmic_coherent_joint_length_result.output_values()
+                    ),
                 }
             ),
             "cosmic_fermi_eyges_process": (
@@ -32880,9 +41318,26 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 + sum(item["result"].invalid_evaluations for item in optimized_basins)
                 + int(cosmic_direction_fan_invalid)
                 + int(cosmic_boundary_causal_polish_invalid)
+                + (
+                    0
+                    if cosmic_joint_energy_range_result is None
+                    else int(
+                        cosmic_joint_energy_range_result.smc
+                        .invalid_likelihood_evaluations
+                    )
+                )
                 + int(auto_topology_range_closure_invalid)
                 + int(boundary_range_profile_invalid)
                 + int(auto_range_profile_invalid)
+                + (
+                    0
+                    if cosmic_coherent_joint_length_result is None
+                    else int(
+                        cosmic_coherent_joint_length_result.diagnostics[
+                            "invalid_candidate_count"
+                        ]
+                    )
+                )
                 + int(mpmt_boundary_summary.get("invalid_evaluations", 0))
             ),
             "quadratic_skip_count": int(
@@ -33261,7 +41716,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)
                 coherent_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
-                if MCS_COHERENT_IMPLEMENTATION == "fast12_profile":
+                _coherent_warmup = coherent_warmup_action(
+                    MCS_COHERENT_IMPLEMENTATION
+                )
+                if _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -33286,7 +41744,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         ),
                         numba_threads=MCS_COHERENT_NUMBA_THREADS,
                     )
-                else:
+                elif _coherent_warmup == "legacy_fisher":
                     _ = run_coherent_fisher_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -33305,6 +41763,152 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                             MCS_COHERENT_APPLY_EXPECTED_CONTRACTION
                         ),
                     )
+                else:
+                    raise AssertionError(
+                        f"unsupported coherent warm-up action {_coherent_warmup!r} "
+                        "in this engine"
+                    )
+
+            # The cosmic coherent continuation is enabled independently of the
+            # contained-track coherent-Fisher switch above.  Warm one bounded
+            # profile/range cycle here so Numba compilation is charged to setup,
+            # never to the first event's reported fit latency.
+            if (
+                AUTO_CLIPPED_TRACK
+                and COSMIC_COHERENT_PROFILE_ENABLED
+                and _env_bool("LF_COHERENT_PIPELINE_WARMUP", True)
+            ):
+                try:
+                    warm_values = dict(values)
+                    warm_values["t0"] = float(FIXED_PARAMS.get("t0", 0.0))
+                    warm_profile = run_cosmic_coherent_profile_update(
+                        EMITTER_TEMPLATE,
+                        values=warm_values,
+                        chart=chart,
+                        detector=DETECTOR,
+                        range_lookup=RANGE_LOOKUP,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        obs_ts=obs_ts,
+                        starts_at_boundary=(start_hypothesis == "boundary_entry"),
+                        mpmt_types=MPMT_TYPE_CODES,
+                        inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                        range_limits=track_length_limits(),
+                        t0_limits=T0_LIMITS,
+                        modes_per_plane=int(COSMIC_COHERENT_MODES_PER_PLANE),
+                        grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                        latent_fd=float(COSMIC_COHERENT_LATENT_FD),
+                        latent_max_iterations=int(
+                            COSMIC_COHERENT_LATENT_ITERATIONS
+                        ),
+                        candidate_latent_max_iterations=int(
+                            COSMIC_COHERENT_CANDIDATE_LATENT_ITERATIONS
+                        ),
+                        track_cycles=1,
+                        adaptive_track_max_cycles=1,
+                        transverse_step_mm=12.0,
+                        longitudinal_step_mm=12.0,
+                        direction_step=0.010,
+                        range_step_mm=30.0,
+                        latent_trust_max_component=1.0,
+                        track_trust_max_scaled_component=float(
+                            COSMIC_COHERENT_TRACK_TRUST
+                        ),
+                        sparse_neighbor_radius_mm=100.0,
+                        fixed_initial_kinetic_energy_mev=(
+                            None
+                            if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                            else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                        ),
+                        profile_selection_objective=str(
+                            COSMIC_COHERENT_SELECTION_OBJECTIVE
+                        ),
+                        track_one_sided_half_step=_env_bool(
+                            "LF_COHERENT_TRACK_ONE_SIDED_HALF_STEP", False
+                        ),
+                    )
+                    if LIKELIHOOD_MODE != "charge_only":
+                        warm_fixed = _optimizer_fixed_params(start_hypothesis)
+                        warm_joint_values = dict(warm_profile.updated_values)
+                        warm_joint_values["t0"] = float(
+                            warm_values.get("t0", 0.0)
+                        )
+                        _ = run_cosmic_coherent_joint_length_update(
+                            EMITTER_TEMPLATE,
+                            values=warm_joint_values,
+                            chart=warm_profile.updated_chart,
+                            detector=DETECTOR,
+                            range_lookup=RANGE_LOOKUP,
+                            wcd=WCD,
+                            pmt_model=PMT_MODEL,
+                            p_locations=P_LOCATIONS,
+                            pmt_normals=PMT_NORMALS,
+                            obs_pes=obs_pes,
+                            obs_ts=obs_ts,
+                            starts_at_boundary=(
+                                start_hypothesis == "boundary_entry"
+                            ),
+                            initial_path_coefficients=(
+                                warm_profile.coefficients_mean
+                            ),
+                            mpmt_types=MPMT_TYPE_CODES,
+                            inset_mm=float(BOUNDARY_CLIP_INSET_MM),
+                            range_limits=track_length_limits(),
+                            t0_limits=T0_LIMITS,
+                            modes_per_plane=int(
+                                COSMIC_COHERENT_MODES_PER_PLANE
+                            ),
+                            grid_points=int(COSMIC_COHERENT_GRID_POINTS),
+                            response_fd_step=float(COSMIC_COHERENT_LATENT_FD),
+                            latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                            ),
+                            final_latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_LATENT_ITERATIONS
+                            ),
+                            candidate_latent_max_iterations=int(
+                                COSMIC_COHERENT_JOINT_TIMING_CANDIDATE_LATENT_ITERATIONS
+                            ),
+                            range_step_mm=float(
+                                COSMIC_COHERENT_JOINT_TIMING_RANGE_STEP_MM
+                            ),
+                            minimum_range_step_mm=float(
+                                COSMIC_COHERENT_JOINT_TIMING_MIN_RANGE_STEP_MM
+                            ),
+                            maximum_range_cycles=1,
+                            maximum_global_cycles=0,
+                            allow_longitudinal=False,
+                            allow_transverse=False,
+                            allow_direction=False,
+                            fixed_parameter_names=tuple(warm_fixed),
+                            sparse_neighbor_radius_mm=float(
+                                MCS_COHERENT_SPARSE_NEIGHBOR_RADIUS_MM
+                            ),
+                            fixed_initial_kinetic_energy_mev=(
+                                None
+                                if COSMIC_COHERENT_FIXED_KE0_MEV is None
+                                else float(COSMIC_COHERENT_FIXED_KE0_MEV)
+                            ),
+                            profile_t0=("t0" not in warm_fixed),
+                            t0_profile_coarse_step_ns=float(
+                                T0_PROFILE_COARSE_STEP_NS
+                            ),
+                            t0_profile_refine_levels=int(
+                                T0_PROFILE_REFINE_LEVELS
+                            ),
+                            t0_profile_global_points=int(
+                                T0_PROFILE_MAX_GLOBAL_POINTS
+                            ),
+                            t0_profile_seed_half_width_ns=float(
+                                T0_PROFILE_SEED_HALF_WIDTH_NS
+                            ),
+                        )
+                except Exception:
+                    if _env_bool("LF_REQUIRE_COHERENT_PIPELINE_WARMUP", False):
+                        raise
 
         finally:
             EMITTER_TEMPLATE.photon_scatter_native_receiver = native_saved
@@ -33333,6 +41937,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         GOOD_WCTE_PMTS_SET = load_good_wcte_pmts()
         ACTIVE_WCTE_PMT_IDS, PMT_ID_TO_POSITION = _build_active_channel_maps()
         configure_relative_efficiency()
+        _validate_realized_wcte_absolute_light_context(
+            relative_efficiency_metadata=REL_EFF_CALIBRATION_METADATA,
+            adc_per_pe=CHARGE_ADC_PER_PE,
+            geometry_placement=WCTE_PLACEMENT_KEY,
+            detector_summary=DETECTOR_SUMMARY,
+            active_pmt_ids=ACTIVE_WCTE_PMT_IDS,
+        )
 
         configured_wcte = bool(WCTE)
         geometry_wcte = bool(DETECTOR_SUMMARY.is_wcte_like)
@@ -33548,7 +42159,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         setup_print("Detector volume:", DETECTOR.metadata())
         setup_print("Detector geometry:", DETECTOR_SUMMARY.metadata())
         setup_print("Detector optical configuration:", DETECTOR_OPTICAL_CONFIGURATION)
-        setup_print("MCS reconstruction mode:", MCS_RECONSTRUCTION_MODE)
+        setup_print(
+            "Contained-track primary MCS mode (inactive in cosmic):",
+            MCS_RECONSTRUCTION_MODE,
+        )
+        setup_print(
+            "Cosmic MCS continuation:",
+            _EMITTER_SWITCHES["cosmic_mcs_continuation"],
+        )
         if USE_COHERENT_FISHER:
             setup_print(
                 "Coherent MCS controls:",
@@ -33883,7 +42501,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         PMT_MODEL.first_arrival_prompt_min_ns = prompt_lo
         PMT_MODEL.first_arrival_prompt_max_ns = prompt_hi
 
-        result = fit_event(OBS_PES_ALL[index], OBS_TS_ALL[index])
+        result = _fit_event_with_failure_record(
+            fit_event,
+            OBS_PES_ALL[index],
+            OBS_TS_ALL[index],
+            event_index=index,
+            prompt_time_min_ns=prompt_lo,
+            prompt_time_max_ns=prompt_hi,
+        )
         result["event_index"] = index
         result["source_event_id"] = int(OBS_SOURCE_EVENT_ID_ALL[index])
         result["source_root_entry_index"] = int(OBS_SOURCE_ROOT_ENTRY_INDEX_ALL[index])
@@ -34230,6 +42855,80 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         "exact_rerank_per_topology": int(
                             AUTO_EXACT_RERANK_PER_TOPOLOGY
                         ),
+                        "multilateration_seed_guard": {
+                            "mode": str(COSMIC_MULTILATERATION_SEED_MODE),
+                            "point_source_model_is_navigation_only": True,
+                            "group_refractive_index": float(
+                                COSMIC_MULTILATERATION_GROUP_INDEX
+                            ),
+                            "phase_refractive_index": float(
+                                getattr(EMITTER_TEMPLATE, "n", 1.344)
+                            ),
+                            "minimum_timed_pmts": int(
+                                COSMIC_MULTILATERATION_MIN_HITS
+                            ),
+                            "maximum_timed_pmts": (
+                                None
+                                if int(COSMIC_MULTILATERATION_MAX_HITS) <= 0
+                                else int(COSMIC_MULTILATERATION_MAX_HITS)
+                            ),
+                            "maximum_point_fit_evaluations": int(
+                                COSMIC_MULTILATERATION_MAX_NFEV
+                            ),
+                            "pool_seeds": int(
+                                COSMIC_MULTILATERATION_POOL_SEEDS
+                            ),
+                            "selected_seeds": int(
+                                COSMIC_MULTILATERATION_MAX_SEEDS
+                            ),
+                            "exact_close_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_EXACT_PER_HYPOTHESIS
+                            ),
+                            "optimizer_tournament_probes": int(
+                                COSMIC_MULTILATERATION_TOURNAMENT_PROBES
+                            ),
+                            "optimizer_tournament_continuations": int(
+                                COSMIC_MULTILATERATION_TOURNAMENT_CONTINUATIONS
+                            ),
+                            "include_reverse_directions": bool(
+                                COSMIC_MULTILATERATION_INCLUDE_REVERSE
+                            ),
+                            "reverse_below_photon_resultant": float(
+                                COSMIC_MULTILATERATION_REVERSE_RESULTANT_THRESHOLD
+                            ),
+                            "guided_bank_max_angle_deg": float(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_ANGLE_DEG
+                            ),
+                            "guided_bank_max_transverse_detector_diagonal_fraction": float(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_TRANSVERSE_FRACTION
+                            ),
+                            "guided_bank_neighbourhood_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_GUIDED_NEIGHBOURHOOD_PER_HYPOTHESIS
+                            ),
+                            "guided_bank_selected_per_start_hypothesis": int(
+                                COSMIC_MULTILATERATION_GUIDED_SEEDS_PER_HYPOTHESIS
+                            ),
+                            "guided_bank_max_proxy_quantization_tie_representatives": int(
+                                COSMIC_MULTILATERATION_GUIDED_MAX_PROXY_TIE_REPRESENTATIVES
+                            ),
+                            "guided_bank_proxy_geometry_representatives": int(
+                                COSMIC_MULTILATERATION_GUIDED_PROXY_GEOMETRY_REPRESENTATIVES
+                            ),
+                            "guided_bank_proxy_geometry_gate_nll": float(
+                                COSMIC_TOURNAMENT_BASELINE_START_GATE_NLL
+                            ),
+                            "guided_bank_proxy_quantization_uncertainty_multiplier": float(
+                                COSMIC_MULTILATERATION_GUIDED_QUANTIZATION_UNCERTAINTY_MULTIPLIER
+                            ),
+                            "outside_point_policy": (
+                                "detector-centre ray to exact active-water "
+                                "boundary plus relative inset"
+                            ),
+                            "primary_failure_policy": (
+                                "restore complete incumbent candidate selection"
+                            ),
+                            "uses_event_truth": False,
+                        },
                         "range_diversity_ratio_edges": [
                             float(x) for x in AUTO_RANGE_DIVERSITY_RATIO_EDGES
                         ],
@@ -34418,6 +43117,56 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "coherent_fisher_enabled": bool(USE_COHERENT_FISHER),
                 "fermi_eyges_enabled": bool(USE_FERMI_EYGES),
                 "legacy_mcs_enabled": bool(USE_LEGACY_MCS),
+                "cosmic_mcs_continuation": str(COSMIC_MCS_CONTINUATION),
+                "cosmic_joint_inference_method": str(
+                    _EMITTER_SWITCHES["cosmic_joint_inference_method"]
+                ),
+                "coherent_numba_parent_preload": dict(COHERENT_NUMBA_PRELOAD),
+                "cosmic_joint_energy_range_configuration": {
+                    "enabled": bool(COSMIC_JOINT_ENERGY_RANGE_ENABLED),
+                    "path_model": str(COSMIC_MCS_CONTINUATION),
+                    "explicit_hard_scatters": bool(
+                        COSMIC_MCS_CONTINUATION
+                        == "joint_k0_range_mixed_mcs"
+                    ),
+                    "charge_only_required": False,
+                    "supported_likelihood_modes": ["charge_only", "charge_time"],
+                    "line_geometry_conditioned": True,
+                    "mixed_global_line_precondition_enabled": bool(
+                        COSMIC_MIXED_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    "joint_global_line_precondition_enabled": bool(
+                        COSMIC_JOINT_GLOBAL_PRECONDITION_ENABLED
+                    ),
+                    "kinetic_energy_bounds_mev": [
+                        float(COSMIC_JOINT_ENERGY_MIN_MEV),
+                        float(COSMIC_JOINT_ENERGY_MAX_MEV),
+                    ],
+                    "energy_stratum_edges_mev": list(
+                        COSMIC_JOINT_ENERGY_STRATUM_EDGES_MEV
+                    ),
+                    "energy_stratum_replicates": int(
+                        COSMIC_JOINT_ENERGY_STRATUM_REPLICATES
+                    ),
+                    "kinetic_energy_prior": (
+                        "uniform_on_documented_broad_support"
+                    ),
+                    "range_prior": (
+                        "Geant4_UniversalFluctuation_first_passage_moment"
+                    ),
+                    "particles": int(COSMIC_JOINT_PARTICLES),
+                    "random_seed": int(COSMIC_JOINT_RANDOM_SEED),
+                    "modes_per_plane": int(COSMIC_COHERENT_MODES_PER_PLANE),
+                    "allow_underpowered_diagnostic": bool(
+                        COSMIC_MIXED_ALLOW_UNDERPOWERED_DIAGNOSTIC
+                    ),
+                    "mixed_inference_engine": str(
+                        COSMIC_MIXED_INFERENCE_ENGINE
+                    ),
+                    "uses_discrete_range_grid": False,
+                    "uses_event_truth": False,
+                    "uses_empirical_mcs_scale": False,
+                },
                 "coherent_fisher_configuration": {
                     "implementation": str(MCS_COHERENT_IMPLEMENTATION),
                     "modes_per_plane": int(MCS_PROCESS_MODES_PER_PLANE),
@@ -34646,9 +43395,20 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                         TIME_REFERENCE_LOCAL_HALF_WIDTH_NS
                     ),
                     "charge_normalization_mode": str(CHARGE_NORMALIZATION_MODE),
+                    "charge_likelihood_mode": str(CHARGE_LIKELIHOOD_MODE),
+                    "pmt_spe_response_model": str(PMT_MODEL.spe_response_model),
+                    "pmt_charge_response": _runtime_pmt_charge_response_metadata(
+                        PMT_MODEL
+                    ),
                     "global_charge_scale": (
                         None if GLOBAL_CHARGE_SCALE is None
                         else float(GLOBAL_CHARGE_SCALE)
+                    ),
+                    "global_charge_calibration_id": str(
+                        GLOBAL_CHARGE_CALIBRATION_ID
+                    ) or None,
+                    "absolute_light_calibration": (
+                        _absolute_light_calibration_metadata("WCTE")
                     ),
                     "user_event_apply_prompt_window": (
                         bool(USER_EVENT_APPLY_PROMPT_WINDOW)
@@ -34756,6 +43516,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             ],
             "full_range": [
                 result["values"]["full_range"] for result in ordered
+            ],
+            "initial_kinetic_energy_mev": [
+                float(result["values"].get(
+                    "initial_kinetic_energy_mev", math.nan
+                ))
+                for result in ordered
+            ],
+            "z_range": [
+                float(result["values"].get("z_range", math.nan))
+                for result in ordered
+            ],
+            "range_equivalent_ke_mev": ke0_values,
+            "initial_kinetic_energy_error_mev": [
+                float(result["errors"].get(
+                    "initial_kinetic_energy_mev", math.nan
+                ))
+                for result in ordered
+            ],
+            "full_range_error_mm": [
+                float(result["errors"].get("full_range", math.nan))
+                for result in ordered
             ],
             "range_constraint_status": [
                 str(result.get("range_constraint_status", "not_applicable"))
@@ -34993,7 +43774,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 result["event_fit_wall_s"] for result in ordered
             ],
             "total_nfcn": [result["total_nfcn"] for result in ordered],
+            "mcs_status": [
+                str(result.get("mcs_status", "not_requested"))
+                for result in ordered
+            ],
+            "mcs_failure": [result.get("mcs_failure") for result in ordered],
         }
+        _append_event_status_columns(output, ordered)
         if SAVE_DETAILED_EVENT_RESULTS:
             output["results"] = ordered
             output["errors"] = [dict(result.get("errors", {})) for result in ordered]
@@ -35214,7 +44001,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         if not COSMIC_CHILD_QUIET:
             if VERBOSE_SETUP:
                 print("LicketyFit real-WCTE cosmic run")
-                print("  driver release:", DRIVER_RELEASE)
+                print(
+                    "  public release:",
+                    os.environ.get(
+                        "LF_PUBLIC_DRIVER_RELEASE", UNIFIED_DRIVER_RELEASE
+                    ),
+                )
+                print("  embedded engine revision:", DRIVER_RELEASE)
                 print("  run / nominal beam momentum [MeV/c]:", int(RUN), float(BEAM_P))
                 print("  particle hypothesis:", FIT_PARTICLE)
                 print(
@@ -35280,7 +44073,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             else:
                 worker_label = "worker" if int(NPROC) == 1 else "workers"
                 print(
-                    f"LicketyFit cosmic: fitting {n_events} selected WCTE event"
+                    f"LicketyFit general: fitting {n_events} selected WCTE event"
                     f"{'s' if n_events != 1 else ''} with {int(NPROC)} "
                     f"{worker_label}",
                     flush=True,

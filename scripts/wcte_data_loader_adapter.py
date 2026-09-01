@@ -932,8 +932,13 @@ def _loader_with_branches(
     *,
     selection_specs: Sequence[Sequence[Any]],
     require_t5_time: bool,
+    available_branches: set[str] | None = None,
 ) -> tuple[Any, list[str], set[str]]:
-    available = _available_branches(DataLoader, cfg.root_file)
+    available = (
+        _available_branches(DataLoader, cfg.root_file)
+        if available_branches is None
+        else set(available_branches)
+    )
     required = list(_BASE_HIT_BRANCHES)
     required.extend(_selection_branch_name(str(spec[0])) for spec in selection_specs)
     if require_t5_time:
@@ -956,6 +961,140 @@ def _loader_with_branches(
     loader = DataLoader(cfg.root_file, branches_to_load=list(dict.fromkeys(branches)))
     _configure_dq(loader, cfg)
     return loader, list(loader.branches_to_load or []), available
+
+
+def _selection_scan_branches(
+    available: set[str],
+    cfg: WCTESelectionConfig,
+    selection_specs: Sequence[Sequence[Any]],
+) -> list[str]:
+    """Return the event-level branches needed to identify selected entries.
+
+    PMT hit arrays are deliberately absent.  In particular,
+    ``hit_pmt_readout_mask`` is a hit-level mask: it can remove individual hits
+    but cannot change whether an event passes the beam/DQ selection.  Reading
+    every jagged hit array while looking for a small selected population makes
+    remote production ROOT files unnecessarily expensive to scan.
+    """
+    required = [_selection_branch_name(str(spec[0])) for spec in selection_specs]
+    if cfg.apply_mpmt_data_quality_cuts:
+        required.append("window_data_quality_mask")
+    if cfg.apply_vme_event_quality_cuts:
+        required.extend(_VME_DQ_BRANCHES)
+    if cfg.apply_t5_event_quality_cuts:
+        required.extend(_T5_DQ_BRANCHES)
+    required = list(dict.fromkeys(required))
+    missing = [name for name in required if name not in available]
+    if missing:
+        raise RuntimeError(
+            f"WCTE production file {cfg.root_file!r} is missing required branches: "
+            + ", ".join(missing)
+        )
+    return required
+
+
+def _event_level_dq_mask(batch: Any, cfg: WCTESelectionConfig) -> Any:
+    """Reproduce DataLoader's event-level DQ mask without touching hit arrays."""
+    mask: Any = np.ones(len(batch), dtype=bool)
+    if cfg.apply_mpmt_data_quality_cuts:
+        mask = mask & (batch["window_data_quality_mask"] == 0)
+    if cfg.apply_vme_event_quality_cuts:
+        mask = mask & (
+            (batch["vme_digi_issues_bitmask"] == 0)
+            & (batch["vme_evt_quality_bitmask"] == 0)
+        )
+    if cfg.apply_t5_event_quality_cuts:
+        mask = mask & (
+            (batch["T5_HasValidHit"] == True)  # noqa: E712 - Awkward elementwise comparison
+            & (batch["T5_HasMultipleScintillatorsHit"] == False)  # noqa: E712
+            & (batch["T5_HasInTimeWindow"] == True)  # noqa: E712
+        )
+    return mask
+
+
+def _scan_selected_root_indices(
+    loader: Any,
+    selection: Any,
+    cfg: WCTESelectionConfig,
+    *,
+    branches: Sequence[str],
+    maximum: int | None,
+) -> list[int]:
+    """Scan only scalar event fields and return original selected ROOT entries."""
+    try:
+        import awkward as ak
+    except Exception as exc:
+        raise RuntimeError(
+            "Indexed WCTE DataLoader selection requires awkward, which is also "
+            "a dependency of analysis_tools.DataLoader."
+        ) from exc
+
+    tree = loader.file["WCTEReadoutWindows"]
+    kwargs: dict[str, Any] = {
+        "expressions": list(branches),
+        "step_size": cfg.step_size,
+        "library": "ak",
+    }
+    if cfg.max_root_entries is not None:
+        kwargs["entry_stop"] = max(0, int(cfg.max_root_entries))
+
+    selected_indices: list[int] = []
+    raw_entry_cursor = 0
+    for raw_batch in tree.iterate(**kwargs):
+        raw_length = int(len(raw_batch))
+        if raw_length == 0:
+            continue
+        raw_indices = np.arange(
+            raw_entry_cursor, raw_entry_cursor + raw_length, dtype=np.int64
+        )
+        raw_entry_cursor += raw_length
+        event_dq = _event_level_dq_mask(raw_batch, cfg)
+        kept = raw_batch[event_dq]
+        kept_indices = raw_indices[np.asarray(ak.to_numpy(event_dq), dtype=bool)]
+        if len(kept) == 0:
+            continue
+        selected = np.asarray(
+            ak.to_numpy(selection.mask(kept)), dtype=bool
+        ).ravel()
+        selected_indices.extend(int(x) for x in kept_indices[selected])
+        if maximum is not None and len(selected_indices) >= int(maximum):
+            return selected_indices[: int(maximum)]
+    return selected_indices
+
+
+def _load_selected_records_by_index(
+    loader: Any,
+    cfg: WCTESelectionConfig,
+    root_indices: Sequence[int],
+) -> Iterable[tuple[Any, int]]:
+    """Load full hit payloads only for already-selected ROOT entries.
+
+    DataLoader's complete DQ implementation is reapplied as an exactness check.
+    This both performs ``hit_pmt_readout_mask`` filtering and protects the
+    two-phase scan against future changes in the pinned DataLoader semantics.
+    """
+    apply_dq = getattr(loader, "_apply_all_data_quality_cuts", None)
+    if not callable(apply_dq):
+        raise RuntimeError(
+            "The analysis_tools DataLoader lacks _apply_all_data_quality_cuts; "
+            "the indexed WCTE loading contract cannot be verified."
+        )
+    tree = loader.file["WCTEReadoutWindows"]
+    for root_index in root_indices:
+        index = int(root_index)
+        raw = tree.arrays(
+            expressions=loader.branches_to_load,
+            entry_start=index,
+            entry_stop=index + 1,
+            library="ak",
+        )
+        checked = apply_dq(raw, False)
+        if len(checked) != 1:
+            raise RuntimeError(
+                "A WCTE event passed the scalar DQ scan but failed the pinned "
+                f"DataLoader's full DQ pass at ROOT entry {index}."
+            )
+        yield checked[0], index
 
 
 def _to_numpy_1d(value: Any, dtype: Any) -> np.ndarray:
@@ -1227,6 +1366,9 @@ def load_selected_events(
 
     threshold_loader = DataLoader(cfg.root_file, branches_to_load=[])
     try:
+        available = set(
+            str(x) for x in threshold_loader.file["WCTEReadoutWindows"].keys()
+        )
         if mode == "nominal":
             cuts = _selection_thresholds(threshold_loader, cfg, particle)
         else:
@@ -1259,38 +1401,57 @@ def load_selected_events(
     t5_peak, calibrated_peak, peak_stats = _estimate_optional_peaks(
         DataLoader, cfg, selection, specs
     )
+    scan_branches = _selection_scan_branches(available, cfg, specs)
+    scan_loader = DataLoader(cfg.root_file, branches_to_load=list(scan_branches))
+    # The pinned DataLoader eagerly appends hit-level DQ branches whenever a
+    # branch list is supplied.  The scalar pass intentionally does not need
+    # those arrays; full DataLoader DQ is reapplied to each selected event below.
+    scan_loader.branches_to_load = list(scan_branches)
+    try:
+        scan_limit = (
+            None
+            if (cfg.use_t5_hit_time_cut or cfg.use_calibrated_peak_time_cut)
+            else cfg.max_selected_events
+        )
+        selected_root_indices = _scan_selected_root_indices(
+            scan_loader,
+            selection,
+            cfg,
+            branches=scan_branches,
+            maximum=scan_limit,
+        )
+    finally:
+        scan_loader.file.close()
+
     loader, branches, available = _loader_with_branches(
         DataLoader,
         cfg,
         selection_specs=specs,
         require_t5_time=cfg.use_t5_hit_time_cut,
+        available_branches=available,
     )
+
     events: list[np.ndarray] = []
-    selected_before_hit_cut = 0
+    selected_before_hit_cut = len(selected_root_indices)
     empty_after_hit_cut = 0
     fallback_id = 0
     try:
-        for batch, root_indices in _iterate_selected(loader, selection, cfg):
-            selected_before_hit_cut += int(len(batch))
-            for record, root_entry_index in zip(batch, root_indices):
-                event = _record_to_event(
-                    record,
-                    root_entry_index=int(root_entry_index),
-                    fallback_event_number=fallback_id,
-                    cfg=cfg,
-                    t5_peak=t5_peak,
-                    calibrated_peak=calibrated_peak,
-                )
-                fallback_id += 1
-                if event.shape[0] == 0:
-                    empty_after_hit_cut += 1
-                    continue
-                events.append(event)
-                if (
-                    cfg.max_selected_events is not None
-                    and len(events) >= int(cfg.max_selected_events)
-                ):
-                    break
+        for record, root_entry_index in _load_selected_records_by_index(
+            loader, cfg, selected_root_indices
+        ):
+            event = _record_to_event(
+                record,
+                root_entry_index=int(root_entry_index),
+                fallback_event_number=fallback_id,
+                cfg=cfg,
+                t5_peak=t5_peak,
+                calibrated_peak=calibrated_peak,
+            )
+            fallback_id += 1
+            if event.shape[0] == 0:
+                empty_after_hit_cut += 1
+                continue
+            events.append(event)
             if (
                 cfg.max_selected_events is not None
                 and len(events) >= int(cfg.max_selected_events)
@@ -1318,9 +1479,13 @@ def load_selected_events(
         "selected_before_hit_time_cut": int(selected_before_hit_cut),
         "empty_after_hit_time_cut": int(empty_after_hit_cut),
         "events_returned": int(len(events)),
+        "root_loading_strategy": "event_scalar_scan_then_selected_hit_payloads",
+        "selection_scan_branches": list(scan_branches),
         "root_entry_limit_semantics": (
-            "WCTEReadoutWindows.iterate(entry_stop=max_root_entries), followed by "
-            "DataLoader._apply_all_data_quality_cuts and BeamSelection"
+            "scalar WCTEReadoutWindows.iterate(entry_stop=max_root_entries), "
+            "followed by the pinned DataLoader event-level DQ predicates and "
+            "BeamSelection; full DataLoader DQ and hit-readout masking are then "
+            "reapplied only to selected ROOT entries"
         ),
         "hit_table_columns": [
             "global_wcte_pmt_id",
