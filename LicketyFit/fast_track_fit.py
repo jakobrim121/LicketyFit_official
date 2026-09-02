@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import lru_cache
 import math
+import os
 import time
 from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
 
@@ -36,6 +37,14 @@ from .detector_geometry import (
     WCTE_PRISM_Y_MAX_MM,
     WCTE_PRISM_Y_MIN_MM,
 )
+
+
+_BATCH_T0_BLOCK_STENCIL = str(
+    os.environ.get("LF_BATCH_T0_BLOCK_STENCIL", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+_EXACT_CHARGE_NLL_REUSE = str(
+    os.environ.get("LF_EXACT_CHARGE_NLL_REUSE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 @lru_cache(maxsize=8)
@@ -506,6 +515,7 @@ class TrackObjective:
     prediction_cache: dict[
         tuple[float, ...], tuple[np.ndarray, object, np.ndarray | None] | None
     ] = field(default_factory=dict)
+    charge_nll_cache: dict[tuple[float, ...], float] = field(default_factory=dict)
     # Event-mean nuisance values are geometry dependent just like the optical
     # prediction.  Cache them alongside that prediction so a caller can report
     # the value at the accepted geometry without relying on whichever trial
@@ -538,13 +548,37 @@ class TrackObjective:
             names = ("x0", "y0", "z0", "dir_u", "dir_v", "length")
         return tuple(round(float(values.get(name, 0.0)), 12) for name in names)
 
-    def _prediction_nll(self, prediction, t0: float) -> float:
+    def _prediction_charge_nll(
+        self,
+        prediction,
+        geometry_key: tuple[float, ...] | None,
+    ) -> float:
+        if (
+            _EXACT_CHARGE_NLL_REUSE
+            and geometry_key is not None
+            and geometry_key in self.charge_nll_cache
+        ):
+            return float(self.charge_nll_cache[geometry_key])
+        value = float(
+            self.pmt_model.get_neg_log_likelihood_npe(
+                prediction[0], self.obs_pes
+            )
+        )
+        if _EXACT_CHARGE_NLL_REUSE and geometry_key is not None:
+            self.charge_nll_cache[geometry_key] = value
+        return value
+
+    def _prediction_nll(
+        self,
+        prediction,
+        t0: float,
+        *,
+        geometry_key: tuple[float, ...] | None = None,
+    ) -> float:
         """Evaluate the configured likelihood for an existing optical field."""
         exp_pes_array, exp_ts_zero, timing_pes = prediction
         if self.objective_mode == "charge_only":
-            fval = self.pmt_model.get_neg_log_likelihood_npe(
-                exp_pes_array, self.obs_pes
-            )
+            fval = self._prediction_charge_nll(prediction, geometry_key)
         elif self.objective_mode == "timing_only":
             fval = self.pmt_model.get_neg_log_likelihood_t(
                 exp_pes_array,
@@ -555,14 +589,32 @@ class TrackObjective:
                 model_time_shift_ns=t0,
             )
         elif self.objective_mode == "charge_time":
-            fval = self.pmt_model.get_neg_log_likelihood_npe_t(
-                exp_pes_array,
-                self.obs_pes,
-                exp_ts_zero,
-                self.obs_ts,
-                timing_pes=timing_pes,
-                model_time_shift_ns=t0,
-            )
+            if (
+                _EXACT_CHARGE_NLL_REUSE
+                and geometry_key is not None
+                and hasattr(exp_ts_zero, "first_arrival_active_indices")
+            ):
+                charge_nll = self._prediction_charge_nll(
+                    prediction, geometry_key
+                )
+                timing_nll = self.pmt_model.get_neg_log_likelihood_t(
+                    exp_pes_array,
+                    self.obs_pes,
+                    exp_ts_zero,
+                    self.obs_ts,
+                    timing_pes=timing_pes,
+                    model_time_shift_ns=t0,
+                )
+                fval = float(charge_nll) + float(timing_nll)
+            else:
+                fval = self.pmt_model.get_neg_log_likelihood_npe_t(
+                    exp_pes_array,
+                    self.obs_pes,
+                    exp_ts_zero,
+                    self.obs_ts,
+                    timing_pes=timing_pes,
+                    model_time_shift_ns=t0,
+                )
         else:
             raise ValueError(f"unknown objective_mode={self.objective_mode!r}")
         fval = float(fval)
@@ -644,7 +696,29 @@ class TrackObjective:
         values_include_prior = False
         if (
             self.objective_mode == "charge_time"
-            and hasattr(self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0")
+            and _EXACT_CHARGE_NLL_REUSE
+            and hasattr(self.pmt_model, "get_neg_log_likelihood_t_many_t0")
+            and hasattr(exp_ts_zero, "first_arrival_active_indices")
+        ):
+            charge_nll = self._prediction_charge_nll(
+                prediction, geometry_key
+            )
+            values_array = self.pmt_model.get_neg_log_likelihood_t_many_t0(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                shift_array,
+                timing_pes=timing_pes,
+            )
+            values_array = np.asarray(values_array, dtype=np.float64) + float(
+                charge_nll
+            )
+        elif (
+            self.objective_mode == "charge_time"
+            and hasattr(
+                self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0"
+            )
         ):
             values_array = self.pmt_model.get_neg_log_likelihood_npe_t_many_t0(
                 exp_pes_array,
@@ -668,7 +742,14 @@ class TrackObjective:
             )
         else:
             values_array = np.asarray(
-                [self._prediction_nll(prediction, float(v)) for v in shift_array],
+                [
+                    self._prediction_nll(
+                        prediction,
+                        float(v),
+                        geometry_key=geometry_key,
+                    )
+                    for v in shift_array
+                ],
                 dtype=np.float64,
             )
             values_include_prior = True
@@ -880,34 +961,9 @@ class TrackObjective:
         if prediction is None:
             return invalid()
 
-        exp_pes_array, exp_ts_zero, timing_pes = prediction
-        if self.objective_mode == "charge_only":
-            fval = self.pmt_model.get_neg_log_likelihood_npe(
-                exp_pes_array, self.obs_pes
-            )
-        elif self.objective_mode == "timing_only":
-            fval = self.pmt_model.get_neg_log_likelihood_t(
-                exp_pes_array,
-                self.obs_pes,
-                exp_ts_zero,
-                self.obs_ts,
-                timing_pes=timing_pes,
-                model_time_shift_ns=t0,
-            )
-        elif self.objective_mode == "charge_time":
-            fval = self.pmt_model.get_neg_log_likelihood_npe_t(
-                exp_pes_array,
-                self.obs_pes,
-                exp_ts_zero,
-                self.obs_ts,
-                timing_pes=timing_pes,
-                model_time_shift_ns=t0,
-            )
-        else:
-            raise ValueError(f"unknown objective_mode={self.objective_mode!r}")
-        fval = float(fval)
-        if self.use_t0_prior and self.objective_mode != "charge_only" and self.t0_prior_sigma:
-            fval += 0.5 * (t0 / float(self.t0_prior_sigma)) ** 2
+        fval = self._prediction_nll(
+            prediction, t0, geometry_key=geometry_key
+        )
         if not math.isfinite(fval):
             return invalid()
         self.cache[key] = fval
@@ -1189,6 +1245,61 @@ def track_aligned_block_optimize(
         cache[key] = result
         return result
 
+    def evaluate_t0_updates_many(
+        current: Mapping[str, float], deltas: Sequence[float]
+    ) -> list[tuple[float, dict[str, float]]]:
+        """Evaluate the unchanged fixed-geometry t0 stencil in one kernel."""
+        rows: list[tuple[float, dict[str, float]] | None] = []
+        pending_indices: list[int] = []
+        pending_trials: list[dict[str, float]] = []
+        pending_keys: list[tuple[float, ...]] = []
+        for delta in deltas:
+            trial = _apply_dimension_updates(
+                current,
+                {"t0": float(delta)},
+                chart=objective.chart,
+                detector=objective.detector,
+                vertex_basis=vertex_basis,
+                fixed_params=fixed,
+                length_limits=length_limits,
+                full_range_limits=full_range_limits,
+                track_end_mode=objective.track_end_mode,
+                project_vertex_steps=bool(project_vertex_steps),
+            )
+            key = tuple(
+                round(float(trial.get(name, 0.0)), 12)
+                for name in key_names
+            )
+            cached = cache.get(key)
+            if cached is not None:
+                rows.append(cached)
+                continue
+            pending_indices.append(len(rows))
+            pending_trials.append(trial)
+            pending_keys.append(key)
+            rows.append(None)
+
+        if pending_trials:
+            values_many = objective.evaluate_t0_many(
+                current,
+                np.asarray(
+                    [trial["t0"] for trial in pending_trials],
+                    dtype=np.float64,
+                ),
+            )
+            for row_index, trial, key, value in zip(
+                pending_indices,
+                pending_trials,
+                pending_keys,
+                np.asarray(values_many, dtype=np.float64),
+                strict=True,
+            ):
+                result = (float(value), trial)
+                cache[key] = result
+                rows[row_index] = result
+
+        return [row for row in rows if row is not None]
+
     for sweep in range(max(1, int(sweeps))):
         sweep_start = fval
         blocks = _active_blocks(
@@ -1206,8 +1317,21 @@ def track_aligned_block_optimize(
                 dim = dims[0]
                 h = float(steps[dim])
                 candidates: list[tuple[float, dict[str, float], float]] = [(fval, dict(values), 0.0)]
-                for sign in (-1.0, 1.0):
-                    fv, trial = evaluate_updates(values, {dim: sign * h})
+                if dim == "t0" and _BATCH_T0_BLOCK_STENCIL:
+                    signed_trials = zip(
+                        (-1.0, 1.0),
+                        evaluate_t0_updates_many(values, (-h, h)),
+                        strict=True,
+                    )
+                else:
+                    signed_trials = (
+                        (
+                            sign,
+                            evaluate_updates(values, {dim: sign * h}),
+                        )
+                        for sign in (-1.0, 1.0)
+                    )
+                for sign, (fv, trial) in signed_trials:
                     candidates.append((fv, trial, sign * h))
                 fm, fp = candidates[1][0], candidates[2][0]
                 if math.isfinite(fm) and math.isfinite(fp):
@@ -2029,8 +2153,14 @@ def proxy_library_metadata(
         path = Path(source)
         try:
             digest.update(path.read_bytes())
-        except Exception:
-            digest.update(str(path).encode("utf-8"))
+        except OSError:
+            # Optional analytic-fallback tables may be deliberately absent.
+            # Hash a stable logical identity rather than the absolute
+            # extraction path, otherwise moving a release ZIP changes its
+            # proxy filename and forces an unnecessary rebuild.
+            logical_name = "/".join(path.parts[-2:])
+            digest.update(b"<missing-proxy-source-v1>\0")
+            digest.update(logical_name.encode("utf-8"))
     if extra:
         # Configuration fields that alter proxy construction must participate in
         # the cache filename, not merely in the compatibility check. Otherwise
@@ -2965,6 +3095,22 @@ class AlignedPriorObjective:
     @property
     def invalid_evaluations(self):
         return self.base.invalid_evaluations
+
+    def evaluate_t0_many(
+        self, values: Mapping[str, float], t0_values
+    ) -> np.ndarray:
+        """Delegate exact t0 batching and add the t0-independent prior once."""
+        out = np.asarray(
+            self.base.evaluate_t0_many(values, t0_values), dtype=np.float64
+        ).copy()
+        if not self.aligned_indices:
+            return out
+        delta = aligned_delta_vector(values, self.center, self.chart)
+        selected = delta[list(self.aligned_indices)]
+        penalty = 0.5 * float(selected @ self.precision @ selected)
+        finite = np.isfinite(out)
+        out[finite] += penalty
+        return out
 
     def __call__(self, values: Mapping[str, float]) -> float:
         fval = float(self.base(values))

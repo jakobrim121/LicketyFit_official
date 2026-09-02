@@ -21,9 +21,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Callable, Hashable, Mapping, Sequence
 
 import numpy as np
+from numba import njit, types
 
 from .cosmic_track_fit import ConvexDetectorVolume, resolve_range_clipped_track
 from .track_parameterization import (
@@ -36,6 +38,9 @@ from .track_parameterization import (
 
 
 DEFAULT_RANGE_RATIO_EDGES = (0.55, 1.0, 1.75)
+_EXACT_COMPILED_CAUSAL_SCORE = str(
+    os.environ.get("LF_EXACT_COMPILED_CAUSAL_SCORE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -1072,6 +1077,153 @@ def _causal_direct_arrival_times_prevalidated(
     )
 
 
+@njit(cache=True)
+def _robust_causal_timing_score_numba(
+    positions,
+    times,
+    weights,
+    sigma,
+    start,
+    direction,
+    length,
+    refractive_index,
+    beta,
+    huber_transition_sigma,
+    trim_fraction,
+    minimum_hits,
+):
+    """Allocation-light compiled form of the established causal score."""
+    n_hits = times.size
+    if n_hits < minimum_hits:
+        return math.nan, math.nan, 0
+    q2 = refractive_index * refractive_index * beta * beta - 1.0
+    if length <= 0.0 or q2 <= 0.0:
+        return math.nan, math.nan, 0
+
+    light_speed = _LIGHT_SPEED_MM_PER_NS
+    root_q2 = math.sqrt(q2)
+    residual = np.empty(n_hits, dtype=np.float64)
+    for index in range(n_hits):
+        dx = positions[index, 0] - start[0]
+        dy = positions[index, 1] - start[1]
+        dz = positions[index, 2] - start[2]
+        longitudinal = (
+            dx * direction[0]
+            + dy * direction[1]
+            + dz * direction[2]
+        )
+        radial2 = (
+            dx * dx + dy * dy + dz * dz
+            - longitudinal * longitudinal
+        )
+        radial = math.sqrt(max(radial2, 0.0))
+        source_s = longitudinal - radial / root_q2
+        if source_s < 0.0:
+            source_s = 0.0
+        elif source_s > length:
+            source_s = length
+        photon_x = dx - source_s * direction[0]
+        photon_y = dy - source_s * direction[1]
+        photon_z = dz - source_s * direction[2]
+        photon_distance = math.sqrt(
+            photon_x * photon_x
+            + photon_y * photon_y
+            + photon_z * photon_z
+        )
+        predicted = (
+            source_s / (beta * light_speed)
+            + refractive_index * photon_distance / light_speed
+        )
+        residual[index] = times[index] - predicted
+
+    order = np.argsort(residual, kind="mergesort")
+    total_weight = 0.0
+    for sorted_index in range(n_hits):
+        total_weight += weights[order[sorted_index]]
+    target_weight = 0.5 * total_weight
+    cumulative_weight = 0.0
+    t0 = residual[order[n_hits - 1]]
+    for sorted_index in range(n_hits):
+        candidate_index = order[sorted_index]
+        cumulative_weight += weights[candidate_index]
+        if cumulative_weight >= target_weight:
+            t0 = residual[candidate_index]
+            break
+
+    transition = max(huber_transition_sigma, 1.0e-6)
+    loss = np.empty(n_hits, dtype=np.float64)
+    for index in range(n_hits):
+        standardized = (residual[index] - t0) / sigma[index]
+        absolute = abs(standardized)
+        if absolute <= transition:
+            loss[index] = 0.5 * standardized * standardized
+        else:
+            loss[index] = transition * (absolute - 0.5 * transition)
+
+    n_keep = max(
+        minimum_hits,
+        int(math.ceil((1.0 - trim_fraction) * n_hits)),
+    )
+    n_keep = min(max(1, n_keep), n_hits)
+    loss_order = np.argsort(loss, kind="mergesort")
+    denominator = 0.0
+    numerator = 0.0
+    for sorted_index in range(n_keep):
+        candidate_index = loss_order[sorted_index]
+        candidate_weight = weights[candidate_index]
+        denominator += candidate_weight
+        numerator += candidate_weight * loss[candidate_index]
+    if denominator <= 0.0 or not math.isfinite(denominator):
+        return math.nan, math.nan, 0
+    score = numerator / denominator
+    if not math.isfinite(score):
+        return math.nan, math.nan, 0
+    return score, t0, n_keep
+
+
+def preload_robust_causal_timing_score_numba() -> dict[str, object]:
+    """Compile/load the exact causal-score signature used in production.
+
+    Whether the causal navigation guard is reached is event-dependent, so a
+    one-event bootstrap cannot rely on its sample event to exercise this
+    dispatcher.  Compile the sole production overload explicitly while the
+    disposable serial bootstrap owns the cache.  This only materializes Numba
+    code; it does not evaluate a synthetic track or alter fitter state.
+    """
+    if not _EXACT_COMPILED_CAUSAL_SCORE:
+        return {
+            "enabled": False,
+            "already_loaded": False,
+            "executes_parallel_region": False,
+        }
+
+    f1 = types.Array(types.float64, 1, "C")
+    f2 = types.Array(types.float64, 2, "C")
+    production_signature = (
+        f2,
+        f1,
+        f1,
+        f1,
+        f1,
+        f1,
+        types.float64,
+        types.float64,
+        types.float64,
+        types.float64,
+        types.float64,
+        types.int64,
+    )
+    already_loaded = production_signature in tuple(
+        _robust_causal_timing_score_numba.signatures
+    )
+    _robust_causal_timing_score_numba.compile(production_signature)
+    return {
+        "enabled": True,
+        "already_loaded": bool(already_loaded),
+        "executes_parallel_region": False,
+    }
+
+
 def _prepare_causal_score_arrays(
     positions: np.ndarray,
     charge: np.ndarray,
@@ -1147,6 +1299,32 @@ def _robust_causal_timing_score_preselected(
         or n * n * b * b <= 1.0
     ):
         return None
+    if _EXACT_COMPILED_CAUSAL_SCORE:
+        score, t0, n_keep = _robust_causal_timing_score_numba(
+            positions,
+            times,
+            weights,
+            sigma,
+            np.ascontiguousarray(start, dtype=np.float64),
+            np.ascontiguousarray(d, dtype=np.float64),
+            length,
+            n,
+            b,
+            float(huber_transition_sigma),
+            float(trim_fraction),
+            int(minimum_hits),
+        )
+        if not math.isfinite(score) or not math.isfinite(t0):
+            return None
+        return CausalTimingScore(
+            score=float(score),
+            t0_ns=float(t0),
+            n_hits=n_hits,
+            n_inliers=int(n_keep),
+            segment_start_mm=np.ascontiguousarray(start, dtype=np.float64),
+            direction=np.ascontiguousarray(d, dtype=np.float64),
+            segment_length_mm=length,
+        )
     predicted = _causal_direct_arrival_times_prevalidated(
         positions,
         start,

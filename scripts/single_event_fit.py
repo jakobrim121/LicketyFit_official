@@ -7,8 +7,9 @@ engine's WCTE/WCSim loader and event-preparation functions, and calls its exact
 ``fit_one_event_by_index`` path for one event at a time.
 
 The configuration classes mirror every public setting in ``run_wcte.py`` and
-``run_wcsim.py``.  Keyword names are case-insensitive, so both ``fit_mode`` and
-``FIT_MODE`` are accepted.  The notebook layer forces serial execution and
+``run_wcsim.py``. Keyword names are case-insensitive, so ``seeding_mode`` /
+``SEEDING_MODE`` and ``interaction_mode`` / ``INTERACTION_MODE`` are accepted.
+The notebook layer forces serial execution and
 suppresses batch checkpoint/output behavior because one interactive fit runs in
 the notebook process.
 """
@@ -38,6 +39,25 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 DRIVER_PATH = SCRIPT_DIR / "batch_fit_driver.py"
 
 _LAUNCHER_CACHE: dict[str, ModuleType] = {}
+
+
+def _canonical_internal_fit_mode(
+    engine: ModuleType,
+    requested: object,
+    interaction_mode: object | None = None,
+) -> str:
+    """Resolve two public axes (or one legacy label) to an engine name."""
+    if interaction_mode is not None:
+        seeding = str(requested).strip().lower().replace("-", "_")
+        interaction = str(interaction_mode).strip().lower().replace("-", "_")
+        if seeding == "general" and interaction == "full_length":
+            return "cosmic"
+        return interaction
+    normalized = str(requested).strip().lower().replace("-", "_")
+    public = getattr(engine, "_LEGACY_FIT_MODE_ALIASES", {}).get(
+        normalized, normalized
+    )
+    return getattr(engine, "_INTERNAL_FIT_MODE_BY_PUBLIC", {}).get(public, public)
 
 
 def _load_module_from_path(name: str, path: Path) -> ModuleType:
@@ -382,6 +402,7 @@ class SingleEventFitter:
         self._events: EventCollection | None = None
         self._wcsim_raw: Mapping[str, Any] | None = None
         self._loader_metadata: dict[str, Any] = {}
+        self._active_pmt_ids_cache: np.ndarray | None = None
 
     @property
     def source(self) -> str:
@@ -435,7 +456,11 @@ class SingleEventFitter:
             engine = _load_module_from_path(module_name, DRIVER_PATH)
         if getattr(engine, "_UNIFIED_DATA_SOURCE", None) != self.source:
             raise RuntimeError("The embedded driver selected the wrong data source")
-        expected_mode = str(self.config.fit_mode).strip().lower().replace("-", "_")
+        expected_mode = _canonical_internal_fit_mode(
+            engine,
+            self.config.seeding_mode,
+            self.config.interaction_mode,
+        )
         if getattr(engine, "_UNIFIED_FIT_MODE", None) != expected_mode:
             raise RuntimeError("The embedded driver selected the wrong fit mode")
         self._engine = engine
@@ -489,8 +514,21 @@ class SingleEventFitter:
 
         records: list[EventRecord] = []
         if self.source == "wcsim":
+            fields = list(getattr(
+                engine,
+                "FIT_FIELDS",
+                ("digi_hit_pmt", "digi_hit_charge", "digi_hit_time"),
+            ))
+            if bool(self.config.use_truth_root):
+                fields.extend(getattr(
+                    engine,
+                    "TRUTH_TRACK_ID_FIELDS",
+                    ("track_id", "track_pid", "track_parent"),
+                ))
             with self._runtime_environment():
-                raw = engine.read_sim_data(str(engine.INPUT_FILE))
+                raw = engine.read_sim_data(
+                    str(engine.INPUT_FILE), fields=fields
+                )
             self._wcsim_raw = raw
             available = int(len(raw["digi_hit_time"]))
             stop = available if count is None else min(available, start + count)
@@ -1043,7 +1081,13 @@ class SingleEventFitter:
                     captured.get("winner"),
                 )
             )
-        pmt_ids = self._active_pmt_ids(engine)
+        if self._active_pmt_ids_cache is None:
+            cached_pmt_ids = self._active_pmt_ids(engine)
+            cached_pmt_ids.setflags(write=False)
+            self._active_pmt_ids_cache = cached_pmt_ids
+        # FitResult historically exposed a writable diagnostic array. Keep the
+        # immutable resolution cached internally without sharing that storage.
+        pmt_ids = np.array(self._active_pmt_ids_cache, copy=True)
         pmt_slots = np.asarray(engine.PMT_SLOTS, dtype=np.int64)
         pmt_positions = pmt_ids % 100
         pmt_coordinates = np.asarray(engine.P_LOCATIONS, dtype=np.float64)

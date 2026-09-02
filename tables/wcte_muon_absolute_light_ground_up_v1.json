@@ -1,6 +1,6 @@
 {
   "calibration_basis": "ground_up_mathematical",
-  "calibration_id": "sha256:83af47207218529f9c9b2bb8da2a632254fddf16a967abb69366705c0f912be1",
+  "calibration_id": "sha256:3c795f0f35a09eebf91aed7f7d561e1acffb48399bd47f50825acb69b618bf8c",
   "calibration_provenance_files_sha256": {
     "analysis/build_ground_up_light_manifests.py": "b4f4639f85aa4fdab20d7f9688ed9e20fcc2eb7647fbb20ffc98d52530676e1f"
   },
@@ -68,12 +68,12 @@
   },
   "model_files_sha256": {
     "LicketyFit/Emitter.py": "309e225054d51f053215f9338ce27ea1a5e559e22bc33391af950de7603d748a",
-    "LicketyFit/PMT.py": "003e8d7f9d5839e64279f8556cd818af32d8bd0093ab2c527a59068c29c7bd20",
+    "LicketyFit/PMT.py": "60b04bfef2c6380c315be5d76cd59a01454694c258a527f730cacbdf7d14ef03",
     "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
     "LicketyFit/ground_up_light_calibration.py": "433cf6fc895f3407e75d8e48fb00a826d618e79f3f4878eaae16ac87247c9a59",
-    "LicketyFit/wcsim_charge_response.py": "a8fe8de9689a8072d56c00b102bfba7e956fdce88b2be6b02045f7575c4abc6f",
-    "scripts/batch_fit_driver.py": "7efc56c8fd0652a7f939e2931522c22c949bf9ea59e91423cc20fc7570d5f1c3",
-    "scripts/particle_range_lookup.py": "488ffb4bfae9b66e94e76b022fdc1ee97d465bc1a7eb2ce15e161cda64d14953",
+    "LicketyFit/wcsim_charge_response.py": "438b6da2dedc48a4caee3e7272a1d4c8390a6d8a36a67d8bc93fb708d0dde9bd",
+    "scripts/batch_fit_driver.py": "8e033055c9611a556dbec648e3092274b458979355b0b31c116e881fca346745",
+    "scripts/particle_range_lookup.py": "af2dae14d1de11fc08386f91cb8fa52995ab0a9b614d0a8da4329aa28fd88c83",
     "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
     "tables/ground_up_reference_response_v2.npz": "b6743a1bf45b94ddb210dd95ba5be541a0d7cc4741dfee958d39e75302013df1",
     "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
@@ -148,6 +148,110 @@
       "new_sha256": "7efc56c8fd0652a7f939e2931522c22c949bf9ea59e91423cc20fc7570d5f1c3",
       "old_sha256": "dd8c0630395d67d706f90485551686d607d1804b66ee2ffb9be87c8124f1d812",
       "reason": "Mode-label and navigation-only rebind: public cosmic/full_length names become general/beam, beam defaults to its compact beam-pipe seed bank, and the optional fast12 numerical budget is corrected. The calibrated general-muon photon prediction, detector response, prompt-charge definition, and frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-01",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "70ff54c17eb89e1c8da572a279ac15ffc3efbb39e61d0881731df67f3bb14b02",
+      "old_sha256": "7efc56c8fd0652a7f939e2931522c22c949bf9ea59e91423cc20fc7570d5f1c3",
+      "reason": "Execution-only rebind: v1.43.1 reuses an already-built exact objective for a scheduled continuation, the real-WCTE beam branch binds its already-prepared Numba thread budget like the other three engines, and each two-point t0 block stencil reuses its invariant reflected field through the existing PMT-ordered exact likelihood. Event PMTs, optical and scattering predictions, likelihood values, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-01",
+      "file": "LicketyFit/PMT.py",
+      "new_sha256": "60b04bfef2c6380c315be5d76cd59a01454694c258a527f730cacbdf7d14ef03",
+      "old_sha256": "ec70d3e5c524f656fa953afaea393263123245ca816c6f5c436436f9751b21fd",
+      "reason": "Execution-only rebind: independent PMT columns of an additive event-time grid are evaluated by the existing exact first-arrival equations in a compiled thread team, then accumulated once in the historical PMT-major order. Bitwise likelihood and complete-fit regression gates preserve PMTs, optical prediction, optimizer trajectory, WCTE channel handling, and the frozen absolute-light scale.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-01",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "f5e7a25d3a0f443ec9f335ce4a6b8b0445b442deb6dfb6bb14fb7bf2ec2511f0",
+      "old_sha256": "70ff54c17eb89e1c8da572a279ac15ffc3efbb39e61d0881731df67f3bb14b02",
+      "reason": "Runtime-startup-only rebind: v1.43.2 uses a persistent source-tagged cache and adds progress/runtime provenance without changing fitted channels, optical prediction, likelihood equations, optimizer policy, or the frozen absolute-light scale.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-01",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "1593db7a9459f052d29782ae7b471e48ca0632f6d47392b58a57455f1d3d4798",
+      "old_sha256": "f5e7a25d3a0f443ec9f335ce4a6b8b0445b442deb6dfb6bb14fb7bf2ec2511f0",
+      "reason": "Multiprocess-runtime-only rebind: v1.43.3 clamps numerical thread teams before import, removes fallible physics work from Pool initializers, and adds supervised worker-width checkpoints, heartbeats, and a no-progress watchdog. WCTE channel handling, optical prediction, detector response, likelihood equations, optimizer policy, and the frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "5534a7471df128e0963c7ccdf6b8ad73dc890c07b1104fa5f4b777f13a4b7fb7",
+      "old_sha256": "1593db7a9459f052d29782ae7b471e48ca0632f6d47392b58a57455f1d3d4798",
+      "reason": "Multiprocess-bootstrap-only rebind: v1.43.3 forces the disposable fork smoke test through the full requested worker pool before cache certification. Pool sizing and explanatory comments changed; WCTE channel handling, optical prediction, detector response, likelihood equations, optimizer policy, and the frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "c8c0ab12944ebfa9265d718a727dbcdaea9d61adb0df525e695a24070efd0eee",
+      "old_sha256": "5534a7471df128e0963c7ccdf6b8ad73dc890c07b1104fa5f4b777f13a4b7fb7",
+      "reason": "Multiprocess-supervision-only rebind: monitored WCSim generation routing and bounded bootstrap worker-readiness reporting changed. WCTE channel handling, optical prediction, detector response, likelihood equations, optimizer policy, and the frozen scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "34520652e839c31853e9d9f084b81b82fcf3c9f31cb4d1056d0010e34b6ed75e",
+      "old_sha256": "c8c0ab12944ebfa9265d718a727dbcdaea9d61adb0df525e695a24070efd0eee",
+      "reason": "Multiprocess-cleanup-only rebind: monitored subprocess failures now terminate the complete process group even when its leader has already exited, preventing orphan descendants. WCTE channel handling, optical prediction, detector response, likelihood equations, optimizer policy, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "bdd19dc3cc7258d01fed15e3def4cbc11aa076a840dba484af6fb360daa72943",
+      "old_sha256": "34520652e839c31853e9d9f084b81b82fcf3c9f31cb4d1056d0010e34b6ed75e",
+      "reason": "Bootstrap-cache-completeness-only rebind: the disposable serial bootstrap now causally preloads the compile-only profile kernels before cache certification. WCTE channel handling, optical prediction, detector response, likelihood equations, optimizer policy, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "492d7286e431a9d5e45be71bb925a9202504adb74a15db44eeef91d344c5cff6",
+      "old_sha256": "61493d3588ace4342d65762618c02b9dc5d57918fa5b3d726634ed22af3115a8",
+      "reason": "Mode-axis routing, prompt-primary selection, and supervisor checkpointing do not alter this manifest's fixed calibration prediction contract. Its frozen scale and prediction values are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "LicketyFit/wcsim_charge_response.py",
+      "new_sha256": "438b6da2dedc48a4caee3e7272a1d4c8390a6d8a36a67d8bc93fb708d0dde9bd",
+      "old_sha256": "062fb40406195313bf2fb2db2491090429f87021da7c8f2878973c6d48ea04e5",
+      "reason": "Execution/cache-only rebind: persistent exact-response grid caching does not alter this manifest's fixed calibration prediction contract. The production 24x16 grids were proved array_equal to the uncached construction with max_abs=0; its frozen scale and prediction values are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "f1a9c42bc7004bc80ce7645020f4b4e9f995ec7aec000be7ae9e44846b49bc39",
+      "old_sha256": "492d7286e431a9d5e45be71bb925a9202504adb74a15db44eeef91d344c5cff6",
+      "reason": "Execution/supervision-only rebind: merged clean-child metadata is now parent-scoped, and all embedded multiprocessing collectors stream per-event results through the existing progress watchdog. These changes do not alter this manifest's fixed calibration prediction contract; its frozen scale and prediction values are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "4b262ab271c0918c95992b92e9321c0d9bbef092e90c1042ba21c1724f39f868",
+      "old_sha256": "f1a9c42bc7004bc80ce7645020f4b4e9f995ec7aec000be7ae9e44846b49bc39",
+      "reason": "Execution/supervision-only rebind: persistent standard-engine event pools now terminate and join after result collection on both success and exception, preventing a timed-out, lost, or idle native worker from trapping Pool.close()/join(). Event PMTs, optical and scattering predictions, likelihood equations, optimizer policy, stopping criteria, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "8e033055c9611a556dbec648e3092274b458979355b0b31c116e881fca346745",
+      "old_sha256": "4b262ab271c0918c95992b92e9321c0d9bbef092e90c1042ba21c1724f39f868",
+      "reason": "Console/orchestration-only rebind: compact milestone reporting and launcher-managed display were added. Event PMTs, event preparation, optical and scattering predictions, likelihood equations, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
       "scale_or_prediction_changed": false
     }
   ],

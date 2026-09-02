@@ -34,6 +34,11 @@ from .mcs_curved_path import (
 )
 
 
+_EXACT_CHARGE_NLL_REUSE = str(
+    os.environ.get("LF_EXACT_CHARGE_NLL_REUSE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+
+
 _SPARSE_NEIGHBOR_CSR_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 _SPARSE_NEIGHBOR_CSR_CACHE_MAX = 4
 
@@ -366,6 +371,8 @@ class FixedTrackCoherentMCSObjective:
         self.curved_evaluations = 0
         self.cache: dict[tuple[float, ...], tuple] = {}
         self.charge_cache: dict[tuple[float, ...], np.ndarray] = {}
+        self.charge_data_nll_cache: dict[tuple[float, ...], float] = {}
+        self.complete_charge_nll_cache: dict[tuple[float, ...], float] = {}
         self.delta_field_cache: dict[tuple[float, ...], np.ndarray] = {}
         self.delta_source_field_cache: dict[tuple[float, ...], tuple] = {}
         self.response_gradient_cache: dict[tuple[object, ...], tuple] = {}
@@ -373,6 +380,7 @@ class FixedTrackCoherentMCSObjective:
         self.batched_timing_response_evaluations = 0
         self.cache_max = 16
         self.charge_cache_max = 64
+        self.charge_nll_cache_max = 64
         self.delta_field_cache_max = 128
         self.sparse_receiver = bool(sparse_receiver)
         self.sparse_neighbor_radius_mm = max(float(sparse_neighbor_radius_mm), 0.0)
@@ -2258,18 +2266,43 @@ class FixedTrackCoherentMCSObjective:
 
     def charge_data_nll(self, coefficients):
         """Configured production charge NLL for one coherent path."""
-        mu = np.maximum(self.charge_prediction(coefficients), 1.0e-300)
+        u = np.asarray(coefficients, dtype=np.float64).reshape(self.n_modes)
+        key = tuple(np.round(u, 10))
+        if _EXACT_CHARGE_NLL_REUSE:
+            cached = self.charge_data_nll_cache.get(key)
+            if cached is not None:
+                return float(cached)
+        mu = np.maximum(self.charge_prediction(u), 1.0e-300)
         if self.pmt_model is not None:
-            return float(
+            value = float(
                 self.pmt_model.get_neg_log_likelihood_npe(mu, self.obs_pes)
             )
-        q = np.asarray(self.obs_pes, dtype=np.float64)
-        return float(np.sum(mu - q * np.log(mu)))
+        else:
+            q = np.asarray(self.obs_pes, dtype=np.float64)
+            value = float(np.sum(mu - q * np.log(mu)))
+        if _EXACT_CHARGE_NLL_REUSE:
+            self._insert_preserving_zero(
+                self.charge_data_nll_cache,
+                key,
+                value,
+                self.charge_nll_cache_max,
+            )
+        return value
 
     def charge_data_nll_and_score(self, coefficients):
         """Return configured charge NLL and score versus predicted PMT rates."""
-        mu = np.maximum(self.charge_prediction(coefficients), 1.0e-300)
-        return self.charge_data_nll_and_score_from_prediction(mu)
+        u = np.asarray(coefficients, dtype=np.float64).reshape(self.n_modes)
+        key = tuple(np.round(u, 10))
+        mu = np.maximum(self.charge_prediction(u), 1.0e-300)
+        value, score = self.charge_data_nll_and_score_from_prediction(mu)
+        if _EXACT_CHARGE_NLL_REUSE:
+            self._insert_preserving_zero(
+                self.charge_data_nll_cache,
+                key,
+                float(value),
+                self.charge_nll_cache_max,
+            )
+        return value, score
 
     def charge_data_nll_and_score_from_prediction(self, prediction):
         """Return charge NLL and score for an already evaluated prediction.
@@ -2295,11 +2328,47 @@ class FixedTrackCoherentMCSObjective:
             np.ascontiguousarray(1.0 - q / mu),
         )
 
+    def _complete_prediction_charge_nll(self, coefficients, exp_pes) -> float:
+        u = np.asarray(coefficients, dtype=np.float64).reshape(self.n_modes)
+        key = tuple(np.round(u, 10))
+        if _EXACT_CHARGE_NLL_REUSE:
+            cached = self.complete_charge_nll_cache.get(key)
+            if cached is not None:
+                return float(cached)
+        value = float(
+            self.pmt_model.get_neg_log_likelihood_npe(
+                exp_pes, self.obs_pes
+            )
+        )
+        if _EXACT_CHARGE_NLL_REUSE:
+            self._insert_preserving_zero(
+                self.complete_charge_nll_cache,
+                key,
+                value,
+                self.charge_nll_cache_max,
+            )
+        return value
+
     def data_nll(self, coefficients, *, t0=None):
         exp_pes, timing_pes, timing, *_ = self.prediction(coefficients)
         dt = self.t0 if t0 is None else float(t0)
         if dt != 0.0:
             timing = shift_timing_prediction(timing, dt)
+        if (
+            _EXACT_CHARGE_NLL_REUSE
+            and hasattr(timing, "first_arrival_active_indices")
+        ):
+            charge_nll = self._complete_prediction_charge_nll(
+                coefficients, exp_pes
+            )
+            timing_nll = self.pmt_model.get_neg_log_likelihood_t(
+                exp_pes,
+                self.obs_pes,
+                timing,
+                self.obs_ts,
+                timing_pes=timing_pes,
+            )
+            return float(charge_nll) + float(timing_nll)
         return float(
             self.pmt_model.get_neg_log_likelihood_npe_t(
                 exp_pes,
@@ -2320,11 +2389,34 @@ class FixedTrackCoherentMCSObjective:
         exp_pes, timing_pes, timing, *_ = self.prediction(coefficients)
         shifts = np.ascontiguousarray(t0_values, dtype=np.float64).reshape(-1)
         interface = getattr(
+            self.pmt_model, "get_neg_log_likelihood_t_many_t0", None
+        )
+        if (
+            _EXACT_CHARGE_NLL_REUSE
+            and interface is not None
+            and hasattr(timing, "first_arrival_active_indices")
+        ):
+            charge_nll = self._complete_prediction_charge_nll(
+                coefficients, exp_pes
+            )
+            timing_values = np.asarray(
+                interface(
+                    exp_pes,
+                    self.obs_pes,
+                    timing,
+                    self.obs_ts,
+                    shifts,
+                    timing_pes=timing_pes,
+                ),
+                dtype=np.float64,
+            )
+            return timing_values + float(charge_nll)
+        combined_interface = getattr(
             self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0", None
         )
-        if interface is not None:
+        if combined_interface is not None:
             return np.asarray(
-                interface(
+                combined_interface(
                     exp_pes,
                     self.obs_pes,
                     timing,

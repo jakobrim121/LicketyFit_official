@@ -12,6 +12,10 @@ from LicketyFit.wcsim_charge_response import (
 )
 
 _NUMBA_SHIM_ACTIVE = bool(getattr(_numba_runtime, "__licketyfit_shim__", False))
+_EXACT_PARALLEL_T0_GRID = str(
+    os.environ.get("LF_EXACT_PARALLEL_T0_GRID", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+
 
 @njit(cache=True)
 def _norm_cdf(x):
@@ -1934,7 +1938,7 @@ def _first_arrival_deferred_reflection_variants_nll_numba(
 
 
 @njit(cache=True, fastmath=True)
-def _first_arrival_deferred_reflection_t0_grid_nll_numba(
+def _first_arrival_deferred_reflection_t0_grid_nll_reference_numba(
     base_mu, base_t, ref_u, ref_tbase, transfer_active, time_offset_active,
     patch_min_offset, patch_max_offset, n_bins,
     q_active, t_active, inv_sigma_active, t0_values,
@@ -2143,6 +2147,357 @@ def _first_arrival_deferred_reflection_t0_grid_nll_numba(
         for it in range(nt):
             out[it] = 1.0e30
     return out
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _first_arrival_deferred_reflection_t0_grid_column_numba(
+    base_mu,
+    base_t,
+    ref_u,
+    ref_tbase,
+    transfer_active,
+    time_offset_active,
+    n_bins,
+    tmin,
+    inv_span_bins,
+    q_active,
+    t_active,
+    inv_sigma_active,
+    t0_values,
+    output_efficiency,
+    prompt_lo,
+    prompt_hi,
+    node_pe_scale,
+    reflection_occupancy_mix,
+    direct_support_scale_pe,
+    use_window,
+    inv_sqrt_2pi,
+    column_nll,
+    column_used,
+    i,
+):
+    """Evaluate one PMT column of an exact additive-time grid."""
+    q = float(q_active[i])
+    tobs = float(t_active[i])
+    inv_sigma = float(inv_sigma_active[i])
+    if q <= 0.0 or (not math.isfinite(tobs)) or inv_sigma <= 0.0:
+        return
+
+    nb = base_mu.shape[0]
+    nt = t0_values.size
+    npatch = ref_u.size
+    sbm = np.empty(nb, dtype=np.float32)
+    sbt = np.empty(nb, dtype=np.float32)
+    rmu = np.empty(n_bins, dtype=np.float64)
+    rtn = np.empty(n_bins, dtype=np.float64)
+    node_t = np.empty(nb + n_bins, dtype=np.float64)
+    node_w = np.empty(nb + n_bins, dtype=np.float64)
+
+    nvalid = 0
+    for j in range(nb):
+        m = float(base_mu[j, i])
+        tt = float(base_t[j, i])
+        if m <= 0.0 or (not math.isfinite(m)) or (not math.isfinite(tt)):
+            continue
+        k = nvalid
+        while k > 0 and tt < float(sbt[k - 1]):
+            sbt[k] = sbt[k - 1]
+            sbm[k] = sbm[k - 1]
+            k -= 1
+        sbt[k] = tt
+        sbm[k] = m
+        nvalid += 1
+
+    for b in range(n_bins):
+        rmu[b] = 0.0
+        rtn[b] = 0.0
+    ref_total = 0.0
+    for p in range(npatch):
+        m = float(ref_u[p]) * float(transfer_active[i, p])
+        if m <= 0.0:
+            continue
+        tt = float(ref_tbase[p]) + float(time_offset_active[i, p])
+        b = int((tt - tmin) * inv_span_bins)
+        if b < 0:
+            b = 0
+        elif b >= n_bins:
+            b = n_bins - 1
+        rmu[b] += m
+        rtn[b] += m * tt
+        ref_total += m
+
+    total = ref_total
+    for j in range(nvalid):
+        total += float(sbm[j])
+    if total <= 0.0 or (not math.isfinite(total)):
+        penalty = -math.log(1.0e-300)
+        for it in range(nt):
+            column_nll[it, i] = penalty
+        column_used[i] = 1
+        return
+
+    neff = q / output_efficiency if output_efficiency > 0.0 else q
+    if neff < 1.0e-6:
+        neff = 1.0e-6
+    base_total = 0.0
+    if reflection_occupancy_mix:
+        for j in range(nvalid):
+            base_total += float(sbm[j])
+
+    remaining = 1.0
+    remaining_power = 1.0
+    ib = 0
+    ir = 0
+    nn = 0
+    while ib < nvalid or ir < n_bins:
+        while ir < n_bins and rmu[ir] <= 0.0:
+            ir += 1
+        if ib >= nvalid and ir >= n_bins:
+            break
+        take_base = False
+        if ir >= n_bins:
+            take_base = True
+        elif ib < nvalid:
+            rt = rtn[ir] / rmu[ir]
+            if float(sbt[ib]) <= rt:
+                take_base = True
+        if take_base:
+            mnode = float(sbm[ib])
+            tau = float(sbt[ib])
+            ib += 1
+        else:
+            mnode = rmu[ir]
+            tau = rtn[ir] / mnode
+            ir += 1
+        pnode = mnode / total
+        next_remaining = remaining - pnode
+        if next_remaining < 0.0:
+            next_remaining = 0.0
+        next_power = next_remaining ** neff
+        w = remaining_power - next_power
+        remaining = next_remaining
+        remaining_power = next_power
+        if w <= 0.0 or (not math.isfinite(w)):
+            if remaining_power <= 1.0e-300:
+                break
+            continue
+        node_t[nn] = tau
+        node_w[nn] = w
+        nn += 1
+
+    trust = 1.0
+    unresolved_density = 0.0
+    if reflection_occupancy_mix:
+        mu_base = max(float(node_pe_scale) * base_total, 0.0)
+        mu_ref = max(float(node_pe_scale) * ref_total, 0.0)
+        p_ref = -math.expm1(-mu_ref)
+        support_scale = max(float(direct_support_scale_pe), 1.0e-12)
+        direct_gate = mu_base / (mu_base + support_scale)
+        trust = direct_gate + (1.0 - direct_gate) * p_ref
+        unresolved_density = 1.0 / max(prompt_hi - prompt_lo, 1.0e-12)
+
+    for it in range(nt):
+        shift = float(t0_values[it])
+        shifted_obs = tobs - shift
+        shifted_lo = prompt_lo - shift
+        shifted_hi = prompt_hi - shift
+        mix = 0.0
+        acceptance = 0.0
+        sum_w = 0.0
+        for j in range(nn):
+            w = node_w[j]
+            tau = node_t[j]
+            z = (shifted_obs - tau) * inv_sigma
+            gpdf = _first_arrival_exp_lut(z)
+            if gpdf > 0.0:
+                mix += w * gpdf * inv_sigma * inv_sqrt_2pi
+            if use_window:
+                zhi = (shifted_hi - tau) * inv_sigma
+                zlo = (shifted_lo - tau) * inv_sigma
+                a = _normal_interval_probability_stable(zlo, zhi)
+                if a > 0.0 and math.isfinite(a):
+                    acceptance += w * a
+            sum_w += w
+        if use_window:
+            full_density = (
+                0.0
+                if acceptance <= 0.0 or mix <= 0.0
+                else mix / acceptance
+            )
+        else:
+            full_density = (
+                0.0 if sum_w <= 0.0 or mix <= 0.0 else mix / sum_w
+            )
+        density = (
+            trust * full_density + (1.0 - trust) * unresolved_density
+            if reflection_occupancy_mix
+            else full_density
+        )
+        column_nll[it, i] = -math.log(max(density, 1.0e-300))
+    column_used[i] = 1
+
+
+@njit(cache=True, fastmath=True, inline="never")
+def _first_arrival_t0_grid_column_sum_numba(column_nll, column_used):
+    """Reproduce the reference grid's PMT-major accumulation schedule."""
+    nt, nc = column_nll.shape
+    out = np.zeros(nt, dtype=np.float64)
+    n_used = 0
+    for i in range(nc):
+        if column_used[i] == 0:
+            continue
+        for it in range(nt):
+            out[it] += column_nll[it, i]
+        n_used += 1
+    if n_used == 0:
+        for it in range(nt):
+            out[it] = 1.0e30
+    return out
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _first_arrival_deferred_reflection_t0_grid_nll_parallel_numba(
+    base_mu,
+    base_t,
+    ref_u,
+    ref_tbase,
+    transfer_active,
+    time_offset_active,
+    patch_min_offset,
+    patch_max_offset,
+    n_bins,
+    q_active,
+    t_active,
+    inv_sigma_active,
+    t0_values,
+    output_efficiency,
+    prompt_lo,
+    prompt_hi,
+    node_pe_scale,
+    reflection_occupancy_mix,
+    direct_support_scale_pe,
+):
+    """PMT-parallel exact first-arrival NLL for additive time shifts."""
+    nc = base_mu.shape[1]
+    nt = t0_values.size
+    out = np.zeros(nt, dtype=np.float64)
+    if nt == 0:
+        return out
+    npatch = ref_u.size
+    tmin = 1.0e300
+    tmax = -1.0e300
+    for p in range(npatch):
+        if float(ref_u[p]) <= 0.0:
+            continue
+        lo = float(ref_tbase[p]) + float(patch_min_offset[p])
+        hi = float(ref_tbase[p]) + float(patch_max_offset[p])
+        if lo < tmin:
+            tmin = lo
+        if hi > tmax:
+            tmax = hi
+    if tmax < tmin:
+        for it in range(nt):
+            out[it] = 1.0e30
+        return out
+    span = tmax - tmin
+    if span < 1.0e-12:
+        span = 1.0e-12
+    inv_span_bins = float(n_bins) / span
+    use_window = (
+        math.isfinite(prompt_lo)
+        and math.isfinite(prompt_hi)
+        and prompt_hi > prompt_lo
+    )
+    inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
+    column_nll = np.zeros((nt, nc), dtype=np.float64)
+    column_used = np.zeros(nc, dtype=np.uint8)
+    for i in prange(nc):
+        _first_arrival_deferred_reflection_t0_grid_column_numba(
+            base_mu,
+            base_t,
+            ref_u,
+            ref_tbase,
+            transfer_active,
+            time_offset_active,
+            n_bins,
+            tmin,
+            inv_span_bins,
+            q_active,
+            t_active,
+            inv_sigma_active,
+            t0_values,
+            output_efficiency,
+            prompt_lo,
+            prompt_hi,
+            node_pe_scale,
+            reflection_occupancy_mix,
+            direct_support_scale_pe,
+            use_window,
+            inv_sqrt_2pi,
+            column_nll,
+            column_used,
+            i,
+        )
+    return _first_arrival_t0_grid_column_sum_numba(
+        column_nll, column_used
+    )
+
+
+def _first_arrival_deferred_reflection_t0_grid_nll_numba(
+    base_mu,
+    base_t,
+    ref_u,
+    ref_tbase,
+    transfer_active,
+    time_offset_active,
+    patch_min_offset,
+    patch_max_offset,
+    n_bins,
+    q_active,
+    t_active,
+    inv_sigma_active,
+    t0_values,
+    output_efficiency,
+    prompt_lo,
+    prompt_hi,
+    node_pe_scale,
+    reflection_occupancy_mix,
+    direct_support_scale_pe,
+):
+    """Dispatch the reference or exact PMT-parallel additive-time grid."""
+    arguments = (
+        base_mu,
+        base_t,
+        ref_u,
+        ref_tbase,
+        transfer_active,
+        time_offset_active,
+        patch_min_offset,
+        patch_max_offset,
+        n_bins,
+        q_active,
+        t_active,
+        inv_sigma_active,
+        t0_values,
+        output_efficiency,
+        prompt_lo,
+        prompt_hi,
+        node_pe_scale,
+        reflection_occupancy_mix,
+        direct_support_scale_pe,
+    )
+    if (
+        _EXACT_PARALLEL_T0_GRID
+        and get_num_threads() > 1
+        and int(base_mu.shape[1]) >= 16
+    ):
+        return _first_arrival_deferred_reflection_t0_grid_nll_parallel_numba(
+            *arguments
+        )
+    return _first_arrival_deferred_reflection_t0_grid_nll_reference_numba(
+        *arguments
+    )
+
 
 def _prepare_first_arrival_observations(obs_pes, obs_ts, active, output_efficiency):
     """Prepare event observations without an unsafe identity cache.
@@ -3158,6 +3513,33 @@ class PMT:
             return np.full(shifts.size, 1.0e30, dtype=np.float64)
         if _has_first_arrival_prediction(timing_prediction):
             charge = self.get_neg_log_likelihood_npe(exp_pes, obs_pes)
+            # A local block stencil has only two t0 points. Keep the scalar
+            # response workspace for that narrow case while sharing its
+            # invariant 192-patch reflected field. Longer profiles use the
+            # dedicated grid kernel, which shares direct-node sorting and
+            # first-source weights across shifts and parallelizes independent
+            # PMT columns without changing the PMT-major reduction schedule.
+            if (
+                shifts.size == 2
+                and get_num_threads() > 1
+                and np.asarray(
+                    timing_prediction.first_arrival_active_indices
+                ).size >= 16
+            ):
+                workspace = self.prepare_first_arrival_reflection_workspace(
+                    timing_prediction, obs_pes, obs_ts
+                )
+                if workspace is not None:
+                    timing_rows = [
+                        self.get_neg_log_likelihood_t_with_reflection_workspace(
+                            timing_prediction,
+                            workspace,
+                            model_time_shift_ns=float(shift),
+                        )
+                        for shift in shifts
+                    ]
+                    if all(value is not None for value in timing_rows):
+                        return np.asarray(timing_rows, dtype=np.float64) + charge
             timing = _first_arrival_prediction_nll_many(
                 timing_prediction,
                 obs_pes,
@@ -3195,6 +3577,27 @@ class PMT:
         if not (valid and valid_times) or np.any(~np.isfinite(shifts)):
             return np.full(shifts.size, 1.0e30, dtype=np.float64)
         if _has_first_arrival_prediction(timing_prediction):
+            if (
+                shifts.size == 2
+                and get_num_threads() > 1
+                and np.asarray(
+                    timing_prediction.first_arrival_active_indices
+                ).size >= 16
+            ):
+                workspace = self.prepare_first_arrival_reflection_workspace(
+                    timing_prediction, obs_pes, obs_ts
+                )
+                if workspace is not None:
+                    timing_rows = [
+                        self.get_neg_log_likelihood_t_with_reflection_workspace(
+                            timing_prediction,
+                            workspace,
+                            model_time_shift_ns=float(shift),
+                        )
+                        for shift in shifts
+                    ]
+                    if all(value is not None for value in timing_rows):
+                        return np.asarray(timing_rows, dtype=np.float64)
             return _first_arrival_prediction_nll_many(
                 timing_prediction,
                 obs_pes,

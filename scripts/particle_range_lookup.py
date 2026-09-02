@@ -158,8 +158,21 @@ class ParticleRangeLookup:
         self.e_vs_dist_path = str(e_vs_dist_path)
         self.overall_distances_path = str(overall_distances_path)
 
-        self.e_vs_dist = np.load(self.e_vs_dist_path, allow_pickle=True)
-        self.overall_distances_mm = np.load(self.overall_distances_path) * 10.0
+        # Reuse the array already loaded by LicketyFit.particle_cherenkov_model
+        # when both live in one process (saves a second 67 MB pickle read at
+        # startup).  Falls back to a plain load when used standalone.
+        try:
+            from LicketyFit.runtime_cache import load_shared_table as _shared_load
+        except Exception:  # pragma: no cover - standalone use without package
+            _shared_load = None
+        if _shared_load is not None:
+            self.e_vs_dist = _shared_load(self.e_vs_dist_path, allow_pickle=True)
+            self.overall_distances_mm = np.array(
+                _shared_load(self.overall_distances_path), dtype=np.float64
+            ) * 10.0
+        else:
+            self.e_vs_dist = np.load(self.e_vs_dist_path, allow_pickle=True)
+            self.overall_distances_mm = np.load(self.overall_distances_path) * 10.0
 
         if (
             self.e_vs_dist.dtype != object

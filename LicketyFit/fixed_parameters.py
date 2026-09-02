@@ -38,15 +38,19 @@ _SCALAR_ENV_BY_KEY = {
 }
 _KNOWN_KEYS = frozenset((*_SCALAR_ENV_BY_KEY, "direction"))
 _COMMON_KEYS = frozenset(("x0_mm", "y0_mm", "z0_mm", "direction", "t0_ns"))
-_MODE_KEYS = {
-    "general": _COMMON_KEYS | {"full_range_mm", "kinetic_energy_mev"},
-    "beam": _COMMON_KEYS | {"length_mm"},
-    "absorption": _COMMON_KEYS
-    | {"visible_length_mm", "full_range_mm", "kinetic_energy_mev"},
+_FULL_LENGTH_GENERAL_KEYS = _COMMON_KEYS | {
+    "length_mm", "full_range_mm", "kinetic_energy_mev"
 }
-_MODE_ALIASES = {
-    "cosmic": "general",
-    "full_length": "beam",
+_FULL_LENGTH_BEAM_KEYS = _COMMON_KEYS | {"length_mm"}
+_ABSORPTION_KEYS = _COMMON_KEYS | {
+    "visible_length_mm", "full_range_mm", "kinetic_energy_mev"
+}
+_LEGACY_MODE_AXES = {
+    "beam": ("beam", "full_length"),
+    "full_length": ("beam", "full_length"),
+    "general": ("general", "full_length"),
+    "cosmic": ("general", "full_length"),
+    "absorption": ("general", "absorption"),
 }
 
 
@@ -87,14 +91,16 @@ def _unit_direction(value: object) -> tuple[float, float, float]:
 def resolve_fixed_parameter_environment(
     fixed_parameters: Mapping[str, object],
     *,
-    fit_mode: str,
     extra_driver_env: Mapping[object, object],
+    seeding_mode: str | None = None,
+    interaction_mode: str | None = None,
+    fit_mode: str | None = None,
 ) -> dict[str, float | None]:
     """Return deterministic driver variables for physical fixed parameters.
 
     ``kinetic_energy_mev`` is an alternate specification of the full CSDA
-    range in general and absorption modes. It is therefore mutually exclusive
-    with ``full_range_mm`` rather than an additional independent constraint.
+    range.  In general/full-length fits, ``length_mm`` names that same
+    coordinate, so exactly one of those aliases may be supplied.
     """
     if not isinstance(fixed_parameters, Mapping):
         raise TypeError("FIXED_PARAMETERS must be a mapping")
@@ -111,20 +117,61 @@ def resolve_fixed_parameter_environment(
             f"{sorted(_KNOWN_KEYS)}"
         )
 
-    mode = str(fit_mode).strip().lower().replace("-", "_")
-    mode = _MODE_ALIASES.get(mode, mode)
-    if mode not in _MODE_KEYS:
-        raise ValueError(f"Unsupported FIT_MODE={fit_mode!r} for fixed parameters")
-    invalid = sorted(set(normalized) - _MODE_KEYS[mode])
+    supplied_axes = seeding_mode is not None or interaction_mode is not None
+    if supplied_axes:
+        if seeding_mode is None or interaction_mode is None:
+            raise ValueError(
+                "SEEDING_MODE and INTERACTION_MODE must be supplied together"
+            )
+        if fit_mode is not None:
+            raise ValueError(
+                "Do not combine legacy FIT_MODE with SEEDING_MODE/INTERACTION_MODE"
+            )
+        seeding = str(seeding_mode).strip().lower().replace("-", "_")
+        interaction = str(interaction_mode).strip().lower().replace("-", "_")
+        if seeding not in {"beam", "general"}:
+            raise ValueError("SEEDING_MODE must be beam or general")
+        if interaction not in {"full_length", "absorption"}:
+            raise ValueError("INTERACTION_MODE must be full_length or absorption")
+    else:
+        legacy = str(fit_mode).strip().lower().replace("-", "_")
+        try:
+            seeding, interaction = _LEGACY_MODE_AXES[legacy]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported legacy FIT_MODE={fit_mode!r} for fixed parameters"
+            ) from exc
+
+    if interaction == "absorption":
+        allowed_keys = _ABSORPTION_KEYS
+    elif seeding == "general":
+        allowed_keys = _FULL_LENGTH_GENERAL_KEYS
+    else:
+        allowed_keys = _FULL_LENGTH_BEAM_KEYS
+    invalid = sorted(set(normalized) - allowed_keys)
     if invalid:
         raise ValueError(
             f"FIXED_PARAMETERS key(s) {invalid} are not physical coordinates "
-            f"of FIT_MODE={mode!r}; valid keys are {sorted(_MODE_KEYS[mode])}"
+            f"of SEEDING_MODE={seeding!r}, INTERACTION_MODE={interaction!r}; "
+            f"valid keys are {sorted(allowed_keys)}"
         )
     if "full_range_mm" in normalized and "kinetic_energy_mev" in normalized:
         raise ValueError(
             "Choose either full_range_mm or kinetic_energy_mev; they specify "
             "the same physical degree of freedom"
+        )
+    if (
+        interaction == "full_length"
+        and seeding == "general"
+        and "length_mm" in normalized
+        and (
+            "full_range_mm" in normalized
+            or "kinetic_energy_mev" in normalized
+        )
+    ):
+        raise ValueError(
+            "Choose one of length_mm, full_range_mm, or kinetic_energy_mev; "
+            "they specify the same full-length coordinate in general seeding"
         )
 
     fixed_extra_names = sorted(

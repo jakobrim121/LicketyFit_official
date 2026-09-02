@@ -22,11 +22,32 @@ after index 192 are identically one and are omitted.
 from __future__ import annotations
 
 from functools import lru_cache
+import hashlib
+import json
 import math
+import os
+from pathlib import Path
+import zipfile
 
 import numpy as np
-from scipy.signal import fftconvolve
+import scipy
 from scipy.special import ndtr
+
+
+def _fftconvolve(*args, **kwargs):
+    """Import scipy.signal on first use only.
+
+    ``scipy.signal`` costs ~1.4 s to import and is reached at startup solely
+    through the module-level ``fftconvolve`` symbol, even though the function
+    is used only inside the exact compound-SPE table builder (which is itself
+    lru_cached and, in absolute-light runs, evaluated a handful of times).
+    Deferring the import removes that fixed cost from every process launch
+    without changing a single numerical value: the same
+    ``scipy.signal.fftconvolve`` is called with the same arguments.
+    """
+    from scipy.signal import fftconvolve as _impl
+
+    return _impl(*args, **kwargs)
 
 
 WCSIM_QPE_BIN_DENOMINATOR = 22.83
@@ -34,6 +55,7 @@ WCSIM_QPE_INDEX_OFFSET = 50
 WCSIM_DIGITIZER_NOISE_SIGMA_PE = 0.03
 WCSIM_DIGITIZER_CHARGE_FACTOR = 0.985
 WCSIM_QPE_SOURCE_COMMIT = "bc5ca65893ee10dc42259ec541690ec09b15facb"
+WCSIM_EXACT_RESPONSE_CACHE_VERSION = 2
 
 # CDF indices 0..192, inclusive.  Index 192 is the first value equal to one.
 WCSIM_R14374_WCTE_QPE_CDF = np.asarray(
@@ -80,6 +102,11 @@ WCSIM_R14374_WCTE_QPE_CDF = np.asarray(
     ),
     dtype=np.float64,
 )
+
+
+_PRELOADED_EXACT_RESPONSE_GRIDS: dict[
+    tuple[int, int], tuple[tuple[tuple[float, float, np.ndarray], ...], float]
+] = {}
 
 
 def _raw_moments() -> tuple[float, float, float, float]:
@@ -173,8 +200,12 @@ def _exact_response_grids(
 ) -> tuple[tuple[tuple[float, float, np.ndarray], ...], float]:
     """Build response grids as ``(zero_mass, x0, positive_density)``."""
     exact_n_max = int(exact_n_max)
+    subbins = int(subbins)
     if exact_n_max < 1:
         raise ValueError("exact_n_max must be positive")
+    preloaded = _PRELOADED_EXACT_RESPONSE_GRIDS.get((exact_n_max, subbins))
+    if preloaded is not None:
+        return preloaded
     single, dx = _single_qpe_mass_grid(subbins)
     noise_sigma = WCSIM_DIGITIZER_NOISE_SIGMA_PE
     pad = int(math.ceil(8.0 * noise_sigma / dx))
@@ -196,15 +227,353 @@ def _exact_response_grids(
             np.sum(accepted_mass * ndtr(-raw_x / noise_sigma))
         )
         zero_mass = min(max(rejected_mass + negative_after_smear, 0.0), 1.0)
-        density = fftconvolve(accepted_mass, gaussian_density, mode="full")
+        density = _fftconvolve(accepted_mass, gaussian_density, mode="full")
         density = np.maximum(np.asarray(density, dtype=np.float64), 0.0)
         smeared_x0 = raw_x0 - float(pad) * dx
-        output.append((zero_mass, smeared_x0, np.ascontiguousarray(density)))
+        density = np.frombuffer(
+            np.ascontiguousarray(density).tobytes(order="C"),
+            dtype=np.float64,
+        )
+        output.append((zero_mass, smeared_x0, density))
         if npe != exact_n_max:
-            current = fftconvolve(current, single, mode="full")
+            current = _fftconvolve(current, single, mode="full")
             current = np.maximum(np.asarray(current, dtype=np.float64), 0.0)
             current /= float(np.sum(current))
     return tuple(output), dx
+
+
+def preload_exact_response_grids(
+    *,
+    exact_n_max: int = 24,
+    subbins: int = 16,
+    cache_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, int | float | str]:
+    """Load/build immutable compound-SPE grids before forking event workers.
+
+    When ``cache_dir`` is supplied, the serial runtime bootstrap materializes a
+    content-keyed NPZ.  Later clean parents load plain arrays from that verified
+    artifact before ``fork``; no worker imports ``scipy.signal`` or repeats the
+    FFT construction on its first event.
+    """
+    exact_n_max = int(exact_n_max)
+    subbins = int(subbins)
+    if exact_n_max < 1:
+        raise ValueError("exact_n_max must be positive")
+    if subbins < 2:
+        raise ValueError("subbins must be at least two")
+    identity = {
+        "cache_version": int(WCSIM_EXACT_RESPONSE_CACHE_VERSION),
+        "exact_n_max": exact_n_max,
+        "subbins": subbins,
+        "qpe_cdf_sha256": hashlib.sha256(
+            np.ascontiguousarray(WCSIM_R14374_WCTE_QPE_CDF).tobytes()
+        ).hexdigest(),
+        "qpe_bin_denominator": float(WCSIM_QPE_BIN_DENOMINATOR),
+        "qpe_index_offset": int(WCSIM_QPE_INDEX_OFFSET),
+        "digitizer_noise_sigma_pe": float(WCSIM_DIGITIZER_NOISE_SIGMA_PE),
+        "digitizer_charge_factor": float(WCSIM_DIGITIZER_CHARGE_FACTOR),
+        "numpy_version": str(np.__version__),
+        "scipy_version": str(scipy.__version__),
+    }
+    encoded_identity = json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    )
+    cache_key = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    artifact_path: Path | None = None
+    cache_status = "memory"
+
+    expected_dx = 1.0 / (
+        float(WCSIM_QPE_BIN_DENOMINATOR) * float(subbins)
+    )
+    expected_pad = int(math.ceil(
+        8.0 * float(WCSIM_DIGITIZER_NOISE_SIGMA_PE) / expected_dx
+    ))
+    single_grid_size = int(
+        (WCSIM_R14374_WCTE_QPE_CDF.size - WCSIM_QPE_INDEX_OFFSET)
+        * subbins
+    )
+    expected_x0 = np.asarray(
+        [
+            0.5 * float(npe) * expected_dx
+            - float(expected_pad) * expected_dx
+            for npe in range(1, exact_n_max + 1)
+        ],
+        dtype=np.float64,
+    )
+    expected_density_sizes = tuple(
+        int(npe * (single_grid_size - 1) + 1 + 2 * expected_pad)
+        for npe in range(1, exact_n_max + 1)
+    )
+
+    def freeze_grids(grids, dx_value: float):
+        """Return the validated grid contract with read-only density arrays."""
+        if len(grids) != exact_n_max or float(dx_value) != expected_dx:
+            raise ValueError("response-grid cache dimensions are inconsistent")
+        rows = []
+        for index, row in enumerate(grids):
+            if not isinstance(row, tuple) or len(row) != 3:
+                raise ValueError("response-grid cache row is invalid")
+            zero_value = float(row[0])
+            x0_value = float(row[1])
+            source_density = np.asarray(row[2])
+            if (
+                source_density.dtype != np.dtype(np.float64)
+                or source_density.ndim != 1
+            ):
+                raise ValueError("response-grid cache density dtype is invalid")
+            density = np.frombuffer(
+                np.ascontiguousarray(source_density).tobytes(order="C"),
+                dtype=np.float64,
+            )
+            if (
+                not math.isfinite(zero_value)
+                or not 0.0 <= zero_value <= 1.0
+                or not math.isfinite(x0_value)
+                or x0_value != float(expected_x0[index])
+                or density.ndim != 1
+                or density.size != expected_density_sizes[index]
+                or np.any(~np.isfinite(density))
+                or np.any(density < 0.0)
+            ):
+                raise ValueError("response-grid cache row values are invalid")
+            density_integral = float(
+                np.sum(density, dtype=np.float64) * expected_dx
+            )
+            if (
+                not math.isfinite(density_integral)
+                or density_integral <= 0.0
+                or density_integral > 1.0 + 1.0e-10
+            ):
+                raise ValueError("response-grid cache density normalization is invalid")
+            rows.append((zero_value, x0_value, density))
+        return tuple(rows), float(dx_value)
+
+    def payload_sha256(
+        dx_value: float,
+        zero_mass: np.ndarray,
+        x0: np.ndarray,
+        grids,
+    ) -> str:
+        """Digest the canonical scientific payload, independent of ZIP bytes."""
+        digest = hashlib.sha256(b"licketyfit-wcsim-response-grid-payload-v1\0")
+        arrays = [
+            ("dx_pe", np.asarray(dx_value, dtype=np.float64)),
+            ("zero_mass", np.ascontiguousarray(zero_mass, dtype=np.float64)),
+            ("x0", np.ascontiguousarray(x0, dtype=np.float64)),
+        ]
+        arrays.extend(
+            (f"density_{index:03d}", row[2])
+            for index, row in enumerate(grids)
+        )
+        for name, array in arrays:
+            canonical = np.ascontiguousarray(array)
+            digest.update(name.encode("ascii") + b"\0")
+            digest.update(canonical.dtype.str.encode("ascii") + b"\0")
+            digest.update(
+                json.dumps(canonical.shape, separators=(",", ":")).encode("ascii")
+                + b"\0"
+            )
+            digest.update(canonical.tobytes(order="C"))
+        return digest.hexdigest()
+
+    def load_artifact(path: Path):
+        with np.load(path, allow_pickle=False) as archive:
+            expected_files = {
+                "identity_json",
+                "payload_sha256",
+                "dx_pe",
+                "zero_mass",
+                "x0",
+            }
+            expected_files.update(
+                f"density_{index:03d}" for index in range(exact_n_max)
+            )
+            if set(archive.files) != expected_files:
+                raise ValueError("response-grid cache array set mismatch")
+            identity_array = np.asarray(archive["identity_json"])
+            digest_array = np.asarray(archive["payload_sha256"])
+            dx_array = np.asarray(archive["dx_pe"])
+            zero_mass = np.asarray(archive["zero_mass"])
+            x0 = np.asarray(archive["x0"])
+            if (
+                identity_array.shape != ()
+                or identity_array.dtype.kind != "U"
+                or digest_array.shape != ()
+                or digest_array.dtype.kind != "U"
+                or dx_array.shape != ()
+                or dx_array.dtype != np.dtype(np.float64)
+                or zero_mass.dtype != np.dtype(np.float64)
+                or x0.dtype != np.dtype(np.float64)
+                or zero_mass.shape != (exact_n_max,)
+                or x0.shape != (exact_n_max,)
+                or not zero_mass.flags.c_contiguous
+                or not x0.flags.c_contiguous
+            ):
+                raise ValueError("response-grid cache scalar arrays are invalid")
+            stored_identity = str(identity_array.item())
+            if stored_identity != encoded_identity:
+                raise ValueError("response-grid cache identity mismatch")
+            stored_payload_digest = str(digest_array.item())
+            if (
+                len(stored_payload_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in stored_payload_digest
+                )
+            ):
+                raise ValueError("response-grid cache payload digest is invalid")
+            dx_value = float(dx_array.item())
+            if (
+                dx_value != expected_dx
+                or np.any(~np.isfinite(zero_mass))
+                or np.any((zero_mass < 0.0) | (zero_mass > 1.0))
+                or np.any(~np.isfinite(x0))
+                or not np.array_equal(x0, expected_x0)
+            ):
+                raise ValueError("response-grid cache scalar arrays are invalid")
+            rows = []
+            for index in range(exact_n_max):
+                source_density = np.asarray(archive[f"density_{index:03d}"])
+                if (
+                    source_density.dtype != np.dtype(np.float64)
+                    or source_density.ndim != 1
+                    or source_density.size != expected_density_sizes[index]
+                    or not source_density.flags.c_contiguous
+                ):
+                    raise ValueError("response-grid cache density is invalid")
+                rows.append((
+                    float(zero_mass[index]),
+                    float(x0[index]),
+                    source_density,
+                ))
+        grids, dx_value = freeze_grids(tuple(rows), dx_value)
+        if stored_payload_digest != payload_sha256(
+            dx_value, zero_mass, x0, grids
+        ):
+            raise ValueError("response-grid cache payload digest mismatch")
+        return grids, dx_value
+
+    def verified_runtime_cache() -> bool:
+        return str(os.environ.get(
+            "LF_RUNTIME_BOOTSTRAP_VERIFIED", "0"
+        )).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def fsync_directory(directory: Path) -> None:
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        descriptor = None
+        try:
+            descriptor = os.open(directory, flags)
+            os.fsync(descriptor)
+        except OSError:
+            # Some network filesystems do not implement directory fsync. The
+            # file itself has already been flushed and atomically replaced.
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    artifact_load_errors = (
+        EOFError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    )
+
+    if cache_dir is not None:
+        response_dir = Path(cache_dir).expanduser().resolve()
+        response_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = response_dir / f"wcsim-r14374-exact-{cache_key}.npz"
+        lock_path = response_dir / f"wcsim-r14374-exact-{cache_key}.lock"
+        import fcntl
+
+        with lock_path.open("a+", encoding="utf-8") as lock_stream:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            try:
+                grids, dx = load_artifact(artifact_path)
+                cache_status = "loaded"
+            except artifact_load_errors as exc:
+                if verified_runtime_cache():
+                    raise RuntimeError(
+                        "verified runtime cache has a missing or invalid "
+                        f"WCSim response-grid artifact: {artifact_path}"
+                    ) from exc
+                grids, dx = _exact_response_grids(exact_n_max, subbins)
+                grids, dx = freeze_grids(grids, dx)
+                payload: dict[str, np.ndarray] = {
+                    "identity_json": np.asarray(encoded_identity),
+                    "dx_pe": np.asarray(float(dx), dtype=np.float64),
+                    "zero_mass": np.asarray(
+                        [row[0] for row in grids], dtype=np.float64
+                    ),
+                    "x0": np.asarray([row[1] for row in grids], dtype=np.float64),
+                }
+                for index, row in enumerate(grids):
+                    payload[f"density_{index:03d}"] = np.ascontiguousarray(row[2])
+                payload["payload_sha256"] = np.asarray(
+                    payload_sha256(
+                        dx,
+                        payload["zero_mass"],
+                        payload["x0"],
+                        grids,
+                    )
+                )
+                temporary = artifact_path.with_name(
+                    f".{artifact_path.name}.tmp-{os.getpid()}.npz"
+                )
+                try:
+                    with temporary.open("wb") as stream:
+                        np.savez(stream, **payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    persisted_grids, persisted_dx = load_artifact(temporary)
+                    if persisted_dx != dx or len(persisted_grids) != len(grids):
+                        raise ValueError(
+                            "fresh response-grid artifact does not match memory"
+                        )
+                    for persisted, original in zip(persisted_grids, grids):
+                        if (
+                            persisted[0] != original[0]
+                            or persisted[1] != original[1]
+                            or not np.array_equal(persisted[2], original[2])
+                        ):
+                            raise ValueError(
+                                "fresh response-grid artifact does not match memory"
+                            )
+                    os.replace(temporary, artifact_path)
+                    fsync_directory(response_dir)
+                    grids, dx = persisted_grids, persisted_dx
+                finally:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                cache_status = "generated"
+    else:
+        if verified_runtime_cache():
+            raise RuntimeError(
+                "verified runtime cache requires a persistent WCSim "
+                "response-grid artifact directory"
+            )
+        grids, dx = _exact_response_grids(exact_n_max, subbins)
+        grids, dx = freeze_grids(grids, dx)
+
+    grids, dx = freeze_grids(grids, dx)
+    _PRELOADED_EXACT_RESPONSE_GRIDS[(exact_n_max, subbins)] = (grids, float(dx))
+    _exact_response_grids.cache_clear()
+    grids, dx = _exact_response_grids(exact_n_max, subbins)
+    nbytes = int(sum(int(row[2].nbytes) for row in grids))
+    return {
+        "exact_n_max": exact_n_max,
+        "subbins": subbins,
+        "grid_count": int(len(grids)),
+        "density_nbytes": nbytes,
+        "dx_pe": float(dx),
+        "cache_key_sha256": cache_key,
+        "cache_status": cache_status,
+        "artifact_path": "" if artifact_path is None else str(artifact_path),
+    }
 
 
 def _edgeworth_density(raw_charge: np.ndarray, npe: int) -> np.ndarray:
@@ -360,6 +729,7 @@ __all__ = [
     "WCSIM_DIGITIZER_NOISE_SIGMA_PE",
     "WCSIM_R14374_WCTE_QPE_CDF",
     "precompute_wcsim_compound_response",
+    "preload_exact_response_grids",
     "response_metadata",
     "ski_threshold_acceptance",
 ]

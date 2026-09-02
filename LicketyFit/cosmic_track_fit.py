@@ -45,6 +45,12 @@ from .detector_geometry import (
 _FAST_WCTE_GEOMETRY = str(
     os.environ.get("LF_COSMIC_FAST_WCTE_GEOMETRY", "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+_BATCH_T0_BLOCK_STENCIL = str(
+    os.environ.get("LF_BATCH_T0_BLOCK_STENCIL", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+_EXACT_CHARGE_NLL_REUSE = str(
+    os.environ.get("LF_EXACT_CHARGE_NLL_REUSE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 # -----------------------------------------------------------------------------
@@ -1327,6 +1333,7 @@ class TrackObjective:
     prediction_cache: dict[
         tuple[float, ...], tuple[np.ndarray, object, np.ndarray | None] | None
     ] = field(default_factory=dict)
+    charge_nll_cache: dict[tuple[float, ...], float] = field(default_factory=dict)
     calls: int = 0
     evaluations: int = 0
     optical_evaluations: int = 0
@@ -1357,6 +1364,14 @@ class TrackObjective:
             self.prediction_cache, key, value, self.max_prediction_cache_entries
         )
 
+    def _store_charge_nll(self, key: tuple[float, ...], value: float) -> None:
+        self._bounded_put(
+            self.charge_nll_cache,
+            key,
+            float(value),
+            self.max_prediction_cache_entries,
+        )
+
     def _store_boundary_diagnostic(
         self, key: tuple[float, ...], value: dict[str, object]
     ) -> None:
@@ -1369,6 +1384,7 @@ class TrackObjective:
         """Release all event/geometry arrays retained by this objective."""
         self.cache.clear()
         self.prediction_cache.clear()
+        self.charge_nll_cache.clear()
         self.boundary_interface_diagnostics.clear()
         self.last_boundary_interface_error = None
 
@@ -1376,6 +1392,7 @@ class TrackObjective:
         return {
             "nll": int(len(self.cache)),
             "prediction": int(len(self.prediction_cache)),
+            "charge_nll": int(len(self.charge_nll_cache)),
             "boundary_diagnostics": int(len(self.boundary_interface_diagnostics)),
         }
 
@@ -1399,7 +1416,34 @@ class TrackObjective:
             names = ("x0", "y0", "z0", "dir_u", "dir_v", "length")
         return tuple(round(float(values.get(name, 0.0)), 12) for name in names)
 
-    def _prediction_nll(self, prediction, t0: float) -> float:
+    def _prediction_charge_nll(
+        self,
+        prediction,
+        geometry_key: tuple[float, ...] | None,
+    ) -> float:
+        exp_pes_array = prediction[0]
+        if (
+            _EXACT_CHARGE_NLL_REUSE
+            and geometry_key is not None
+            and geometry_key in self.charge_nll_cache
+        ):
+            return float(self.charge_nll_cache[geometry_key])
+        value = float(
+            self.pmt_model.get_neg_log_likelihood_npe(
+                exp_pes_array, self.obs_pes
+            )
+        )
+        if _EXACT_CHARGE_NLL_REUSE and geometry_key is not None:
+            self._store_charge_nll(geometry_key, value)
+        return value
+
+    def _prediction_nll(
+        self,
+        prediction,
+        t0: float,
+        *,
+        geometry_key: tuple[float, ...] | None = None,
+    ) -> float:
         """Evaluate the configured likelihood for an already-built prediction.
 
         This small helper is intentionally independent of the mutable Emitter
@@ -1410,9 +1454,7 @@ class TrackObjective:
         """
         exp_pes_array, exp_ts_zero, timing_pes = prediction
         if self.objective_mode == "charge_only":
-            fval = self.pmt_model.get_neg_log_likelihood_npe(
-                exp_pes_array, self.obs_pes
-            )
+            fval = self._prediction_charge_nll(prediction, geometry_key)
         elif self.objective_mode == "timing_only":
             fval = self.pmt_model.get_neg_log_likelihood_t(
                 exp_pes_array,
@@ -1423,14 +1465,32 @@ class TrackObjective:
                 model_time_shift_ns=t0,
             )
         elif self.objective_mode == "charge_time":
-            fval = self.pmt_model.get_neg_log_likelihood_npe_t(
-                exp_pes_array,
-                self.obs_pes,
-                exp_ts_zero,
-                self.obs_ts,
-                timing_pes=timing_pes,
-                model_time_shift_ns=t0,
-            )
+            if (
+                _EXACT_CHARGE_NLL_REUSE
+                and geometry_key is not None
+                and hasattr(exp_ts_zero, "first_arrival_active_indices")
+            ):
+                charge_nll = self._prediction_charge_nll(
+                    prediction, geometry_key
+                )
+                timing_nll = self.pmt_model.get_neg_log_likelihood_t(
+                    exp_pes_array,
+                    self.obs_pes,
+                    exp_ts_zero,
+                    self.obs_ts,
+                    timing_pes=timing_pes,
+                    model_time_shift_ns=t0,
+                )
+                fval = float(charge_nll) + float(timing_nll)
+            else:
+                fval = self.pmt_model.get_neg_log_likelihood_npe_t(
+                    exp_pes_array,
+                    self.obs_pes,
+                    exp_ts_zero,
+                    self.obs_ts,
+                    timing_pes=timing_pes,
+                    model_time_shift_ns=t0,
+                )
         else:
             raise ValueError(f"unknown objective_mode={self.objective_mode!r}")
         fval = float(fval)
@@ -1512,7 +1572,29 @@ class TrackObjective:
         shift_array = np.ascontiguousarray(pending_values, dtype=np.float64)
         if (
             self.objective_mode == "charge_time"
-            and hasattr(self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0")
+            and _EXACT_CHARGE_NLL_REUSE
+            and hasattr(self.pmt_model, "get_neg_log_likelihood_t_many_t0")
+            and hasattr(exp_ts_zero, "first_arrival_active_indices")
+        ):
+            charge_nll = self._prediction_charge_nll(
+                prediction, geometry_key
+            )
+            values_array = self.pmt_model.get_neg_log_likelihood_t_many_t0(
+                exp_pes_array,
+                self.obs_pes,
+                exp_ts_zero,
+                self.obs_ts,
+                shift_array,
+                timing_pes=timing_pes,
+            )
+            values_array = np.asarray(values_array, dtype=np.float64) + float(
+                charge_nll
+            )
+        elif (
+            self.objective_mode == "charge_time"
+            and hasattr(
+                self.pmt_model, "get_neg_log_likelihood_npe_t_many_t0"
+            )
         ):
             values_array = self.pmt_model.get_neg_log_likelihood_npe_t_many_t0(
                 exp_pes_array,
@@ -1536,7 +1618,14 @@ class TrackObjective:
             )
         else:
             values_array = np.asarray(
-                [self._prediction_nll(prediction, float(v)) for v in shift_array],
+                [
+                    self._prediction_nll(
+                        prediction,
+                        float(v),
+                        geometry_key=geometry_key,
+                    )
+                    for v in shift_array
+                ],
                 dtype=np.float64,
             )
 
@@ -1594,7 +1683,9 @@ class TrackObjective:
             prediction = self.prediction_cache[geometry_key]
             if prediction is None:
                 return invalid()
-            fval = self._prediction_nll(prediction, t0)
+            fval = self._prediction_nll(
+                prediction, t0, geometry_key=geometry_key
+            )
             if not math.isfinite(fval):
                 return invalid()
             self._store_nll(key, fval)
@@ -2036,7 +2127,9 @@ class TrackObjective:
         if prediction is None:
             return invalid()
 
-        fval = self._prediction_nll(prediction, t0)
+        fval = self._prediction_nll(
+            prediction, t0, geometry_key=geometry_key
+        )
         if not math.isfinite(fval):
             return invalid()
         self._store_nll(key, fval)
@@ -2318,6 +2411,68 @@ def track_aligned_block_optimize(
         cache[key] = result
         return result
 
+    def evaluate_t0_updates_many(
+        current: Mapping[str, float], deltas: Sequence[float]
+    ) -> list[tuple[float, dict[str, float]]]:
+        """Evaluate one-geometry t0 stencil through the exact batched kernel.
+
+        ``t0`` is an additive shift and does not change the optical prediction.
+        The scalar optimizer historically rebuilt the reflected-arrival bins for
+        its ``-h`` and ``+h`` samples independently.  ``TrackObjective`` already
+        exposes a scalar-accounted, bitwise-equivalent multi-t0 likelihood; use
+        it here while retaining the same physical trials and local cache keys.
+        """
+        rows: list[tuple[float, dict[str, float]] | None] = []
+        pending_indices: list[int] = []
+        pending_trials: list[dict[str, float]] = []
+        pending_keys: list[tuple[float, ...]] = []
+        for delta in deltas:
+            trial = _apply_dimension_updates(
+                current,
+                {"t0": float(delta)},
+                chart=objective.chart,
+                detector=objective.detector,
+                vertex_basis=vertex_basis,
+                fixed_params=fixed,
+                length_limits=length_limits,
+                full_range_limits=full_range_limits,
+                track_end_mode=objective.track_end_mode,
+                project_vertex_steps=bool(project_vertex_steps),
+            )
+            key = tuple(
+                round(float(trial.get(name, 0.0)), 12)
+                for name in key_names
+            )
+            cached = cache.get(key)
+            if cached is not None:
+                rows.append(cached)
+                continue
+            pending_indices.append(len(rows))
+            pending_trials.append(trial)
+            pending_keys.append(key)
+            rows.append(None)
+
+        if pending_trials:
+            values_many = objective.evaluate_t0_many(
+                current,
+                np.asarray(
+                    [trial["t0"] for trial in pending_trials],
+                    dtype=np.float64,
+                ),
+            )
+            for row_index, trial, key, value in zip(
+                pending_indices,
+                pending_trials,
+                pending_keys,
+                np.asarray(values_many, dtype=np.float64),
+                strict=True,
+            ):
+                result = (float(value), trial)
+                cache[key] = result
+                rows[row_index] = result
+
+        return [row for row in rows if row is not None]
+
     for sweep in range(max(1, int(sweeps))):
         sweep_start = fval
         blocks = _active_blocks(
@@ -2335,8 +2490,21 @@ def track_aligned_block_optimize(
                 dim = dims[0]
                 h = float(steps[dim])
                 candidates: list[tuple[float, dict[str, float], float]] = [(fval, dict(values), 0.0)]
-                for sign in (-1.0, 1.0):
-                    fv, trial = evaluate_updates(values, {dim: sign * h})
+                if dim == "t0" and _BATCH_T0_BLOCK_STENCIL:
+                    signed_trials = zip(
+                        (-1.0, 1.0),
+                        evaluate_t0_updates_many(values, (-h, h)),
+                        strict=True,
+                    )
+                else:
+                    signed_trials = (
+                        (
+                            sign,
+                            evaluate_updates(values, {dim: sign * h}),
+                        )
+                        for sign in (-1.0, 1.0)
+                    )
+                for sign, (fv, trial) in signed_trials:
                     candidates.append((fv, trial, sign * h))
                 fm, fp = candidates[1][0], candidates[2][0]
                 if math.isfinite(fm) and math.isfinite(fp):
@@ -2799,15 +2967,20 @@ def _reanchor_objective_state(
 
     old_geometry_key = objective._geometry_key(current)
     prediction = objective.prediction_cache.get(old_geometry_key)
+    charge_nll = objective.charge_nll_cache.get(old_geometry_key)
     new_chart = TangentDirectionChart.from_direction(direction)
     current["dir_u"] = 0.0
     current["dir_v"] = 0.0
     objective.chart = new_chart
     objective.cache.clear()
     objective.prediction_cache.clear()
+    objective.charge_nll_cache.clear()
     objective._store_nll(objective._key(current), float(fval))
     if prediction is not None:
-        objective._store_prediction(objective._geometry_key(current), prediction)
+        new_geometry_key = objective._geometry_key(current)
+        objective._store_prediction(new_geometry_key, prediction)
+        if charge_nll is not None:
+            objective._store_charge_nll(new_geometry_key, charge_nll)
     return current
 
 
@@ -3347,14 +3520,24 @@ def two_anchor_block_optimize(
         current_fval: float,
         dimension: str,
         evaluator: Callable[[float], tuple[float, dict[str, float] | None]],
+        evaluator_many: Callable[
+            [Sequence[float]], Sequence[tuple[float, dict[str, float] | None]]
+        ] | None = None,
     ) -> tuple[float, dict[str, float], float]:
         h = float(steps[dimension])
         candidates: list[tuple[float, dict[str, float], float]] = [
             (float(current_fval), dict(current_values), 0.0)
         ]
         side: dict[int, tuple[float, dict[str, float] | None]] = {}
-        for sign in (-1, 1):
-            fv, trial = evaluator(float(sign) * h)
+        if evaluator_many is None:
+            signed_results = (
+                (sign, evaluator(float(sign) * h)) for sign in (-1, 1)
+            )
+        else:
+            signed_results = zip(
+                (-1, 1), evaluator_many((-h, h)), strict=True
+            )
+        for sign, (fv, trial) in signed_results:
             side[sign] = (fv, trial)
             if trial is not None and math.isfinite(fv):
                 candidates.append((float(fv), trial, float(sign) * h))
@@ -3558,7 +3741,32 @@ def two_anchor_block_optimize(
                     value = float(objective(trial))
                     return (value, trial) if math.isfinite(value) else (math.inf, None)
 
-                fval, values, _ = optimize_1d(values, fval, "t0", t0_eval)
+                def t0_eval_many(deltas: Sequence[float]):
+                    trials: list[dict[str, float]] = []
+                    for dt in deltas:
+                        trial = dict(base)
+                        trial["t0"] = float(base.get("t0", 0.0) + dt)
+                        trials.append(trial)
+                    scores = objective.evaluate_t0_many(
+                        base,
+                        np.asarray(
+                            [trial["t0"] for trial in trials],
+                            dtype=np.float64,
+                        ),
+                    )
+                    return [
+                        (float(score), trial)
+                        if math.isfinite(float(score)) else (math.inf, None)
+                        for score, trial in zip(scores, trials, strict=True)
+                    ]
+
+                fval, values, _ = optimize_1d(
+                    values,
+                    fval,
+                    "t0",
+                    t0_eval,
+                    t0_eval_many if _BATCH_T0_BLOCK_STENCIL else None,
+                )
             else:
                 raise RuntimeError(f"unknown two-anchor block kind {block_kind!r}")
 
@@ -4199,8 +4407,14 @@ def proxy_library_metadata(
         path = Path(source)
         try:
             digest.update(path.read_bytes())
-        except Exception:
-            digest.update(str(path).encode("utf-8"))
+        except OSError:
+            # Optional analytic-fallback tables may be deliberately absent.
+            # Hash a stable logical identity rather than the absolute
+            # extraction path, otherwise moving a release ZIP changes its
+            # proxy filename and forces an unnecessary rebuild.
+            logical_name = "/".join(path.parts[-2:])
+            digest.update(b"<missing-proxy-source-v1>\0")
+            digest.update(logical_name.encode("utf-8"))
     if extra:
         # Configuration fields that alter proxy construction must participate in
         # the cache filename, not merely in the compatibility check. Otherwise

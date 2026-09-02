@@ -9,13 +9,93 @@ update. No WCSim-derived scale, template, or fitted MCS width enters the model.
 from __future__ import annotations
 
 import math
+import os
 import numpy as np
 from numba import njit
 
 from . import Emitter as emod
 
+# ---------------------------------------------------------------------------
+# Fork-safe single-thread BLAS limiter for the small-KL eigensolve
+# ---------------------------------------------------------------------------
+#
+# v1.43-v1.44 wrapped each ``np.linalg.eigh`` below in
+# ``threadpoolctl.threadpool_limits(limits=1, user_api="blas")``.  Every entry
+# builds a fresh ``ThreadpoolController`` whose library discovery walks the
+# dynamic linker's loaded-object table with ``dl_iterate_phdr``.  Inside a
+# *forked* ``multiprocessing.Pool`` worker with ~100 extension modules loaded
+# that walk segfaults (observed on lxplus, Python 3.11: faulthandler stack
+# ``threadpoolctl._find_libraries_with_dl_iterate_phdr`` <- ``build_raw_fe_kl_basis``
+# <- ``pool.worker``).  ``Pool`` silently respawns each dead worker, the
+# replacement dies the same way, and the tasks they held never complete: the
+# run stalls after the first wave of events.
+#
+# The limiter is only *useful* when BLAS could otherwise spin up a host-wide
+# team, i.e. in a single-process run on a multi-core host.  Multiprocess
+# workers already run with OPENBLAS/MKL/BLIS/OMP_NUM_THREADS=1 set before
+# NumPy is imported (see ``_MULTIPROCESS_RUNTIME_ENV`` in the launchers), so
+# for them the limit is redundant.  Rules, in order:
+#   1. BLAS already single-threaded by environment -> no-op.
+#   2. Otherwise, in the process that imported this module (never a forked
+#      child): build ONE ``ThreadpoolController`` lazily and reuse it.
+#   3. In a forked child that reaches here anyway -> no-op; never walk the
+#      loader table after fork.
+# The eigensolve therefore runs with exactly the same BLAS thread count as
+# before in every configuration, and no forked worker can execute the
+# crashing code path.
+
+_IMPORT_PID = os.getpid()
+_BLAS_CONTROLLER = None
+_BLAS_CONTROLLER_UNAVAILABLE = False
+_BLAS_SINGLE_THREAD_ENV_NAMES = (
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+)
+
+
+class _NoBlasLimit:
+    """Context manager that changes nothing."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _blas_single_threaded_by_environment():
+    return any(
+        os.environ.get(name, "").strip() == "1"
+        for name in _BLAS_SINGLE_THREAD_ENV_NAMES
+    )
+
+
+def _single_thread_blas_limiter():
+    """Return a context manager that runs BLAS single-threaded, fork-safely."""
+    global _BLAS_CONTROLLER, _BLAS_CONTROLLER_UNAVAILABLE
+    if _blas_single_threaded_by_environment():
+        return _NoBlasLimit()
+    if _BLAS_CONTROLLER is None:
+        if os.getpid() != _IMPORT_PID or _BLAS_CONTROLLER_UNAVAILABLE:
+            return _NoBlasLimit()
+        try:
+            from threadpoolctl import ThreadpoolController
+            _BLAS_CONTROLLER = ThreadpoolController()
+        except Exception:
+            _BLAS_CONTROLLER_UNAVAILABLE = True
+            return _NoBlasLimit()
+    try:
+        return _BLAS_CONTROLLER.limit(limits=1, user_api="blas")
+    except Exception:
+        return _NoBlasLimit()
+
 _KL_CACHE = {}
 _KL_CACHE_MAX = 256
+_EXACT_SMALL_KL_SINGLE_THREAD = str(
+    os.environ.get("LF_EXACT_SMALL_KL_SINGLE_THREAD", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def stable_transverse_basis(direction):
@@ -190,7 +270,20 @@ def build_raw_fe_kl_basis(emitter, n_modes_per_plane=4, n_grid=41):
             Ca = C[np.ix_(active, active)]
             sw = np.sqrt(wa)
             B = (sw[:, None] * Ca) * sw[None, :]
-            evals, evecs = np.linalg.eigh(0.5 * (B + B.T))
+            symmetric_B = 0.5 * (B + B.T)
+            # These dense KL matrices are at most a few hundred rows.  A
+            # host-wide BLAS team costs more to dispatch than the LAPACK work
+            # itself, particularly for the many 41-row general-mode bases.
+            # Limit only this eigensolve; all other fitter linear algebra keeps
+            # its configured thread policy.
+            if (
+                _EXACT_SMALL_KL_SINGLE_THREAD
+                or symmetric_B.shape[0] >= 128
+            ):
+                with _single_thread_blas_limiter():
+                    evals, evecs = np.linalg.eigh(symmetric_B)
+            else:
+                evals, evecs = np.linalg.eigh(symmetric_B)
             order = np.argsort(evals)[::-1]
             evals = np.maximum(evals[order], 0.0)
             evecs = evecs[:, order]

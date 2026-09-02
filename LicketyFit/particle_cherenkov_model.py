@@ -140,7 +140,10 @@ def cherenkov_threshold_kinetic_mev(particle_or_mass, n: float = 1.344) -> float
 def _load_first_existing(paths, *, allow_pickle=False):
     for path in paths:
         if path and os.path.exists(path):
-            return np.load(path, allow_pickle=allow_pickle)
+            # Share the (large, read-only) array with any other consumer in
+            # this process instead of re-reading it from disk.
+            from LicketyFit.runtime_cache import load_shared_table
+            return load_shared_table(path, allow_pickle=allow_pickle)
     raise FileNotFoundError(
         "Could not find any of the required lookup tables. Checked:\n"
         + "\n".join(str(p) for p in paths if p)

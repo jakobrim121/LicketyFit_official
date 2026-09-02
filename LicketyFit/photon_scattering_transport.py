@@ -15,6 +15,7 @@ import hashlib
 from pathlib import Path
 from typing import Callable, NamedTuple
 import numpy as np
+from LicketyFit.runtime_cache import open_npz_table as _open_npz_table
 from numba import njit, prange, get_num_threads, set_num_threads
 
 try:
@@ -100,7 +101,7 @@ def _load_spectral_moment_lut(config):
         _SPECTRAL_MOMENT_LUT_CACHE[key] = None
         return None
     try:
-        with np.load(path, allow_pickle=False) as z:
+        with _open_npz_table(path, allow_pickle=False) as z:
             if not _spectral_lut_matches_config(z, config):
                 out = None
             else:
@@ -1912,7 +1913,7 @@ def _inspect_receiver_moment_table(path, config, p, n, hp, hn):
         return result
 
     try:
-        with np.load(path, allow_pickle=False) as payload:
+        with _open_npz_table(path, allow_pickle=False) as payload:
             required = {
                 "table_kind", "schema_version", "n_pmts",
                 "pmt_aperture_radius_mm", "pmt_facing_soft_width",
@@ -2181,7 +2182,7 @@ def _find_receiver_moment_table(config, p, n):
         if not diagnostic.get("compatible", False):
             continue
         try:
-            with np.load(path, allow_pickle=False) as payload:
+            with _open_npz_table(path, allow_pickle=False) as payload:
                 xs = np.ascontiguousarray(payload["xs"], dtype=np.float64)
                 ys = np.ascontiguousarray(payload["ys"], dtype=np.float64)
                 zs = np.ascontiguousarray(payload["zs"], dtype=np.float64)

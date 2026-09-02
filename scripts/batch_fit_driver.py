@@ -1,22 +1,16 @@
 """Single-file LicketyFit batch driver for WCSim and real WCTE data.
 
 This file contains the complete driver logic for both data adapters and all
-three public fit modes. Normal users should configure and launch it through
+four public reconstruction combinations. Normal users should configure and launch it through
 ``run_wcte.py`` or ``run_wcsim.py`` in this directory rather than editing this
 large implementation file directly:
 
-    FIT_MODE = "beam"
-        Fast seven-parameter internal-start fit. The fitted longitudinal
-        coordinate is the remaining CSDA range; the visible optical support is
-        clipped at the detector boundary when an energetic particle exits.
+    SEEDING_MODE = "general" or "beam"
+        Selects broad detector-wide or compact beam-pipe seed coverage.
 
-    FIT_MODE = "absorption"
-        Original fast eight-parameter abrupt-endpoint fit with separate visible
-        length and full range / initial kinetic energy.
-
-    FIT_MODE = "general"
-        More careful geometry-clipped fit supporting all four combinations of
-        start inside/outside and stop inside/outside.
+    INTERACTION_MODE = "full_length" or "absorption"
+        Selects the seven-parameter threshold-range endpoint or the
+        eight-parameter abrupt endpoint with separate visible and full ranges.
 
 The two launcher files translate their short, documented Python configuration
 sections into the driver's environment interface and then execute this file
@@ -34,11 +28,49 @@ under ``LicketyFit/``.
 
 from __future__ import annotations
 
+import os
+
+
+def _configure_early_multiprocess_runtime_environment() -> None:
+    """Clamp native thread pools before any project or numerical import.
+
+    NumPy initializes its BLAS runtime during import.  Changing the thread
+    environment later leaves a host-sized native team in the parent and every
+    forked event worker, defeating the one-thread-per-worker contract and
+    making fork startup unsafe.  Keep this dependency-free bootstrap above all
+    LicketyFit, NumPy, and Numba imports.
+    """
+    raw_nproc = os.environ.get("NPROC", "16").strip()
+    try:
+        nproc = max(1, int(float(raw_nproc)))
+    except Exception:
+        nproc = 16
+    nested = str(os.environ.get("ALLOW_NESTED_PARALLELISM", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+    if nproc <= 1 or nested:
+        return
+
+    # Assign rather than using setdefault: stale shell settings must not turn
+    # an event-level process pool into NPROC x host_threads nested parallelism.
+    os.environ["BLIS_NUM_THREADS"] = "1"
+    os.environ["EMITTER_PHOTON_SCATTER_NATIVE_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMBA_NUM_THREADS"] = "1"
+    os.environ["NUMBA_THREADING_LAYER"] = "forksafe"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+
+_configure_early_multiprocess_runtime_environment()
+
 import base64
 import faulthandler
 import json
 import math
-import os
 from pathlib import Path
 import signal
 import sys
@@ -54,7 +86,18 @@ from LicketyFit.mcs_configuration import (
     default_coherent_modes_per_plane,
     validate_coherent_configuration,
 )
-from LicketyFit.runtime_cache import runtime_cache_content_tag
+from LicketyFit.runtime_cache import resolve_runtime_cache_location
+from LicketyFit.run_configuration import (
+    internal_engine_mode,
+    legacy_fit_mode_axes,
+    normalize_interaction_mode,
+    normalize_seeding_mode,
+    public_mode_label,
+)
+from LicketyFit.run_console import (
+    progress_milestones as _simple_progress_milestones,
+    print_progress as _print_simple_progress,
+)
 from LicketyFit.cosmic_basin_arbitration import (
     select_coherent_basin_payloads,
 )
@@ -64,6 +107,21 @@ from LicketyFit.absolute_light_calibration import (
     validate_pmt_charge_response_context,
     validate_wcte_runtime_context,
 )
+
+
+def _terminate_event_pool(event_pool) -> None:
+    """Terminate and join a pool after copying every available result.
+
+    ``Pool.close(); Pool.join()`` can wait forever if result collection raised
+    with an unresolved task or if native/OpenMP state keeps an otherwise idle
+    worker alive.  No worker state is needed after results cross IPC, so the
+    reliable cleanup for both success and failure is terminate then join.  In
+    particular, this keeps the finite no-progress timeout an actual bound.
+    """
+    if event_pool is None:
+        return
+    event_pool.terminate()
+    event_pool.join()
 
 
 def _runtime_pmt_charge_response_metadata(pmt_model):
@@ -81,6 +139,59 @@ def _runtime_pmt_charge_response_metadata(pmt_model):
             "amp_threshold_pe": float(pmt_model.amp_threshold),
         }
     raise ValueError(f"unsupported PMT charge-response model {model!r}")
+
+
+def _preload_wcsim_response_grids_for_fork(pmt_model) -> dict[str, object]:
+    """Prime the process-local WCSim SPE table once in the fork parent."""
+    model = str(pmt_model.spe_response_model).strip().lower().replace("-", "_")
+    if model != "wcsim_r14374_ski":
+        return {"enabled": False, "response_model": model}
+    likelihood = str(pmt_model.charge_likelihood_mode).strip().lower().replace(
+        "-", "_"
+    )
+    if likelihood not in {"compound_spe_profile", "compound_spe_calibrated"}:
+        return {
+            "enabled": False,
+            "response_model": model,
+            "charge_likelihood_mode": likelihood,
+            "reason": "active likelihood does not use exact compound-SPE grids",
+        }
+    from LicketyFit.wcsim_charge_response import preload_exact_response_grids
+
+    # The event path caps the exact table at the configured compound-response
+    # support.  Prime that *effective* key, otherwise a non-default n_cap would
+    # make every worker miss the inherited table and rebuild it on event 0.
+    requested_exact_n_max = int(
+        os.environ.get("PMT_WCSIM_QPE_EXACT_N_MAX", "24")
+    )
+    exact_n_max = min(
+        requested_exact_n_max,
+        int(pmt_model.compound_profile_n_cap),
+    )
+    subbins = int(os.environ.get("PMT_WCSIM_QPE_SUBBINS", "16"))
+    runtime_root_text = os.environ.get(
+        "LF_RESOLVED_RUNTIME_CACHE_DIR",
+        os.environ.get("NUMBA_CACHE_DIR", ""),
+    ).strip()
+    runtime_root = Path(runtime_root_text).resolve() if runtime_root_text else None
+    if runtime_root is not None and runtime_root.name == "numba":
+        runtime_root = runtime_root.parent
+    response_cache_dir = (
+        None if runtime_root is None else runtime_root / "response"
+    )
+    started = time.perf_counter()
+    metadata = preload_exact_response_grids(
+        exact_n_max=exact_n_max,
+        subbins=subbins,
+        cache_dir=response_cache_dir,
+    )
+    return {
+        "enabled": True,
+        "response_model": model,
+        "charge_likelihood_mode": likelihood,
+        "wall_s": float(time.perf_counter() - started),
+        **metadata,
+    }
 
 
 def _prepare_numba_thread_budget(requested: int) -> int:
@@ -105,7 +216,7 @@ def _prepare_numba_thread_budget(requested: int) -> int:
     return min(requested, maximum)
 
 
-UNIFIED_DRIVER_RELEASE = "2026-08-31-v1.43.0-mode-rename-beam-speed"
+UNIFIED_DRIVER_RELEASE = "2026-09-02-v1.44.0-mode-axes"
 
 
 _REMOVED_COSMIC_MODEL_ENV_SWITCHES = (
@@ -166,7 +277,7 @@ def _cosmic_model_switches_from_emitter(emitter_switches):
 # Which input/calibration adapter to use: "wcsim" or "wcte".
 DEFAULT_DATA_SOURCE = "wcsim"
 
-# Exactly one public mode: "beam", "absorption", or "general".
+# Legacy direct-driver fallback. New launchers provide the two orthogonal axes.
 DEFAULT_FIT_MODE = "general"
 
 # Shared settings.
@@ -325,28 +436,30 @@ except Exception:
 
 
 def _configure_process_runtime_environment() -> None:
-    """Configure fork-safe numerical runtimes before NumPy/Numba imports."""
-    raw_nproc = os.environ.get("NPROC", str(DEFAULT_NPROC)).strip()
-    try:
-        nproc = max(1, int(float(raw_nproc)))
-    except Exception:
-        nproc = max(1, int(DEFAULT_NPROC))
-    nested = str(os.environ.get("ALLOW_NESTED_PARALLELISM", "0")).strip().lower() in {
-        "1", "true", "yes", "y", "on",
-    }
+    """Reassert thread limits and finish runtime-cache configuration."""
+    _configure_early_multiprocess_runtime_environment()
 
-    cache_base = (
-        os.environ.get("LF_RUNTIME_CACHE_DIR", "").strip()
-        or os.environ.get("TMPDIR", "").strip()
-        or "/tmp"
-    )
+    # The launcher binds all three paths explicitly after validating the
+    # canonical cache and, when possible, staging it off AFS.  Re-resolving
+    # here would hash the source tree and probe the home cache in every clean
+    # child, defeating the node-local production path.
+    bound_numba = os.environ.get("NUMBA_CACHE_DIR", "").strip()
+    bound_native = os.environ.get("LF_NATIVE_CACHE_DIR", "").strip()
+    bound_root = os.environ.get("LF_RESOLVED_RUNTIME_CACHE_DIR", "").strip()
+    if bound_numba and bound_native and bound_root:
+        try:
+            Path(bound_root).expanduser().mkdir(parents=True, exist_ok=True)
+            Path(bound_numba).expanduser().mkdir(parents=True, exist_ok=True)
+            Path(bound_native).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        else:
+            return
+
     project_root = Path(__file__).resolve().parent.parent
-    project_tag = runtime_cache_content_tag(project_root)
-    runtime_root = Path(cache_base).expanduser() / (
-        f"licketyfit-{os.getuid()}-{project_tag}-"
-        f"py{sys.version_info.major}{sys.version_info.minor}"
-    )
     try:
+        cache_location = resolve_runtime_cache_location(project_root)
+        runtime_root = cache_location.root
         numba_cache = runtime_root / "numba"
         native_cache = runtime_root / "native"
         numba_cache.mkdir(parents=True, exist_ok=True)
@@ -354,17 +467,41 @@ def _configure_process_runtime_environment() -> None:
         os.environ.setdefault("NUMBA_CACHE_DIR", str(numba_cache))
         os.environ.setdefault("LF_NATIVE_CACHE_DIR", str(native_cache))
         os.environ.setdefault("LF_RESOLVED_RUNTIME_CACHE_DIR", str(runtime_root))
+        os.environ.setdefault(
+            "LF_RUNTIME_CACHE_PERSISTENT",
+            "1" if cache_location.persistent else "0",
+        )
+        os.environ.setdefault(
+            "LF_RUNTIME_CACHE_LOCATION_SOURCE", cache_location.source
+        )
+        # Numba's stock locator keys its cache directory on sha1(absolute
+        # source directory) and freshness on (mtime, size), so a job that
+        # extracts the package to a new scratch path recompiles everything
+        # (~90 s measured).  This locator keys on the package-relative path
+        # and a SHA-256 of each source file, so compiled code is reused
+        # wherever the same source runs and only edited modules recompile.
+        # LF_NUMBA_PORTABLE_CACHE_DIR can place it on shared storage while
+        # derived tables stay node-local.  LF_PORTABLE_NUMBA_CACHE=0 restores
+        # stock behaviour.
+        try:
+            from LicketyFit.runtime_cache import (
+                install_portable_numba_cache_locator,
+            )
+            explicit = os.environ.get(
+                "LF_NUMBA_PORTABLE_CACHE_DIR", ""
+            ).strip()
+            portable_root = (
+                Path(explicit).expanduser() if explicit
+                else runtime_root / "numba-portable"
+            )
+            os.environ.setdefault(
+                "LF_RESOLVED_NUMBA_PORTABLE_CACHE_DIR", str(portable_root)
+            )
+            install_portable_numba_cache_locator(project_root, portable_root)
+        except Exception:
+            pass
     except OSError:
         pass
-
-    if nproc > 1 and not nested:
-        os.environ.setdefault("NUMBA_THREADING_LAYER", "forksafe")
-        os.environ["OPENBLAS_NUM_THREADS"] = "1"
-        os.environ["MKL_NUM_THREADS"] = "1"
-        os.environ["NUMEXPR_NUM_THREADS"] = "1"
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["OMP_DYNAMIC"] = "FALSE"
-
 
 def _receiver_status_without_prefork_native_load(
     emitter,
@@ -403,7 +540,7 @@ def _receiver_status_without_prefork_native_load(
     return status
 
 _VALID_DATA_SOURCES = {"wcsim", "wcte"}
-_VALID_FIT_MODES = {"beam", "absorption", "general"}
+_VALID_FIT_MODES = {"beam", "absorption", "general", "beam_absorption"}
 _LEGACY_FIT_MODE_ALIASES = {
     "full_length": "beam",
     "cosmic": "general",
@@ -411,6 +548,7 @@ _LEGACY_FIT_MODE_ALIASES = {
 _INTERNAL_FIT_MODE_BY_PUBLIC = {
     "beam": "full_length",
     "absorption": "absorption",
+    "beam_absorption": "absorption",
     "general": "cosmic",
 }
 
@@ -793,13 +931,40 @@ def _apply_unified_defaults() -> tuple[str, str]:
         _VALID_DATA_SOURCES,
         "DATA_SOURCE/LF_DATA_SOURCE",
     )
-    public_mode = _normalize_public_fit_mode(
-        os.environ.get("FIT_MODE", DEFAULT_FIT_MODE)
-    )
-    mode = _INTERNAL_FIT_MODE_BY_PUBLIC[public_mode]
+    raw_seeding = os.environ.get("LF_SEEDING_MODE", "").strip()
+    raw_interaction = os.environ.get("LF_INTERACTION_MODE", "").strip()
+    if raw_seeding or raw_interaction:
+        if not raw_seeding or not raw_interaction:
+            raise ValueError(
+                "LF_SEEDING_MODE and LF_INTERACTION_MODE must be supplied together"
+            )
+        seeding = normalize_seeding_mode(raw_seeding)
+        interaction = normalize_interaction_mode(raw_interaction)
+    else:
+        seeding, interaction = legacy_fit_mode_axes(
+            os.environ.get("FIT_MODE", DEFAULT_FIT_MODE)
+        )
+    public_mode = public_mode_label(seeding, interaction)
+    mode = internal_engine_mode(seeding, interaction)
     os.environ["LF_DATA_SOURCE"] = source
+    os.environ["LF_SEEDING_MODE"] = seeding
+    os.environ["LF_INTERACTION_MODE"] = interaction
     os.environ["LF_PUBLIC_FIT_MODE"] = public_mode
     os.environ["FIT_MODE"] = mode
+    # Seed guards belong to the seeding axis. Explicit expert overrides retain
+    # precedence, while direct legacy invocations receive the historical
+    # defaults (old absorption already used the general/global guards).
+    guard_default = "1" if seeding == "general" else "0"
+    os.environ.setdefault("WCTE_INCLUDE_ORIENTATION_GUARD", guard_default)
+    os.environ.setdefault("WCTE_INCLUDE_DETECTOR_GLOBAL", guard_default)
+    os.environ.setdefault(
+        "MCS_COHERENT_IMPLEMENTATION",
+        "fast12_profile"
+        if interaction == "absorption"
+        else "physics_reference"
+        if seeding == "beam"
+        else "fast12_profile",
+    )
 
     # Record whether the resolved truth setting came from the user's shell or
     # from the edited driver defaults.  Environment variables intentionally
@@ -1095,6 +1260,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
 import zipfile
@@ -1109,11 +1275,73 @@ def _env_int(name: str, default: int) -> int:
     return int(float(raw))
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    return float(raw)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _simple_console_enabled() -> bool:
+    return _env_bool("LF_SIMPLE_CONSOLE", False)
+
+
+def _simple_progress_interval() -> int:
+    return max(0, _env_int("LF_PROGRESS_INTERVAL", 50))
+
+
+def _publish_simple_fit_progress(
+    previous_completed: int,
+    completed: int,
+    *,
+    total: int,
+) -> None:
+    """Publish exact fit-count milestones from a direct or supervised engine."""
+    if not _simple_console_enabled():
+        return
+    offset = max(0, _env_int("LF_PROGRESS_OFFSET", 0))
+    overall_total = max(0, _env_int("LF_PROGRESS_TOTAL", total + offset))
+    interval = _simple_progress_interval()
+    milestones = _simple_progress_milestones(
+        offset + int(previous_completed),
+        offset + int(completed),
+        total=overall_total,
+        interval=interval,
+    )
+    if not milestones:
+        return
+    progress_path_text = os.environ.get("LF_PROGRESS_FILE", "").strip()
+    if not progress_path_text:
+        _print_simple_progress(
+            offset + int(previous_completed),
+            offset + int(completed),
+            total=overall_total,
+            interval=interval,
+        )
+        return
+    progress_path = Path(progress_path_text).expanduser()
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = progress_path.with_name(
+        progress_path.name + f".tmp.{os.getpid()}"
+    )
+    temporary.write_text(f"{int(milestones[-1])}\n", encoding="utf-8")
+    os.replace(temporary, progress_path)
+
+
+def _read_simple_fit_progress(path: Path | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return max(0, int(path.read_text(encoding="utf-8").strip()))
+    except (OSError, ValueError):
+        return None
 
 
 def _resolved_wcsim_truth_request_metadata() -> dict[str, Any]:
@@ -1311,6 +1539,75 @@ def _merge_child_outputs(
     if not children:
         raise RuntimeError("Cosmic supervisor produced no child outputs")
 
+    child_metadata = [
+        dict(child.get("metadata", {}))
+        if isinstance(child.get("metadata", {}), dict)
+        else {}
+        for child in children
+    ]
+
+    def common_mapping_fields(
+        rows: list[dict[str, Any]], *, excluded: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Retain only fields explicitly identical in every child mapping."""
+        if not rows:
+            return {}
+        keys = set(rows[0])
+        for row in rows[1:]:
+            keys.intersection_update(row)
+        keys.difference_update(excluded or set())
+        common: dict[str, Any] = {}
+        for key in sorted(keys):
+            first = rows[0][key]
+            try:
+                identical = all(row[key] == first for row in rows[1:])
+            except (TypeError, ValueError):
+                identical = False
+            if identical:
+                common[key] = first
+        return common
+
+    def merged_child_mapping(name: str) -> dict[str, Any] | None:
+        """Make child-varying preload provenance explicit and lossless."""
+        values = [row.get(name) for row in child_metadata]
+        if not any(isinstance(value, dict) for value in values):
+            return None
+        mappings = [
+            dict(value) if isinstance(value, dict) else {}
+            for value in values
+        ]
+        explicitly_child_scoped = {
+            "artifact_path", "cache_status", "wall_s"
+        }
+        explicitly_child_scoped.update(
+            key
+            for mapping in mappings
+            for key in mapping
+            if key.endswith("_already_loaded")
+        )
+        summary = common_mapping_fields(
+            mappings, excluded=explicitly_child_scoped
+        )
+        varying_keys = set().union(*(mapping.keys() for mapping in mappings))
+        varying_keys.difference_update(summary)
+        summary.update({
+            "clean_process_child_count": int(len(children)),
+            "metadata_present_per_child": [
+                bool(isinstance(value, dict)) for value in values
+            ],
+        })
+        for key in sorted(varying_keys):
+            summary[f"{key}_per_child"] = [
+                mapping.get(key) for mapping in mappings
+            ]
+        wall_values = [
+            float(mapping.get("wall_s", 0.0)) for mapping in mappings
+        ]
+        if "wall_s" in varying_keys or any(wall_values):
+            summary["wall_s_per_child"] = wall_values
+            summary["wall_s_total"] = float(sum(wall_values))
+        return summary
+
     merged: dict[str, Any] = {}
     all_keys = set().union(*(child.keys() for child in children))
     for key in sorted(all_keys):
@@ -1337,18 +1634,168 @@ def _merge_child_outputs(
             result["event_index"] = int(source_index)
             result["source_event_index"] = int(source_index)
 
-    metadata = dict(children[0].get("metadata", {}))
+    # Failure summaries carry the child's local event ordinal. Promote those
+    # records with the same source-index map used by the event-aligned columns.
+    for record_key in ("event_failures", "mcs_failures"):
+        promoted_records: list[dict[str, Any]] = []
+        for child in children:
+            source_indices = child.get("source_event_index", [])
+            source_by_local = (
+                {index: int(value) for index, value in enumerate(source_indices)}
+                if isinstance(source_indices, list) else {}
+            )
+            child_start = int(
+                dict(child.get("metadata", {})).get(
+                    "source_event_start_index", source_start
+                )
+            )
+            records = child.get(record_key, [])
+            if not isinstance(records, list):
+                continue
+            for ordinal, record in enumerate(records):
+                if not isinstance(record, dict):
+                    continue
+                promoted = dict(record)
+                local_index = int(promoted.get("event_index", ordinal))
+                source_index = promoted.get("source_event_index")
+                if source_index is None:
+                    source_index = source_by_local.get(
+                        local_index, child_start + local_index
+                    )
+                promoted["local_event_index"] = local_index
+                promoted["event_index"] = int(source_index)
+                promoted["source_event_index"] = int(source_index)
+                promoted_records.append(promoted)
+        if promoted_records or record_key in merged:
+            merged[record_key] = promoted_records
+
+    # A merged output describes the complete supervised request, never the
+    # first clean child.  Remove every field whose scope is one child process;
+    # aggregate or replace the public fields below.
+    child_local_metadata_keys = {
+        "checkpoint",
+        "coherent_numba_parent_preload",
+        "completed_source_event_indices",
+        "cosmic_supervised_child",
+        "event_workers_used",
+        "events_per_batch",
+        "fit_loop_wall_s",
+        "incremental_event_checkpoint",
+        "last_completed_event_exclusive",
+        "max_events_to_fit",
+        "multiprocessing_max_tasks_per_child",
+        "multiprocessing_recycle_after_tasks_per_worker",
+        "multiprocessing_used",
+        "n_events_accepted",
+        "n_events_completed",
+        "n_events_failed",
+        "n_events_prepared",
+        "n_events_requested",
+        "n_events_skipped_during_preparation",
+        "n_mcs_applied",
+        "n_mcs_failed_straight_retained",
+        "n_selected_events_available",
+        "n_selected_events_loaded",
+        "output_file",
+        "parallel_throughput_events_per_s",
+        "parallel_wall_s_per_completed_event",
+        "print_event_results",
+        "process_generation_max_events",
+        "process_generation_tasks_per_worker",
+        "safe_process_generation_capacity",
+        "save_after_each_batch",
+        "setup_wall_s",
+        "single_process",
+        "single_worker_event_fit_wall_s_mean",
+        "single_worker_event_fit_wall_s_median",
+        "skipped_event_records",
+        "source_event_start_index",
+        "source_event_stop_exclusive",
+        "warm_kernel_wall_s",
+        "wcsim_response_grid_fork_preload",
+    }
+    metadata = common_mapping_fields(
+        child_metadata, excluded=child_local_metadata_keys
+    )
+    for name in (
+        "coherent_numba_parent_preload",
+        "wcsim_response_grid_fork_preload",
+    ):
+        summary = merged_child_mapping(name)
+        if summary is not None:
+            metadata[name] = summary
 
     # Every WCSim cosmic child reads only the optional truth diagnostics for its
     # assigned source-event interval.  Merge the nested metadata explicitly;
     # ordinary top-level event columns are already concatenated above.
-    truth_children = [
-        child.get("metadata", {}).get("wcsim_truth_root")
-        for child in children
-    ]
-    truth_children = [row for row in truth_children if isinstance(row, dict)]
+    truth_values = [row.get("wcsim_truth_root") for row in child_metadata]
+    truth_children = [row for row in truth_values if isinstance(row, dict)]
+    truth_requested = any(
+        bool(dict(row.get("wcsim_truth_request", {})).get("requested", False))
+        for row in child_metadata
+        if isinstance(row.get("wcsim_truth_request", {}), dict)
+    )
+    if truth_children and len(truth_children) != len(children):
+        raise RuntimeError(
+            "Cosmic supervisor received partial child truth metadata"
+        )
+    if truth_requested and len(truth_children) != len(children):
+        raise RuntimeError(
+            "Cosmic supervisor requested truth but a child omitted its metadata"
+        )
     if truth_children:
-        truth_metadata = dict(truth_children[0])
+        truth_child_local_keys = {
+            "entry_candidate_rows_tested",
+            "event_index_basket_lookup_error",
+            "event_index_basket_ranges_decoded_this_call",
+            "event_index_baskets_available",
+            "event_index_baskets_probed_this_call",
+            "event_index_cache_error",
+            "event_index_cache_extended",
+            "event_index_cache_hit",
+            "event_index_complete",
+            "event_index_entries_decoded_this_call",
+            "event_index_entries_scanned_this_call",
+            "event_index_events_added_this_call",
+            "event_index_events_stored",
+            "event_index_missing_events_stored",
+            "event_index_prefetched_beyond_output",
+            "event_index_scan_entry_stop",
+            "event_index_target_max_event",
+            "event_index_wall_s",
+            "event_record_count",
+            "full_geometry_points_tested",
+            "matching_primary_rows",
+            "n_entries_found",
+            "n_entries_found_in_output",
+            "n_output_events",
+            "n_requested_events",
+            "n_root_events_seen",
+            "npz_primary_track_id_inference",
+            "numeric_read_and_processing_wall_s",
+            "output_status_counts",
+            "primary_selection_counts",
+            "processing_wall_s",
+            "read_wall_s",
+            "requested_entry_ranges",
+            "requested_root_events_found_in_index",
+            "resolved_event_entry_ranges",
+            "rows_in_requested_events",
+            "rows_scanned",
+            "sparse_detail_branches",
+            "sparse_detail_entries_decoded",
+            "sparse_detail_ranges_read",
+            "sparse_detail_rows",
+            "sparse_detail_wall_s",
+            "status_counts",
+            "track_segments_processed",
+            "tree_entry_ranges_read",
+            "tree_entry_start_read",
+            "tree_entry_stop_read",
+        }
+        truth_metadata = common_mapping_fields(
+            truth_children, excluded=truth_child_local_keys
+        )
         status_counts: dict[str, int] = {}
         selection_counts: dict[str, int] = {}
         output_status_counts: dict[str, int] = {}
@@ -1361,6 +1808,21 @@ def _merge_child_outputs(
                 output_status_counts[str(key)] = (
                     output_status_counts.get(str(key), 0) + int(value)
                 )
+        resolved_event_entry_ranges: dict[str, Any] = {}
+        for row in truth_children:
+            ranges = row.get("resolved_event_entry_ranges", {})
+            if not isinstance(ranges, dict):
+                continue
+            for event, bounds in ranges.items():
+                key = str(event)
+                if key in resolved_event_entry_ranges and (
+                    resolved_event_entry_ranges[key] != bounds
+                ):
+                    raise RuntimeError(
+                        "Cosmic supervisor received conflicting truth entry ranges "
+                        f"for source event {key}"
+                    )
+                resolved_event_entry_ranges[key] = bounds
         truth_metadata.update({
             "clean_process_child_count": int(len(truth_children)),
             "rows_scanned_per_child": [
@@ -1396,10 +1858,63 @@ def _merge_child_outputs(
                 bool(row.get("event_index_cache_hit", False))
                 for row in truth_children
             ],
+            "event_index_cache_extended_per_child": [
+                bool(row.get("event_index_cache_extended", False))
+                for row in truth_children
+            ],
+            "event_index_wall_s_per_child": [
+                float(row.get("event_index_wall_s", 0.0))
+                for row in truth_children
+            ],
+            "event_index_wall_s_total": float(sum(
+                float(row.get("event_index_wall_s", 0.0))
+                for row in truth_children
+            )),
+            "processing_wall_s_per_child": [
+                float(row.get("processing_wall_s", 0.0))
+                for row in truth_children
+            ],
+            "processing_wall_s_total": float(sum(
+                float(row.get("processing_wall_s", 0.0))
+                for row in truth_children
+            )),
+            "numeric_read_and_processing_wall_s_per_child": [
+                float(row.get("numeric_read_and_processing_wall_s", 0.0))
+                for row in truth_children
+            ],
+            "numeric_read_and_processing_wall_s_total": float(sum(
+                float(row.get("numeric_read_and_processing_wall_s", 0.0))
+                for row in truth_children
+            )),
+            "sparse_detail_wall_s_per_child": [
+                float(row.get("sparse_detail_wall_s", 0.0))
+                for row in truth_children
+            ],
+            "sparse_detail_wall_s_total": float(sum(
+                float(row.get("sparse_detail_wall_s", 0.0))
+                for row in truth_children
+            )),
             "sparse_detail_entries_decoded_total": int(sum(
                 int(row.get("sparse_detail_entries_decoded", 0))
                 for row in truth_children
             )),
+            "tree_entry_ranges_read_per_child": [
+                list(row.get("tree_entry_ranges_read", []))
+                for row in truth_children
+            ],
+            "requested_entry_ranges_per_child": [
+                list(row.get("requested_entry_ranges", []))
+                for row in truth_children
+            ],
+            "resolved_event_entry_ranges": dict(
+                sorted(resolved_event_entry_ranges.items())
+            ),
+            "npz_primary_track_id_inference_per_child": [
+                dict(row.get("npz_primary_track_id_inference", {}))
+                if isinstance(row.get("npz_primary_track_id_inference", {}), dict)
+                else {}
+                for row in truth_children
+            ],
             "n_requested_events": int(sum(
                 int(row.get("n_requested_events", 0)) for row in truth_children
             )),
@@ -1455,10 +1970,42 @@ def _merge_child_outputs(
         float(value) for value in merged.get("event_fit_wall_s", [])
         if isinstance(value, (int, float)) and math.isfinite(float(value))
     ]
+    accepted_count = int(sum(
+        bool(value) for value in merged.get("fit_accepted", [])
+    ))
+    mcs_applied_count = int(sum(
+        bool(value) for value in merged.get("mcs_applied", [])
+    ))
+    event_failure_count = int(len(merged.get("event_failures", [])))
+    mcs_failure_count = int(len(merged.get("mcs_failures", [])))
+    event_workers_per_child = [
+        max(0, int(row.get("event_workers_used", 0)))
+        for row in child_metadata
+    ]
+    events_per_batch_per_child = [
+        max(0, int(row.get("events_per_batch", 0)))
+        for row in child_metadata
+    ]
+    max_tasks_per_child = [
+        row.get("multiprocessing_max_tasks_per_child")
+        for row in child_metadata
+    ]
+    recycle_per_worker = [
+        row.get("multiprocessing_recycle_after_tasks_per_worker")
+        for row in child_metadata
+    ]
     metadata.update({
         "checkpoint": False,
         "n_events_requested": int(requested),
         "n_events_completed": int(completed),
+        # Child metadata describes one clean generation.  Recompute all result
+        # counts from the concatenated output; retaining children[0] here made
+        # a successful 500-event run incorrectly report only its first 80
+        # accepted events.
+        "n_events_accepted": accepted_count,
+        "n_events_failed": event_failure_count,
+        "n_mcs_applied": mcs_applied_count,
+        "n_mcs_failed_straight_retained": mcs_failure_count,
         "source_event_start_index": int(source_start),
         "source_event_stop_exclusive": int(source_start + requested),
         "last_completed_event_exclusive": int(source_start + requested),
@@ -1469,6 +2016,37 @@ def _merge_child_outputs(
         "cosmic_supervisor_chunk_size": int(chunk_size),
         "cosmic_supervisor_chunk_count": int(len(children)),
         "cosmic_supervisor_child_output_names": [path.name for path in child_paths],
+        "single_process": bool(all(
+            bool(row.get("single_process", False)) for row in child_metadata
+        )),
+        "multiprocessing_used": bool(any(
+            bool(row.get("multiprocessing_used", False))
+            for row in child_metadata
+        )),
+        "event_workers_used": int(max(event_workers_per_child, default=0)),
+        "cosmic_supervisor_event_workers_used_per_child": (
+            event_workers_per_child
+        ),
+        "events_per_batch": int(max(events_per_batch_per_child, default=0)),
+        "cosmic_supervisor_events_per_batch_per_child": (
+            events_per_batch_per_child
+        ),
+        "print_event_results": bool(any(
+            bool(row.get("print_event_results", False))
+            for row in child_metadata
+        )),
+        "save_after_each_batch": bool(any(
+            bool(row.get("save_after_each_batch", False))
+            for row in child_metadata
+        )),
+        "multiprocessing_max_tasks_per_child": (
+            max(int(value) for value in max_tasks_per_child if value is not None)
+            if any(value is not None for value in max_tasks_per_child) else None
+        ),
+        "multiprocessing_recycle_after_tasks_per_worker": (
+            max(int(value) for value in recycle_per_worker if value is not None)
+            if any(value is not None for value in recycle_per_worker) else None
+        ),
         "fit_loop_wall_s": fit_loop_wall_s,
         "setup_wall_s": setup_wall_s,
         "warm_kernel_wall_s": warm_wall_s,
@@ -1525,35 +2103,273 @@ def _subprocess_status_description(returncode: int) -> str:
     return f"signal {number} ({name}); subprocess return code {code}"
 
 
+def _cosmic_checkpoint_completed(path: Path | None) -> int | None:
+    """Read an atomically written child checkpoint without trusting its shape."""
+    if path is None:
+        return None
+    try:
+        with path.open("rb") as stream:
+            payload = pickle.load(stream)
+        metadata = payload.get("metadata", {})
+        return max(0, int(metadata.get("n_events_completed", 0)))
+    except (
+        AttributeError,
+        EOFError,
+        OSError,
+        pickle.UnpicklingError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _terminate_cosmic_process_group(
+    process: subprocess.Popen,
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    """Stop a supervised child and every event worker it spawned."""
+    if os.name == "posix":
+        # ``start_new_session=True`` makes the child PID its process-group ID.
+        # The group can still contain live workers after that leader exits, so
+        # do not use ``process.poll()`` as evidence that cleanup is complete.
+        process_group = int(process.pid)
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        deadline = time.monotonic() + max(0.0, float(grace_seconds))
+        while True:
+            process.poll()  # Reap the leader when it has exited.
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.wait()
+        return
+
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=max(0.1, float(grace_seconds)))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return
+    process.wait()
+
+
 def _run_cosmic_subprocess(
     script_dir: Path,
     engine_path: Path,
     env: dict,
     *,
     log_path: Path | None = None,
+    status_label: str | None = None,
+    progress_path: Path | None = None,
+    progress_total: int | None = None,
+    progress_offset: int = 0,
+    progress_overall_total: int | None = None,
+    simple_progress_path: Path | None = None,
+    heartbeat_seconds: float | None = None,
+    stall_timeout_seconds: float | None = None,
+    poll_interval_seconds: float = 0.5,
 ):
-    """Run one clean cosmic subprocess and preserve native-crash evidence."""
+    """Run one clean child with heartbeat, checkpoint watch, and cleanup.
+
+    A supervised fit chunk defaults to a ten-minute *no-progress* watchdog.
+    Each atomic checkpoint resets that clock. Set
+    ``LF_COSMIC_CHILD_STALL_TIMEOUT_SECONDS=0`` to disable it or increase it
+    for deliberately exceptional events. Non-fit helper children have no
+    implicit timeout because they do not publish event checkpoints.
+    """
     child_env = dict(env)
     child_env.setdefault("PYTHONFAULTHANDLER", "1")
     child_env.setdefault("PYTHONUNBUFFERED", "1")
-    completed = subprocess.run(
-        [sys.executable, "-u", str(engine_path)],
-        cwd=str(script_dir),
-        env=child_env,
-        close_fds=True,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    heartbeat = (
+        _env_float("LF_COSMIC_CHILD_HEARTBEAT_SECONDS", 30.0)
+        if heartbeat_seconds is None
+        else float(heartbeat_seconds)
     )
-    output = completed.stdout or ""
+    heartbeat = max(0.05, heartbeat)
+    if stall_timeout_seconds is None:
+        stall_timeout = (
+            _env_float("LF_COSMIC_CHILD_STALL_TIMEOUT_SECONDS", 600.0)
+            if progress_path is not None
+            else 0.0
+        )
+    else:
+        stall_timeout = float(stall_timeout_seconds)
+    stall_timeout = max(0.0, stall_timeout)
+    poll_interval = max(0.01, float(poll_interval_seconds))
+    label = str(status_label or "cosmic subprocess")
+    total = None if progress_total is None else max(0, int(progress_total))
+    simple_console = str(child_env.get("LF_SIMPLE_CONSOLE", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+    overall_total = (
+        total
+        if progress_overall_total is None
+        else max(0, int(progress_overall_total))
+    )
+    offset = max(0, int(progress_offset))
+    last_simple_completed = offset
+    if simple_console and simple_progress_path is not None:
+        child_env["LF_PROGRESS_FILE"] = str(simple_progress_path)
+        child_env["LF_PROGRESS_OFFSET"] = str(offset)
+        child_env["LF_PROGRESS_TOTAL"] = str(overall_total)
+
+    if log_path is None:
+        log_context = tempfile.TemporaryFile(
+            mode="w+", encoding="utf-8", errors="replace"
+        )
+    else:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_context = log_path.open("w+", encoding="utf-8", errors="replace")
+
+    command = [sys.executable, "-u", str(engine_path)]
+    started = time.monotonic()
+    last_checkpoint_at = started
+    last_completed = 0
+    last_progress_stat: tuple[int, int, int] | None = None
+    next_heartbeat = started + heartbeat
+    timeout_message: str | None = None
+    if status_label is not None and not simple_console:
+        print(f"  starting {label}", flush=True)
+
+    with log_context as log_stream:
+        process = subprocess.Popen(
+            command,
+            cwd=str(script_dir),
+            env=child_env,
+            close_fds=True,
+            stdout=log_stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                if simple_console and simple_progress_path is not None:
+                    simple_completed = _read_simple_fit_progress(
+                        simple_progress_path
+                    )
+                    if (
+                        simple_completed is not None
+                        and simple_completed > last_simple_completed
+                    ):
+                        _print_simple_progress(
+                            last_simple_completed,
+                            simple_completed,
+                            total=overall_total,
+                            interval=_simple_progress_interval(),
+                        )
+                        last_simple_completed = simple_completed
+                        last_checkpoint_at = now
+                if progress_path is not None:
+                    try:
+                        stat = progress_path.stat()
+                        stat_token = (
+                            int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ino)
+                        )
+                    except OSError:
+                        stat_token = None
+                    if stat_token is not None and stat_token != last_progress_stat:
+                        last_progress_stat = stat_token
+                        checkpoint_completed = _cosmic_checkpoint_completed(progress_path)
+                        if (
+                            checkpoint_completed is not None
+                            and checkpoint_completed > last_completed
+                        ):
+                            last_completed = checkpoint_completed
+                            last_checkpoint_at = now
+                            if not simple_console:
+                                suffix = f"/{total}" if total is not None else ""
+                                print(
+                                    f"  {label}: checkpointed {last_completed}{suffix} "
+                                    f"events after {now - started:.0f} s",
+                                    flush=True,
+                                )
+
+                if not simple_console and now >= next_heartbeat:
+                    suffix = f"/{total}" if total is not None else ""
+                    print(
+                        f"  {label} still running ({now - started:.0f} s; "
+                        f"{last_completed}{suffix} events checkpointed; "
+                        f"{now - last_checkpoint_at:.0f} s since progress)",
+                        flush=True,
+                    )
+                    while next_heartbeat <= now:
+                        next_heartbeat += heartbeat
+
+                if (
+                    stall_timeout > 0.0
+                    and now - last_checkpoint_at >= stall_timeout
+                ):
+                    timeout_message = (
+                        f"{label} made no checkpoint progress for "
+                        f"{stall_timeout:.0f} s"
+                    )
+                    _terminate_cosmic_process_group(process)
+                    break
+                time.sleep(poll_interval)
+        except BaseException:
+            _terminate_cosmic_process_group(process)
+            raise
+
+        if process.poll() is None:
+            process.wait()
+        if simple_console and simple_progress_path is not None:
+            simple_completed = _read_simple_fit_progress(simple_progress_path)
+            if (
+                simple_completed is not None
+                and simple_completed > last_simple_completed
+            ):
+                _print_simple_progress(
+                    last_simple_completed,
+                    simple_completed,
+                    total=overall_total,
+                    interval=_simple_progress_interval(),
+                )
+                last_simple_completed = simple_completed
+        log_stream.flush()
+        log_stream.seek(0)
+        output = log_stream.read()
+
+    if timeout_message is not None:
+        log_note = (
+            "Child output used a temporary log."
+            if log_path is None
+            else f"Child log retained at: {log_path}"
+        )
+        raise RuntimeError(
+            f"{timeout_message}; terminated its process group. {log_note}"
+        )
+
+    completed = subprocess.CompletedProcess(
+        command, int(process.returncode), stdout=output
+    )
     if completed.returncode != 0:
-        if log_path is not None:
-            try:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text(output)
-            except Exception:
-                pass
+        # The process leader may have failed after spawning event workers.
+        # Sweep its session even though ``poll()`` has already reaped it.
+        _terminate_cosmic_process_group(process)
         if output:
             print(output.rstrip(), file=sys.stderr, flush=True)
         print(
@@ -1564,7 +2380,7 @@ def _run_cosmic_subprocess(
         )
         if log_path is not None:
             print(f"Child log retained at: {log_path}", file=sys.stderr, flush=True)
-    else:
+    elif not simple_console:
         for line in _important_subprocess_lines(output):
             print(f"  {line}", flush=True)
     return completed
@@ -1589,12 +2405,17 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
     source_start = max(0, _env_int("LF_EVENT_START_INDEX", 0))
     requested_raw = max(0, _env_int("TOT_EVENTS", 100))
     requested = min(requested_raw, max(0, available - source_start))
-    max_events = max(1, _env_int("LF_COSMIC_GENERATION_MAX_EVENTS", 40))
     tasks_per_worker = max(1, _env_int("LF_COSMIC_GENERATION_TASKS_PER_WORKER", 10))
+    max_events = max(
+        1,
+        _env_int(
+            "LF_COSMIC_GENERATION_MAX_EVENTS",
+            nproc * tasks_per_worker,
+        ),
+    )
     chunk_size = max(1, min(max_events, nproc * tasks_per_worker))
-    if requested <= chunk_size:
+    if requested <= 0:
         return False
-
     final_output = Path(
         os.environ.get("LF_OUTPUT_FILE", "").strip() or _default_wcsim_output(script_dir)
     ).expanduser()
@@ -1602,13 +2423,17 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
     part_dir = final_output.with_name(final_output.name + f".parts.{os.getpid()}")
     part_dir.mkdir(parents=True, exist_ok=False)
     engine_path = Path(__file__).resolve()
+    _stub = engine_path.with_name("lf_driver_main.py")
+    if _stub.is_file():
+        engine_path = _stub  # cached-bytecode entry point (same semantics)
 
     n_chunks = int(math.ceil(requested / chunk_size))
-    print(
-        f"LicketyFit general: fitting {requested} events with {nproc} workers "
-        f"in {n_chunks} clean chunks",
-        flush=True,
-    )
+    if not _env_bool("LF_SIMPLE_CONSOLE", False):
+        print(
+            f"LicketyFit general: fitting {requested} events with {nproc} workers "
+            f"in {n_chunks} clean chunks",
+            flush=True,
+        )
     wall0 = time.perf_counter()
     children: list[dict[str, Any]] = []
     child_paths: list[Path] = []
@@ -1621,11 +2446,17 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
             child_env = os.environ.copy()
             child_env.update({
                 "LF_DATA_SOURCE": "wcsim",
-                "FIT_MODE": "general",
+                "LF_SEEDING_MODE": "general",
+                "LF_INTERACTION_MODE": "full_length",
+                "LF_PUBLIC_FIT_MODE": "general",
+                "FIT_MODE": "cosmic",
                 "LF_COSMIC_SUPERVISED_CHILD": "1",
                 "LF_EVENT_START_INDEX": str(int(absolute_start)),
                 "TOT_EVENTS": str(int(count)),
-                "N_EVENTS_PER_BATCH": str(int(count)),
+                # Publish one worker-width wave at a time so the supervisor can
+                # distinguish live progress from a lost worker pool.
+                "N_EVENTS_PER_BATCH": str(int(min(count, nproc))),
+                "SAVE_AFTER_EACH_BATCH": "1",
                 "LF_OUTPUT_FILE": str(part_path),
                 "LF_COSMIC_GENERATION_MAX_EVENTS": str(int(chunk_size)),
                 "LF_MP_MAX_TASKS_PER_CHILD": "0",
@@ -1643,9 +2474,26 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
                 "PRINT_EVENT_RESULTS": "0",
                 "PRINT_BATCH_PROGRESS": "0",
             })
+            if _env_bool("LF_RUNTIME_BOOTSTRAP_VERIFIED", False):
+                child_env["WARM_FIT_KERNELS"] = "0"
             child_log = part_path.with_name(part_path.name + ".log")
+            status_label = (
+                f"chunk {part_number + 1}/{n_chunks} events "
+                f"[{absolute_start}, {absolute_start + count})"
+            )
             completed = _run_cosmic_subprocess(
-                script_dir, engine_path, child_env, log_path=child_log
+                script_dir,
+                engine_path,
+                child_env,
+                log_path=child_log,
+                status_label=status_label,
+                progress_path=part_path,
+                progress_total=count,
+                progress_offset=relative_start,
+                progress_overall_total=requested,
+                simple_progress_path=part_path.with_name(
+                    part_path.name + ".progress"
+                ),
             )
             if completed.returncode != 0:
                 raise RuntimeError(
@@ -1664,7 +2512,8 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
             children.append(child)
             child_paths.append(part_path)
             done = min(requested, relative_start + count)
-            print(f"  completed {done}/{requested} events", flush=True)
+            if not _env_bool("LF_SIMPLE_CONSOLE", False):
+                print(f"  completed {done}/{requested} events", flush=True)
 
         supervisor_wall_s = float(time.perf_counter() - wall0)
         merged = _merge_child_outputs(
@@ -1682,14 +2531,15 @@ def run_wcsim_cosmic_supervisor(script_dir: Path) -> bool:
         _atomic_pickle(final_output, merged)
         success = True
         truth_summary = _wcsim_truth_summary_line(merged)
-        if truth_summary is not None:
+        if truth_summary is not None and not _env_bool("LF_SIMPLE_CONSOLE", False):
             print(f"  {truth_summary}", flush=True)
-        print(
-            f"Completed {requested} events in {supervisor_wall_s:.3f} s "
-            f"({requested/max(supervisor_wall_s,1e-300):.2f} events/s). "
-            f"Saved: {final_output}",
-            flush=True,
-        )
+        if not _env_bool("LF_SIMPLE_CONSOLE", False):
+            print(
+                f"Completed {requested} events in {supervisor_wall_s:.3f} s "
+                f"({requested/max(supervisor_wall_s,1e-300):.2f} events/s). "
+                f"Saved: {final_output}",
+                flush=True,
+            )
         return True
     finally:
         if success:
@@ -1718,6 +2568,9 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
     part_dir = final_output.with_name(final_output.name + f".parts.{os.getpid()}")
     part_dir.mkdir(parents=True, exist_ok=False)
     engine_path = Path(__file__).resolve()
+    _stub = engine_path.with_name("lf_driver_main.py")
+    if _stub.is_file():
+        engine_path = _stub  # cached-bytecode entry point (same semantics)
     prepared_path = part_dir / "raw_selected_events.pkl"
     prepared_metadata_path = prepared_path.with_name(
         prepared_path.name + ".metadata.pkl"
@@ -1758,7 +2611,10 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         prepare_env["TOT_EVENTS"] = str(int(prepare_limit))
     prepare_env.update({
         "LF_DATA_SOURCE": "wcte",
-        "FIT_MODE": "general",
+        "LF_SEEDING_MODE": "general",
+        "LF_INTERACTION_MODE": "full_length",
+        "LF_PUBLIC_FIT_MODE": "general",
+        "FIT_MODE": "cosmic",
         "NPROC": "1",
         "LF_WCTE_PREPARE_EVENTS_ONLY": "1",
         "LF_WCTE_PREPARED_EVENT_FILE": str(prepared_path),
@@ -1766,7 +2622,8 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         "LF_COSMIC_SUPERVISED_CHILD": "1",
     })
 
-    print("LicketyFit general: preparing selected WCTE events", flush=True)
+    if not _env_bool("LF_SIMPLE_CONSOLE", False):
+        print("LicketyFit general: preparing selected WCTE events", flush=True)
     wall0 = time.perf_counter()
     prepare_env.update({
         "LF_COSMIC_CHILD_QUIET": "1",
@@ -1804,17 +2661,24 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             f"the prepared stream contains {available} events."
         )
 
-    max_events = max(1, _env_int("LF_COSMIC_GENERATION_MAX_EVENTS", 40))
     tasks_per_worker = max(
         1, _env_int("LF_COSMIC_GENERATION_TASKS_PER_WORKER", 10)
     )
+    max_events = max(
+        1,
+        _env_int(
+            "LF_COSMIC_GENERATION_MAX_EVENTS",
+            nproc * tasks_per_worker,
+        ),
+    )
     chunk_size = max(1, min(max_events, nproc * tasks_per_worker))
     n_chunks = int(math.ceil(requested / chunk_size))
-    print(
-        f"LicketyFit general: fitting {requested} selected WCTE events with "
-        f"{nproc} workers in {n_chunks} clean chunks",
-        flush=True,
-    )
+    if not _env_bool("LF_SIMPLE_CONSOLE", False):
+        print(
+            f"LicketyFit general: fitting {requested} selected WCTE events with "
+            f"{nproc} workers in {n_chunks} clean chunks",
+            flush=True,
+        )
 
     children: list[dict[str, Any]] = []
     child_paths: list[Path] = []
@@ -1829,7 +2693,10 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             child_env = os.environ.copy()
             child_env.update({
                 "LF_DATA_SOURCE": "wcte",
-                "FIT_MODE": "general",
+                "LF_SEEDING_MODE": "general",
+                "LF_INTERACTION_MODE": "full_length",
+                "LF_PUBLIC_FIT_MODE": "general",
+                "FIT_MODE": "cosmic",
                 "EVENT_SOURCE": "file",
                 "USER_EVENT_FILE": str(prepared_path),
                 "USER_EVENT_KEY": "",
@@ -1840,7 +2707,8 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
                 "LF_EVENT_COUNT": str(int(count)),
                 "MAX_EVENTS_TO_FIT": str(int(absolute_start + count)),
                 "TOT_EVENTS": str(int(absolute_start + count)),
-                "N_EVENTS_PER_BATCH": str(int(count)),
+                "N_EVENTS_PER_BATCH": str(int(min(count, nproc))),
+                "SAVE_AFTER_EACH_BATCH": "1",
                 "LF_OUTPUT_FILE": str(part_path),
                 "LF_COSMIC_GENERATION_MAX_EVENTS": str(int(chunk_size)),
                 "LF_MP_MAX_TASKS_PER_CHILD": "0",
@@ -1853,8 +2721,23 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
                 "PRINT_BATCH_PROGRESS": "0",
             })
             child_log = part_path.with_name(part_path.name + ".log")
+            status_label = (
+                f"chunk {part_number + 1}/{n_chunks} selected-event interval "
+                f"[{absolute_start}, {absolute_start + count})"
+            )
             completed = _run_cosmic_subprocess(
-                script_dir, engine_path, child_env, log_path=child_log
+                script_dir,
+                engine_path,
+                child_env,
+                log_path=child_log,
+                status_label=status_label,
+                progress_path=part_path,
+                progress_total=count,
+                progress_offset=relative_start,
+                progress_overall_total=requested,
+                simple_progress_path=part_path.with_name(
+                    part_path.name + ".progress"
+                ),
             )
             if completed.returncode != 0:
                 raise RuntimeError(
@@ -1885,7 +2768,8 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             children.append(child)
             child_paths.append(part_path)
             done = min(requested, relative_start + count)
-            print(f"  completed {done}/{requested} events", flush=True)
+            if not _env_bool("LF_SIMPLE_CONSOLE", False):
+                print(f"  completed {done}/{requested} events", flush=True)
 
         supervisor_wall_s = float(time.perf_counter() - wall0)
         merged = _merge_child_outputs(
@@ -1901,6 +2785,17 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             "wcte_raw_event_preparation_file": prepared_path.name,
             "wcte_raw_event_preparation_file_retained": False,
             "wcte_raw_events_available": int(available),
+            "max_events_to_fit": (
+                None if requested_raw is None else int(requested_raw)
+            ),
+            "n_selected_events_available": int(available),
+            "n_selected_events_loaded": int(requested),
+            "n_events_prepared": int(
+                merged["metadata"].get("n_events_completed", 0)
+            ),
+            "n_raw_events_materialized": int(
+                prepared_metadata.get("n_raw_events_materialized", available)
+            ),
             "event_source_requested": str(original_event_source),
             "event_source": str(original_event_source),
             "input_file": str(original_input_file),
@@ -1915,6 +2810,11 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
             ),
             "wcte_data_loader": dict(
                 prepared_metadata.get("wcte_data_loader", {})
+            ),
+            "source_identity": dict(
+                dict(prepared_metadata.get("wcte_data_loader", {})).get(
+                    "identity", {}
+                )
             ),
         })
         selection_metadata = dict(merged["metadata"].get("selection", {}))
@@ -1962,11 +2862,12 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         _atomic_pickle(final_output, merged)
         success = True
         completed_total = int(merged["metadata"].get("n_events_completed", 0))
-        print(
-            f"Completed {completed_total} selected WCTE events in "
-            f"{supervisor_wall_s:.3f} s. Saved: {final_output}",
-            flush=True,
-        )
+        if not _env_bool("LF_SIMPLE_CONSOLE", False):
+            print(
+                f"Completed {completed_total} selected WCTE events in "
+                f"{supervisor_wall_s:.3f} s. Saved: {final_output}",
+                flush=True,
+            )
         return True
     finally:
         if success:
@@ -2461,6 +3362,8 @@ def _append_event_status_columns(
 # =============================================================================
 _UNIFIED_DATA_SOURCE, _UNIFIED_FIT_MODE = _apply_unified_defaults()
 _PUBLIC_FIT_MODE = os.environ["LF_PUBLIC_FIT_MODE"]
+_PUBLIC_SEEDING_MODE = os.environ["LF_SEEDING_MODE"]
+_PUBLIC_INTERACTION_MODE = os.environ["LF_INTERACTION_MODE"]
 # Publish the normalized mode before importing/constructing an Emitter. Its one
 # MCS master switch uses this value to route scattering to the ordinary
 # contained-track path or the mutually exclusive cosmic continuation.
@@ -2474,7 +3377,9 @@ os.environ.setdefault(
 if _UNIFIED_FIT_MODE != "cosmic" or _env_bool("VERBOSE_SETUP", False):
     print(
         f"Unified LicketyFit driver {UNIFIED_DRIVER_RELEASE}: "
-        f"DATA_SOURCE={_UNIFIED_DATA_SOURCE}, FIT_MODE={_PUBLIC_FIT_MODE}",
+        f"DATA_SOURCE={_UNIFIED_DATA_SOURCE}, "
+        f"SEEDING_MODE={_PUBLIC_SEEDING_MODE}, "
+        f"INTERACTION_MODE={_PUBLIC_INTERACTION_MODE}",
         flush=True,
     )
     _config_provenance = _run_config_provenance()
@@ -2687,6 +3592,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     # Optional fixed prompt window. Leave both as None to use the event peak.
     PROMPT_MIN_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MIN_NS", None)
     PROMPT_MAX_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MAX_NS", None)
+    PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS = max(
+        6.0,
+        _env_float("WCSIM_PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS", 100.0),
+    )
     CHARGE_NORMALIZATION_MODE = os.environ.get(
         "WCSIM_CHARGE_NORMALIZATION_MODE", "event_mean"
     ).strip().lower().replace("-", "_")
@@ -2731,12 +3640,23 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     MP_START_METHOD = os.environ.get("LF_MP_START_METHOD", "fork").strip().lower()
     MP_CHUNKSIZE = max(1, _env_int("LF_MP_CHUNKSIZE", 1))
     MP_MAX_TASKS_PER_CHILD = max(0, _env_int("LF_MP_MAX_TASKS_PER_CHILD", 0))
+    EVENT_RESULT_STALL_TIMEOUT_SECONDS = _env_float(
+        "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS", 540.0
+    )
+    if (
+        not math.isfinite(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+        or EVENT_RESULT_STALL_TIMEOUT_SECONDS <= 0.0
+    ):
+        raise ValueError(
+            "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS must be finite and positive"
+        )
     SAVE_AFTER_EACH_BATCH = _env_bool("SAVE_AFTER_EACH_BATCH", True)
     ALLOW_NESTED_PARALLELISM = _env_bool("ALLOW_NESTED_PARALLELISM", False)
 
     # Console and pickle verbosity.
     PRINT_EVENT_RESULTS = _env_bool("PRINT_EVENT_RESULTS", False)
     PRINT_BATCH_PROGRESS = _env_bool("PRINT_BATCH_PROGRESS", True)
+    PRINT_LIVE_EVENT_PROGRESS = _env_bool("PRINT_LIVE_EVENT_PROGRESS", True)
     PRINT_CHECKPOINT_MESSAGES = _env_bool("PRINT_CHECKPOINT_MESSAGES", False)
     VERBOSE_SETUP = _env_bool("VERBOSE_SETUP", False)
     SAVE_DETAILED_EVENT_RESULTS = _env_bool("SAVE_DETAILED_EVENT_RESULTS", False)
@@ -3321,7 +4241,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         set_active_particle,
     )
     from particle_range_lookup import ParticleRangeLookup
-    from read_sim_data import read_sim_data
+    from read_sim_data import FIT_FIELDS, TRUTH_TRACK_ID_FIELDS, read_sim_data
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
     reset_rel_eff_mode()
@@ -3554,7 +4474,17 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             return np.isfinite(hit_times) & (hit_times >= lo) & (hit_times <= hi), lo, hi
         if hit_times.size == 0:
             return np.zeros(0, dtype=bool), 0.0, 17.0
-        counts, edges = np.histogram(hit_times, bins=np.arange(0.0, 2000.0, 1.0))
+        counts, edges = np.histogram(
+            hit_times,
+            bins=np.arange(
+                0.0, float(PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS) + 1.0, 1.0
+            ),
+        )
+        if not np.any(counts):
+            raise ValueError(
+                "event has no digitized hit in the WCSim primary-prompt "
+                f"search window [0, {PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS:g}) ns"
+            )
         peak = int(np.argmax(counts))
         hi = float(edges[min(peak + 5, len(edges) - 1)])
         lo = 0.0
@@ -4441,6 +5371,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "joint_exact_sweeps": int(JOINT_EXACT_SWEEPS),
             "adaptive_exact_polish": bool(ADAPTIVE_EXACT_POLISH),
             "stable_prompt_window_gaussian_tails": True,
+            "primary_prompt_peak_search_max_ns": float(
+                PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS
+            ),
         }
 
 
@@ -6329,11 +7262,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     ):
         """Compile/cache every production objective branch outside timed fits.
 
-        For ``NPROC == 1`` this runs in the serial process. For ``NPROC > 1`` it is
-        called by the worker initializer *after* the worker has been forked. It must
-        never run in the multiprocessing parent: several Numba and native receiver
-        kernels use GNU OpenMP, and forking after libgomp has entered a parallel
-        region is unsafe and terminates the children.
+        This runs only in a serial fit process or disposable serial bootstrap.
+        Production pool initializers deliberately never call it: workers load the
+        bootstrap's verified cache on their first task, keeping initialization
+        bounded and free of fallible physics work.
         """
         native_saved = bool(getattr(
             EMITTER_TEMPLATE, "photon_scatter_native_receiver", False
@@ -6607,8 +7539,13 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
         # Construct a status-only event to establish the immutable PMT ordering.
         empty = event_from_wcsim([], [], [])
-        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(
-            empty, WCD, "design"
+        from LicketyFit.runtime_cache import cached_pmt_placements
+        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = cached_pmt_placements(
+            lambda: EMITTER_TEMPLATE.get_pmt_placements(empty, WCD, "design"),
+            geometry_file=GEOMETRY_FILE,
+            place_info="design",
+            mpmt_status=empty.mpmt_status,
+            pmt_status=empty.pmt_status,
         )
         P_LOCATIONS = np.ascontiguousarray(P_LOCATIONS, dtype=np.float64)
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
@@ -6865,12 +7802,13 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def _initialize_event_worker():
-        """Initialize thread runtimes and warm fit kernels inside a forked worker.
+        """Apply the bounded, no-physics worker thread contract.
 
-        The parent intentionally prepares only OpenMP-free geometry, event arrays,
-        tables and proxy state. Every worker then initializes GNU OpenMP/Numba and
-        the native molecular-scattering receiver in its own process. This preserves
-        copy-on-write sharing without the unsafe ``fork-after-OpenMP`` sequence.
+        Full kernel/model warm-up must not run in ``Pool`` initializers.  If a
+        fallible native or compiled warm-up exits here, ``multiprocessing.Pool``
+        silently respawns replacements and a blocking map can wait forever.  The
+        disposable bootstrap executes a real fit under the production NPROC
+        contract; production workers load its verified cache on their first task.
         """
         if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
             os.environ["OMP_NUM_THREADS"] = "1"
@@ -6881,33 +7819,37 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 pass
             if EMITTER_TEMPLATE is not None:
                 EMITTER_TEMPLATE.photon_scatter_native_threads = 1
-
-        if (
-            WARM_FIT_KERNELS
-            and OBS_PES_ALL is not None
-            and OBS_TS_ALL is not None
-            and OBS_PROMPT_MIN_ALL is not None
-            and OBS_PROMPT_MAX_ALL is not None
-            and len(OBS_PES_ALL) > 0
-        ):
-            warm_fit_kernels(
-                OBS_PES_ALL[0],
-                OBS_TS_ALL[0],
-                float(OBS_PROMPT_MIN_ALL[0]),
-                float(OBS_PROMPT_MAX_ALL[0]),
-                allow_native_receiver=True,
-            )
-
+        ready_dir = os.environ.get(
+            "LF_RUNTIME_BOOTSTRAP_WORKER_READY_DIR", ""
+        ).strip()
+        if ready_dir:
+            try:
+                (Path(ready_dir) / f"{os.getpid()}.ready").write_text(
+                    f"{os.getpid()}\n", encoding="utf-8"
+                )
+            except Exception:
+                # Readiness reporting must never recreate the fallible
+                # initializer/respawn loop. The bootstrap parent detects a
+                # missing report and refuses to certify the cache.
+                pass
 
     def _create_persistent_event_pool(n_events):
         """Create one fork pool for the complete fit loop.
 
-        The pool is created only after geometry, tables, proxy shapes, prepared event
-        arrays and JIT warm-up have completed in the parent. Forked children inherit
-        those large read-only objects copy-on-write. Reusing one pool across batches
-        avoids repeatedly paying worker startup costs.
+        The pool is created after geometry, tables, proxy shapes, and prepared
+        event arrays are ready. Forked children inherit those large read-only
+        objects copy-on-write. Reusing one pool across batches avoids repeatedly
+        paying worker startup costs.
         """
-        worker_count = min(int(NPROC), max(1, int(n_events)))
+        # A one-event runtime bootstrap must still exercise the complete
+        # production fork/initializer contract.  Ordinarily there is no reason
+        # to launch more workers than events, but the disposable fork-smoke
+        # phase deliberately starts the requested pool width and submits one
+        # cached event through it before the cache is certified.
+        if _env_bool("LF_RUNTIME_BOOTSTRAP_FORCE_ALL_WORKERS", False):
+            worker_count = max(1, int(NPROC))
+        else:
+            worker_count = min(int(NPROC), max(1, int(n_events)))
         if worker_count <= 1:
             return None
         if MP_START_METHOD != "fork":
@@ -6931,7 +7873,12 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         )
 
 
-    def run_event_batch_multiprocess(event_indices, event_pool=None):
+    def run_event_batch_multiprocess(
+        event_indices,
+        event_pool=None,
+        *,
+        on_result=None,
+    ):
         """Fit a batch serially or through the persistent event process pool.
 
         Only integer event indices enter the queue. Detector geometry, response
@@ -6943,12 +7890,61 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         if not indices:
             return []
         if event_pool is None:
-            return [fit_one_event_by_index(index) for index in indices]
-        return event_pool.map(
+            serial_results = []
+            for index in indices:
+                result = fit_one_event_by_index(index)
+                serial_results.append(result)
+                if on_result is not None:
+                    on_result(result)
+                if PRINT_LIVE_EVENT_PROGRESS and not _env_bool(
+                    "LF_COSMIC_CHILD_QUIET", False
+                ):
+                    wall_s = float(result.get("event_fit_wall_s", math.nan))
+                    accepted = bool(result.get("fit_accepted", False))
+                    print(
+                        f"  completed event {EVENT_START_INDEX + index} in "
+                        f"{wall_s:.3f} s ({'accepted' if accepted else 'rejected'})",
+                        flush=True,
+                    )
+            return serial_results
+        # Pool.map() withholds completed peers behind the slowest event in a
+        # wave. If a native worker exits while holding one map slot, that slot
+        # can also remain unresolved after multiprocessing.Pool respawns the
+        # process. Stream one task/result at a time so progress is observable
+        # and a genuinely lost result has a finite no-progress deadline.
+        iterator = event_pool.imap_unordered(
             fit_one_event_by_index,
             indices,
-            chunksize=int(MP_CHUNKSIZE),
+            chunksize=1,
         )
+        completed = []
+        last_result_at = time.monotonic()
+        while len(completed) < len(indices):
+            timeout = float(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+            remaining = timeout - (time.monotonic() - last_result_at)
+            if remaining <= 0.0:
+                finished = {
+                    int(result["event_index"]) for result in completed
+                }
+                unresolved = [
+                    int(EVENT_START_INDEX + index)
+                    for index in indices
+                    if index not in finished
+                ]
+                raise RuntimeError(
+                    "event-worker pool produced no result for "
+                    f"{timeout:.0f} s; unresolved source event indices: "
+                    f"{unresolved}"
+                )
+            try:
+                result = iterator.next(timeout=min(5.0, remaining))
+            except mp.TimeoutError:
+                continue
+            completed.append(result)
+            last_result_at = time.monotonic()
+            if on_result is not None:
+                on_result(result)
+        return completed
 
 
     def print_event_result(result, completed, total):
@@ -7075,6 +8071,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 ),
                 "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
                 "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "wcsim_response_grid_fork_preload": json.loads(
+                    os.environ.get(
+                        "LF_WCSIM_RESPONSE_GRID_PRELOAD_METADATA", "{}"
+                    )
+                ),
                 "numba_threading_layer_requested": os.environ.get(
                     "NUMBA_THREADING_LAYER", "default"
                 ),
@@ -7138,6 +8139,11 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 "fit_particle_raw": FIT_PARTICLE_RAW,
                 "energy_true_mev_seed_guidance": float(ENERGY_TRUE),
                 "fit_mode": _PUBLIC_FIT_MODE,
+                "seeding_mode": _PUBLIC_SEEDING_MODE,
+                "interaction_mode": _PUBLIC_INTERACTION_MODE,
+                "fit_parameter_count": (
+                    8 if _PUBLIC_INTERACTION_MODE == "absorption" else 7
+                ),
                 "optical_track_end_mode": FIT_MODE,
                 "full_length_semantics": (
                     {
@@ -7521,7 +8527,10 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
         setup_wall0 = time.perf_counter()
         initialize()
-        raw = read_sim_data(INPUT_FILE)
+        input_fields = list(FIT_FIELDS)
+        if _env_bool("WCSIM_USE_TRUTH_ROOT", False):
+            input_fields.extend(TRUTH_TRACK_ID_FIELDS)
+        raw = read_sim_data(INPUT_FILE, fields=input_fields)
         n_available = int(len(raw["digi_hit_time"]))
         event_window = resolve_event_window(
             n_available,
@@ -7562,9 +8571,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         )
 
         # JIT/cache work is deliberately outside the measured event loop. The
-        # serial process can warm here. In multiprocessing mode, the parent must
-        # remain OpenMP-free until after the fork; every worker warms through the
-        # pool initializer instead.
+        # serial bootstrap phase performs the complete warm-up. Multiprocessing
+        # production parents stay OpenMP-free until after fork and their workers
+        # load the already-verified cache on the first submitted event.
         warm_wall_s = 0.0
         if WARM_FIT_KERNELS and prepared and int(NPROC) <= 1:
             warm0 = time.perf_counter()
@@ -7620,6 +8629,22 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
         results = []
         fit_loop_start = time.perf_counter()
+        progress_completed = 0
+
+        def record_fit_progress(_result):
+            nonlocal progress_completed
+            previous_completed = progress_completed
+            progress_completed += 1
+            _publish_simple_fit_progress(
+                previous_completed,
+                progress_completed,
+                total=n_events,
+            )
+
+        response_grid_preload = _preload_wcsim_response_grids_for_fork(PMT_MODEL)
+        os.environ["LF_WCSIM_RESPONSE_GRID_PRELOAD_METADATA"] = json.dumps(
+            response_grid_preload, sort_keys=True
+        )
         event_pool = _create_persistent_event_pool(n_events)
         try:
             for batch_start in range(0, n_events, int(N_EVENTS_PER_BATCH)):
@@ -7629,7 +8654,9 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                 event_indices = list(range(batch_start, batch_end))
                 batch_wall0 = time.perf_counter()
                 batch_results = run_event_batch_multiprocess(
-                    event_indices, event_pool=event_pool
+                    event_indices,
+                    event_pool=event_pool,
+                    on_result=record_fit_progress,
                 )
                 results.extend(batch_results)
                 results.sort(key=lambda item: int(item["event_index"]))
@@ -7722,9 +8749,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     if PRINT_CHECKPOINT_MESSAGES:
                         print(f"  checkpoint saved: {OUTPUT_FILE}", flush=True)
         finally:
-            if event_pool is not None:
-                event_pool.close()
-                event_pool.join()
+            _terminate_event_pool(event_pool)
 
         total_wall = float(time.perf_counter() - fit_loop_start)
         output = build_output(
@@ -7980,6 +9005,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # Optional fixed prompt window. Leave both as None to use the event peak.
     PROMPT_MIN_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MIN_NS", None)
     PROMPT_MAX_FIXED = _env_optional_float("WCSIM_PROMPT_TIME_MAX_NS", None)
+    PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS = max(
+        6.0,
+        _env_float("WCSIM_PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS", 100.0),
+    )
     CHARGE_NORMALIZATION_MODE = os.environ.get(
         "WCSIM_CHARGE_NORMALIZATION_MODE", "event_mean"
     ).strip().lower().replace("-", "_")
@@ -8033,12 +9062,26 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     MP_RECYCLE_AFTER_TASKS_PER_WORKER = max(
         0, _env_int("LF_MP_RECYCLE_AFTER_TASKS_PER_WORKER", 0)
     )
-    COSMIC_PROCESS_GENERATION_MAX_EVENTS = max(
-        1, _env_int("LF_COSMIC_GENERATION_MAX_EVENTS", 40)
-    )
     COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER = max(
         1, _env_int("LF_COSMIC_GENERATION_TASKS_PER_WORKER", 10)
     )
+    COSMIC_PROCESS_GENERATION_MAX_EVENTS = max(
+        1,
+        _env_int(
+            "LF_COSMIC_GENERATION_MAX_EVENTS",
+            int(NPROC) * int(COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER),
+        ),
+    )
+    EVENT_RESULT_STALL_TIMEOUT_SECONDS = _env_float(
+        "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS", 540.0
+    )
+    if (
+        not math.isfinite(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+        or EVENT_RESULT_STALL_TIMEOUT_SECONDS <= 0.0
+    ):
+        raise ValueError(
+            "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS must be finite and positive"
+        )
     COSMIC_RESUME_ACTIVE = _env_bool("LF_COSMIC_RESUME_ACTIVE", False)
     SAVE_AFTER_EACH_BATCH = _env_bool("SAVE_AFTER_EACH_BATCH", True)
     ALLOW_NESTED_PARALLELISM = _env_bool("ALLOW_NESTED_PARALLELISM", False)
@@ -8046,6 +9089,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     # Console and pickle verbosity.
     PRINT_EVENT_RESULTS = _env_bool("PRINT_EVENT_RESULTS", False)
     PRINT_BATCH_PROGRESS = _env_bool("PRINT_BATCH_PROGRESS", True)
+    PRINT_LIVE_EVENT_PROGRESS = _env_bool("PRINT_LIVE_EVENT_PROGRESS", True)
     PRINT_CHECKPOINT_MESSAGES = _env_bool("PRINT_CHECKPOINT_MESSAGES", False)
     VERBOSE_SETUP = _env_bool("VERBOSE_SETUP", False)
     SAVE_DETAILED_EVENT_RESULTS = _env_bool("SAVE_DETAILED_EVENT_RESULTS", False)
@@ -9315,6 +10359,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         safeguarded_log_parabolic_range_candidate,
         build_tangent_direction_fan,
         pivot_reference_for_direction_fan,
+        preload_robust_causal_timing_score_numba,
         refine_local_causal_timing_lines,
     )
     from LicketyFit.multilateration_seeding import (
@@ -9363,7 +10408,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         set_active_particle,
     )
     from particle_range_lookup import ParticleRangeLookup
-    from read_sim_data import read_sim_data
+    from read_sim_data import FIT_FIELDS, TRUTH_TRACK_ID_FIELDS, read_sim_data
     from LicketyFit.photon_scattering_native import ensure_native_receiver_built
 
     reset_rel_eff_mode()
@@ -9682,7 +10727,17 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             return np.isfinite(hit_times) & (hit_times >= lo) & (hit_times <= hi), lo, hi
         if hit_times.size == 0:
             return np.zeros(0, dtype=bool), 0.0, 17.0
-        counts, edges = np.histogram(hit_times, bins=np.arange(0.0, 2000.0, 1.0))
+        counts, edges = np.histogram(
+            hit_times,
+            bins=np.arange(
+                0.0, float(PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS) + 1.0, 1.0
+            ),
+        )
+        if not np.any(counts):
+            raise ValueError(
+                "event has no digitized hit in the WCSim primary-prompt "
+                f"search window [0, {PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS:g}) ns"
+            )
         peak = int(np.argmax(counts))
         hi = float(edges[min(peak + 5, len(edges) - 1)])
         lo = 0.0
@@ -12102,6 +13157,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             "joint_exact_sweeps": int(JOINT_EXACT_SWEEPS),
             "adaptive_exact_polish": bool(ADAPTIVE_EXACT_POLISH),
             "stable_prompt_window_gaussian_tails": True,
+            "primary_prompt_peak_search_max_ns": float(
+                PRIMARY_PROMPT_PEAK_SEARCH_MAX_NS
+            ),
         }
 
 
@@ -14843,16 +15901,21 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             allow_adaptive=True,
             initial_steps_override=None,
             run_final_t0_profile=True,
+            objective_override=None,
         ):
             exact_fval, index, proxy_result, start_values, exact_chart, initial_t0_profile = row
             start_hypothesis = _seed_start_hypothesis(event_seeds[int(index)])
-            exact_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                exact_chart,
-                exact_mode,
-                proxy=False,
-                start_hypothesis=start_hypothesis,
+            exact_objective = (
+                objective_override
+                if objective_override is not None
+                else make_objective(
+                    obs_pes,
+                    obs_ts,
+                    exact_chart,
+                    exact_mode,
+                    proxy=False,
+                    start_hypothesis=start_hypothesis,
+                )
             )
             exact_result = track_aligned_block_optimize(
                 exact_objective,
@@ -14923,6 +15986,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 allow_adaptive=False,
                 initial_steps_override=_optimizer_continuation_steps(source),
                 run_final_t0_profile=False,
+                objective_override=(
+                    fit_payload["objective"]
+                    if _env_bool("LF_EXACT_OBJECTIVE_REUSE", True)
+                    else None
+                ),
             )
             target = continued["result"]
             target.nfcn += int(source.nfcn)
@@ -19986,11 +21054,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
     ):
         """Compile/cache every production objective branch outside timed fits.
 
-        For ``NPROC == 1`` this runs in the serial process. For ``NPROC > 1`` it is
-        called by the worker initializer *after* the worker has been forked. It must
-        never run in the multiprocessing parent: several Numba and native receiver
-        kernels use GNU OpenMP, and forking after libgomp has entered a parallel
-        region is unsafe and terminates the children.
+        This runs only in a serial fit process or disposable serial bootstrap.
+        Production pool initializers deliberately never call it: workers load the
+        bootstrap's verified cache on their first task, keeping initialization
+        bounded and free of fallible physics work.
         """
         native_saved = bool(getattr(
             EMITTER_TEMPLATE, "photon_scatter_native_receiver", False
@@ -20006,6 +21073,7 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
             )
             seed = dict(SEEDS[int(np.argmin(scores))])
             start_hypothesis = _seed_start_hypothesis(seed)
+            preload_robust_causal_timing_score_numba()
             values, chart = seed_values_and_chart_for_fit(seed)
             for name, value in FIXED_PARAMS.items():
                 if name != "direction" and name in values:
@@ -20427,8 +21495,13 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
 
         # Construct a status-only event to establish the immutable PMT ordering.
         empty = event_from_wcsim([], [], [])
-        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = EMITTER_TEMPLATE.get_pmt_placements(
-            empty, WCD, "design"
+        from LicketyFit.runtime_cache import cached_pmt_placements
+        P_LOCATIONS, PMT_NORMALS, PMT_SLOTS = cached_pmt_placements(
+            lambda: EMITTER_TEMPLATE.get_pmt_placements(empty, WCD, "design"),
+            geometry_file=GEOMETRY_FILE,
+            place_info="design",
+            mpmt_status=empty.mpmt_status,
+            pmt_status=empty.pmt_status,
         )
         P_LOCATIONS = np.ascontiguousarray(P_LOCATIONS, dtype=np.float64)
         PMT_NORMALS = np.ascontiguousarray(PMT_NORMALS, dtype=np.float64)
@@ -20890,12 +21963,13 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
 
 
     def _initialize_event_worker():
-        """Initialize thread runtimes and warm fit kernels inside a forked worker.
+        """Apply the bounded, no-physics worker thread contract.
 
-        The parent intentionally prepares only OpenMP-free geometry, event arrays,
-        tables and proxy state. Every worker then initializes GNU OpenMP/Numba and
-        the native molecular-scattering receiver in its own process. This preserves
-        copy-on-write sharing without the unsafe ``fork-after-OpenMP`` sequence.
+        Full kernel/model warm-up must not run in ``Pool`` initializers.  If a
+        fallible native or compiled warm-up exits here, ``multiprocessing.Pool``
+        silently respawns replacements and a blocking map can wait forever.  The
+        disposable bootstrap executes a real fit under the production NPROC
+        contract; production workers load its verified cache on their first task.
         """
         if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
             os.environ["OMP_NUM_THREADS"] = "1"
@@ -20906,33 +21980,29 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 pass
             if EMITTER_TEMPLATE is not None:
                 EMITTER_TEMPLATE.photon_scatter_native_threads = 1
-
-        if (
-            WARM_FIT_KERNELS
-            and OBS_PES_ALL is not None
-            and OBS_TS_ALL is not None
-            and OBS_PROMPT_MIN_ALL is not None
-            and OBS_PROMPT_MAX_ALL is not None
-            and len(OBS_PES_ALL) > 0
-        ):
-            warm_fit_kernels(
-                OBS_PES_ALL[0],
-                OBS_TS_ALL[0],
-                float(OBS_PROMPT_MIN_ALL[0]),
-                float(OBS_PROMPT_MAX_ALL[0]),
-                allow_native_receiver=True,
-            )
-
+        ready_dir = os.environ.get(
+            "LF_RUNTIME_BOOTSTRAP_WORKER_READY_DIR", ""
+        ).strip()
+        if ready_dir:
+            try:
+                (Path(ready_dir) / f"{os.getpid()}.ready").write_text(
+                    f"{os.getpid()}\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
 
     def _create_persistent_event_pool(n_events):
         """Create one fork pool for the complete fit loop.
 
-        The pool is created only after geometry, tables, proxy shapes, prepared event
-        arrays and JIT warm-up have completed in the parent. Forked children inherit
-        those large read-only objects copy-on-write. Reusing one pool across batches
-        avoids repeatedly paying worker startup costs.
+        The pool is created after geometry, tables, proxy shapes, and prepared
+        event arrays are ready. Forked children inherit those large read-only
+        objects copy-on-write. Reusing one pool across batches avoids repeatedly
+        paying worker startup costs.
         """
-        worker_count = min(int(NPROC), max(1, int(n_events)))
+        if _env_bool("LF_RUNTIME_BOOTSTRAP_FORCE_ALL_WORKERS", False):
+            worker_count = max(1, int(NPROC))
+        else:
+            worker_count = min(int(NPROC), max(1, int(n_events)))
         if worker_count <= 1:
             return None
         if MP_START_METHOD != "fork":
@@ -20956,7 +22026,12 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         )
 
 
-    def run_event_batch_multiprocess(event_indices, event_pool=None):
+    def run_event_batch_multiprocess(
+        event_indices,
+        event_pool=None,
+        *,
+        on_result=None,
+    ):
         """Fit a batch serially or through the persistent event process pool.
 
         Only integer event indices enter the queue. Detector geometry, response
@@ -20968,12 +22043,60 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         if not indices:
             return []
         if event_pool is None:
-            return [fit_one_event_by_index(index) for index in indices]
-        return event_pool.map(
+            serial_results = []
+            for index in indices:
+                result = fit_one_event_by_index(index)
+                serial_results.append(result)
+                if on_result is not None:
+                    on_result(result)
+                if PRINT_LIVE_EVENT_PROGRESS and not COSMIC_CHILD_QUIET:
+                    wall_s = float(result.get("event_fit_wall_s", math.nan))
+                    accepted = bool(result.get("fit_accepted", False))
+                    print(
+                        f"  completed event {EVENT_START_INDEX + index} in "
+                        f"{wall_s:.3f} s ({'accepted' if accepted else 'rejected'})",
+                        flush=True,
+                    )
+            return serial_results
+
+        # Pool.map() hides every completed peer behind the slowest event in the
+        # wave.  If a native worker exits while holding one map slot, that slot
+        # can also remain unresolved after multiprocessing.Pool respawns the
+        # process.  Stream one task/result at a time so the parent can publish an
+        # atomic checkpoint immediately and can bound a genuinely lost result.
+        iterator = event_pool.imap_unordered(
             fit_one_event_by_index,
             indices,
-            chunksize=int(MP_CHUNKSIZE),
+            chunksize=1,
         )
+        completed = []
+        last_result_at = time.monotonic()
+        while len(completed) < len(indices):
+            timeout = float(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+            remaining = timeout - (time.monotonic() - last_result_at)
+            if remaining <= 0.0:
+                finished = {
+                    int(result["event_index"]) for result in completed
+                }
+                unresolved = [
+                    int(EVENT_START_INDEX + index)
+                    for index in indices
+                    if index not in finished
+                ]
+                raise RuntimeError(
+                    "event-worker pool produced no result for "
+                    f"{timeout:.0f} s; unresolved source event indices: "
+                    f"{unresolved}"
+                )
+            try:
+                result = iterator.next(timeout=min(5.0, remaining))
+            except mp.TimeoutError:
+                continue
+            completed.append(result)
+            last_result_at = time.monotonic()
+            if on_result is not None:
+                on_result(result)
+        return completed
 
 
     def _shutdown_event_pool(event_pool):
@@ -21070,6 +22193,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 ),
                 "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR", ""),
                 "native_cache_dir": os.environ.get("LF_NATIVE_CACHE_DIR", ""),
+                "wcsim_response_grid_fork_preload": json.loads(
+                    os.environ.get(
+                        "LF_WCSIM_RESPONSE_GRID_PRELOAD_METADATA", "{}"
+                    )
+                ),
                 "numba_threading_layer_requested": os.environ.get(
                     "NUMBA_THREADING_LAYER", "default"
                 ),
@@ -21446,6 +22574,11 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 ),
                 "expected_energy_hint_enabled": bool(WCTE_USE_EXPECTED_ENERGY_HINT),
                 "fit_mode": FIT_MODE_LABEL,
+                "seeding_mode": _PUBLIC_SEEDING_MODE,
+                "interaction_mode": _PUBLIC_INTERACTION_MODE,
+                "fit_parameter_count": (
+                    8 if _PUBLIC_INTERACTION_MODE == "absorption" else 7
+                ),
                 "optical_track_end_mode": FIT_MODE,
                 "track_topology": (
                     "automatic_finite_range_geometry_clipping"
@@ -22131,7 +23264,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
 
         setup_wall0 = time.perf_counter()
         initialize()
-        raw = read_sim_data(INPUT_FILE)
+        input_fields = list(FIT_FIELDS)
+        if _env_bool("WCSIM_USE_TRUTH_ROOT", False):
+            input_fields.extend(TRUTH_TRACK_ID_FIELDS)
+        raw = read_sim_data(INPUT_FILE, fields=input_fields)
         n_available = int(len(raw["digi_hit_time"]))
         source_start = min(int(EVENT_START_INDEX), n_available)
         n_events = min(int(TOT_EVENTS), max(0, n_available - source_start))
@@ -22173,9 +23309,9 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
         )
 
         # JIT/cache work is deliberately outside the measured event loop. The
-        # serial process can warm here. In multiprocessing mode, the parent must
-        # remain OpenMP-free until after the fork; every worker warms through the
-        # pool initializer instead.
+        # serial bootstrap phase performs the complete warm-up. Multiprocessing
+        # production parents stay OpenMP-free until after fork and their workers
+        # load the already-verified cache on the first submitted event.
         warm_wall_s = 0.0
         if WARM_FIT_KERNELS and prepared and int(NPROC) <= 1:
             warm0 = time.perf_counter()
@@ -22278,6 +23414,77 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
 
         results = []
         fit_loop_start = time.perf_counter()
+
+        def record_completed_result(result):
+            """Persist each completed peer without waiting for its slowest wave."""
+            previous_completed = len(results)
+            results.append(result)
+            results.sort(key=lambda item: int(item["event_index"]))
+            _publish_simple_fit_progress(
+                previous_completed,
+                len(results),
+                total=n_events,
+            )
+            if not SAVE_AFTER_EACH_BATCH:
+                return
+
+            elapsed = float(time.perf_counter() - fit_loop_start)
+            completed_local = {
+                int(item["event_index"]) for item in results
+            }
+            contiguous_prefix = 0
+            while contiguous_prefix in completed_local:
+                contiguous_prefix += 1
+            checkpoint = build_output(
+                results,
+                n_events_requested=n_events,
+                setup_wall_s=setup_wall_s,
+                warm_wall_s=warm_wall_s,
+                fit_loop_wall_s=elapsed,
+            )
+            completed_source_ids = [
+                int(source_start + int(item["event_index"]))
+                for item in results
+            ]
+            checkpoint["metadata"].update({
+                "checkpoint": bool(len(results) < n_events),
+                "last_completed_event_exclusive": int(
+                    source_start + contiguous_prefix
+                ),
+                "source_event_start_index": int(source_start),
+                "source_event_stop_exclusive": int(
+                    source_start + contiguous_prefix
+                ),
+                "cosmic_supervised_child": bool(COSMIC_SUPERVISED_CHILD),
+                "safe_process_generation_capacity": int(generation_capacity),
+                "process_generation_max_events": int(
+                    COSMIC_PROCESS_GENERATION_MAX_EVENTS
+                ),
+                "process_generation_tasks_per_worker": int(
+                    COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER
+                ),
+                "incremental_event_checkpoint": True,
+            })
+            checkpoint["source_event_index"] = completed_source_ids
+            if "results" in checkpoint:
+                for local_index, item in enumerate(checkpoint["results"]):
+                    event_index = int(item.get("event_index", local_index))
+                    item["local_event_index"] = event_index
+                    item["source_event_index"] = int(
+                        source_start + event_index
+                    )
+            _attach_optional_wcsim_truth(
+                checkpoint,
+                source_event_ids=completed_source_ids,
+                records=truth_records,
+                metadata=truth_metadata,
+            )
+            save_output(checkpoint)
+
+        response_grid_preload = _preload_wcsim_response_grids_for_fork(PMT_MODEL)
+        os.environ["LF_WCSIM_RESPONSE_GRID_PRELOAD_METADATA"] = json.dumps(
+            response_grid_preload, sort_keys=True
+        )
         event_pool = _create_persistent_event_pool(n_events)
         try:
             for batch_start in range(0, n_events, int(N_EVENTS_PER_BATCH)):
@@ -22286,10 +23493,10 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 )
                 batch_wall0 = time.perf_counter()
                 batch_results = run_event_batch_multiprocess(
-                    list(range(batch_start, batch_end)), event_pool=event_pool
+                    list(range(batch_start, batch_end)),
+                    event_pool=event_pool,
+                    on_result=record_completed_result,
                 )
-                results.extend(batch_results)
-                results.sort(key=lambda item: int(item["event_index"]))
                 batch_wall_s = float(time.perf_counter() - batch_wall0)
 
                 if PRINT_EVENT_RESULTS:
@@ -22312,60 +23519,6 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                         flush=True,
                     )
 
-                if SAVE_AFTER_EACH_BATCH:
-                    elapsed = float(time.perf_counter() - fit_loop_start)
-                    checkpoint = build_output(
-                        results,
-                        n_events_requested=n_events,
-                        setup_wall_s=setup_wall_s,
-                        warm_wall_s=warm_wall_s,
-                        fit_loop_wall_s=elapsed,
-                    )
-                    completed_source_ids = [
-                        int(source_start + int(result["event_index"]))
-                        for result in results
-                    ]
-                    checkpoint["metadata"].update({
-                        "checkpoint": bool(batch_end < n_events),
-                        "last_completed_event_exclusive": int(
-                            source_start + batch_end
-                        ),
-                        "source_event_start_index": int(source_start),
-                        "source_event_stop_exclusive": int(
-                            source_start + batch_end
-                        ),
-                        "cosmic_supervised_child": bool(
-                            COSMIC_SUPERVISED_CHILD
-                        ),
-                        "safe_process_generation_capacity": int(
-                            generation_capacity
-                        ),
-                        "process_generation_max_events": int(
-                            COSMIC_PROCESS_GENERATION_MAX_EVENTS
-                        ),
-                        "process_generation_tasks_per_worker": int(
-                            COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER
-                        ),
-                    })
-                    checkpoint["source_event_index"] = completed_source_ids
-                    if "results" in checkpoint:
-                        for local_index, result in enumerate(
-                            checkpoint["results"]
-                        ):
-                            event_index = int(
-                                result.get("event_index", local_index)
-                            )
-                            result["local_event_index"] = event_index
-                            result["source_event_index"] = int(
-                                source_start + event_index
-                            )
-                    _attach_optional_wcsim_truth(
-                        checkpoint,
-                        source_event_ids=completed_source_ids,
-                        records=truth_records,
-                        metadata=truth_metadata,
-                    )
-                    save_output(checkpoint)
         finally:
             if event_pool is not None:
                 _shutdown_event_pool(event_pool)
@@ -22872,6 +24025,16 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     MP_START_METHOD = os.environ.get("LF_MP_START_METHOD", "fork").strip().lower()
     MP_CHUNKSIZE = max(1, _env_int("LF_MP_CHUNKSIZE", 1))
     MP_MAX_TASKS_PER_CHILD = max(0, _env_int("LF_MP_MAX_TASKS_PER_CHILD", 0))
+    EVENT_RESULT_STALL_TIMEOUT_SECONDS = _env_float(
+        "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS", 540.0
+    )
+    if (
+        not math.isfinite(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+        or EVENT_RESULT_STALL_TIMEOUT_SECONDS <= 0.0
+    ):
+        raise ValueError(
+            "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS must be finite and positive"
+        )
     SAVE_AFTER_EACH_BATCH = _env_bool("SAVE_AFTER_EACH_BATCH", True)
     ALLOW_NESTED_PARALLELISM = _env_bool("ALLOW_NESTED_PARALLELISM", False)
 
@@ -23340,6 +24503,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     MCS_COHERENT_JOINT_MODEL_CACHE_SIZE = _env_int(
         "MCS_COHERENT_JOINT_MODEL_CACHE_SIZE", 32
     )
+    MCS_COHERENT_NUMBA_THREADS = int(_MCS_COHERENT_NUMBA_THREADS_REQUESTED)
     # PMT response used by the current analytic likelihood.
     PMT_SINGLE_PE_AMP_MEAN = _env_float("PMT_SINGLE_PE_AMP_MEAN", 1.0)
     PMT_SINGLE_PE_AMP_STD = _env_float("PMT_SINGLE_PE_AMP_STD", 0.3)
@@ -27164,11 +28328,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     ):
         """Compile/cache every production objective branch outside timed fits.
 
-        For ``NPROC == 1`` this runs in the serial process. For ``NPROC > 1`` it is
-        called by the worker initializer *after* the worker has been forked. It must
-        never run in the multiprocessing parent: several Numba and native receiver
-        kernels use GNU OpenMP, and forking after libgomp has entered a parallel
-        region is unsafe and terminates the children.
+        This runs only in a serial fit process or disposable serial bootstrap.
+        Production pool initializers deliberately never call it: workers load the
+        bootstrap's verified cache on their first task, keeping initialization
+        bounded and free of fallible physics work.
         """
         native_saved = bool(getattr(
             EMITTER_TEMPLATE, "photon_scatter_native_receiver", False
@@ -27659,12 +28822,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
 
     def _initialize_event_worker():
-        """Initialize thread runtimes and warm fit kernels inside a forked worker.
+        """Apply the bounded, no-physics worker thread contract.
 
-        The parent intentionally prepares only OpenMP-free geometry, event arrays,
-        tables and proxy state. Every worker then initializes GNU OpenMP/Numba and
-        the native molecular-scattering receiver in its own process. This preserves
-        copy-on-write sharing without the unsafe ``fork-after-OpenMP`` sequence.
+        Full kernel/model warm-up must not run in ``Pool`` initializers.  If a
+        fallible native or compiled warm-up exits here, ``multiprocessing.Pool``
+        silently respawns replacements and a blocking map can wait forever.  The
+        disposable bootstrap executes a real fit under the production NPROC
+        contract; production workers load its verified cache on their first task.
         """
         if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
             os.environ["OMP_NUM_THREADS"] = "1"
@@ -27675,33 +28839,29 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 pass
             if EMITTER_TEMPLATE is not None:
                 EMITTER_TEMPLATE.photon_scatter_native_threads = 1
-
-        if (
-            WARM_FIT_KERNELS
-            and OBS_PES_ALL is not None
-            and OBS_TS_ALL is not None
-            and OBS_PROMPT_MIN_ALL is not None
-            and OBS_PROMPT_MAX_ALL is not None
-            and len(OBS_PES_ALL) > 0
-        ):
-            warm_fit_kernels(
-                OBS_PES_ALL[0],
-                OBS_TS_ALL[0],
-                float(OBS_PROMPT_MIN_ALL[0]),
-                float(OBS_PROMPT_MAX_ALL[0]),
-                allow_native_receiver=True,
-            )
-
+        ready_dir = os.environ.get(
+            "LF_RUNTIME_BOOTSTRAP_WORKER_READY_DIR", ""
+        ).strip()
+        if ready_dir:
+            try:
+                (Path(ready_dir) / f"{os.getpid()}.ready").write_text(
+                    f"{os.getpid()}\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
 
     def _create_persistent_event_pool(n_events):
         """Create one fork pool for the complete fit loop.
 
-        The pool is created only after geometry, tables, proxy shapes, prepared event
-        arrays and JIT warm-up have completed in the parent. Forked children inherit
-        those large read-only objects copy-on-write. Reusing one pool across batches
-        avoids repeatedly paying worker startup costs.
+        The pool is created after geometry, tables, proxy shapes, and prepared
+        event arrays are ready. Forked children inherit those large read-only
+        objects copy-on-write. Reusing one pool across batches avoids repeatedly
+        paying worker startup costs.
         """
-        worker_count = min(int(NPROC), max(1, int(n_events)))
+        if _env_bool("LF_RUNTIME_BOOTSTRAP_FORCE_ALL_WORKERS", False):
+            worker_count = max(1, int(NPROC))
+        else:
+            worker_count = min(int(NPROC), max(1, int(n_events)))
         if worker_count <= 1:
             return None
         if MP_START_METHOD != "fork":
@@ -27725,7 +28885,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         )
 
 
-    def run_event_batch_multiprocess(event_indices, event_pool=None):
+    def run_event_batch_multiprocess(
+        event_indices,
+        event_pool=None,
+        *,
+        on_result=None,
+    ):
         """Fit a batch serially or through the persistent event process pool.
 
         Only integer event indices enter the queue. Detector geometry, response
@@ -27737,12 +28902,49 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         if not indices:
             return []
         if event_pool is None:
-            return [fit_one_event_by_index(index) for index in indices]
-        return event_pool.map(
+            serial_results = []
+            for index in indices:
+                result = fit_one_event_by_index(index)
+                serial_results.append(result)
+                if on_result is not None:
+                    on_result(result)
+            return serial_results
+
+        # Stream individual results so completed events are observable and a
+        # lost native-worker result cannot block the whole wave indefinitely.
+        iterator = event_pool.imap_unordered(
             fit_one_event_by_index,
             indices,
-            chunksize=int(MP_CHUNKSIZE),
+            chunksize=1,
         )
+        completed = []
+        last_result_at = time.monotonic()
+        while len(completed) < len(indices):
+            timeout = float(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+            remaining = timeout - (time.monotonic() - last_result_at)
+            if remaining <= 0.0:
+                finished = {
+                    int(result["event_index"]) for result in completed
+                }
+                unresolved = [
+                    int(OBS_SOURCE_INPUT_INDEX_ALL[index])
+                    for index in indices
+                    if index not in finished
+                ]
+                raise RuntimeError(
+                    "event-worker pool produced no result for "
+                    f"{timeout:.0f} s; unresolved source event indices: "
+                    f"{unresolved}"
+                )
+            try:
+                result = iterator.next(timeout=min(5.0, remaining))
+            except mp.TimeoutError:
+                continue
+            completed.append(result)
+            last_result_at = time.monotonic()
+            if on_result is not None:
+                on_result(result)
+        return completed
 
 
     def print_event_result(result, completed, total):
@@ -27873,6 +29075,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 "fit_particle_raw": FIT_PARTICLE_RAW,
                 "expected_ke_mev_seed_guidance": float(ENERGY_TRUE),
                 "fit_mode": _PUBLIC_FIT_MODE,
+                "seeding_mode": _PUBLIC_SEEDING_MODE,
+                "interaction_mode": _PUBLIC_INTERACTION_MODE,
+                "fit_parameter_count": (
+                    8 if _PUBLIC_INTERACTION_MODE == "absorption" else 7
+                ),
                 "optical_track_end_mode": FIT_MODE,
                 "full_length_semantics": (
                     {
@@ -28471,9 +29678,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         n_events = int(len(prepared))
 
         # JIT/cache work is deliberately outside the measured event loop. The
-        # serial process can warm here. In multiprocessing mode, the parent must
-        # remain OpenMP-free until after the fork; every worker warms through the
-        # pool initializer instead.
+        # serial bootstrap phase performs the complete warm-up. Multiprocessing
+        # production parents stay OpenMP-free until after fork and their workers
+        # load the already-verified cache on the first submitted event.
         warm_wall_s = 0.0
         if WARM_FIT_KERNELS and prepared and int(NPROC) <= 1:
             warm0 = time.perf_counter()
@@ -28543,6 +29750,18 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
         results = []
         fit_loop_start = time.perf_counter()
+        progress_completed = 0
+
+        def record_fit_progress(_result):
+            nonlocal progress_completed
+            previous_completed = progress_completed
+            progress_completed += 1
+            _publish_simple_fit_progress(
+                previous_completed,
+                progress_completed,
+                total=n_events,
+            )
+
         event_pool = _create_persistent_event_pool(n_events)
         try:
             for batch_start in range(0, n_events, int(N_EVENTS_PER_BATCH)):
@@ -28550,7 +29769,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 event_indices = list(range(batch_start, batch_end))
                 batch_wall0 = time.perf_counter()
                 batch_results = run_event_batch_multiprocess(
-                    event_indices, event_pool=event_pool
+                    event_indices,
+                    event_pool=event_pool,
+                    on_result=record_fit_progress,
                 )
                 results.extend(batch_results)
                 results.sort(key=lambda item: int(item["event_index"]))
@@ -28592,9 +29813,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     if PRINT_CHECKPOINT_MESSAGES:
                         print(f"  checkpoint saved: {OUTPUT_FILE}", flush=True)
         finally:
-            if event_pool is not None:
-                event_pool.close()
-                event_pool.join()
+            _terminate_event_pool(event_pool)
 
         total_wall = float(time.perf_counter() - fit_loop_start)
         output = build_output(
@@ -29068,6 +30287,16 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     COSMIC_PROCESS_GENERATION_TASKS_PER_WORKER = max(
         1, _env_int("LF_COSMIC_GENERATION_TASKS_PER_WORKER", 10)
     )
+    EVENT_RESULT_STALL_TIMEOUT_SECONDS = _env_float(
+        "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS", 540.0
+    )
+    if (
+        not math.isfinite(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+        or EVENT_RESULT_STALL_TIMEOUT_SECONDS <= 0.0
+    ):
+        raise ValueError(
+            "LF_EVENT_RESULT_STALL_TIMEOUT_SECONDS must be finite and positive"
+        )
     SAVE_AFTER_EACH_BATCH = _env_bool("SAVE_AFTER_EACH_BATCH", True)
     ALLOW_NESTED_PARALLELISM = _env_bool("ALLOW_NESTED_PARALLELISM", False)
 
@@ -30286,6 +31515,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         safeguarded_log_parabolic_range_candidate,
         build_tangent_direction_fan,
         pivot_reference_for_direction_fan,
+        preload_robust_causal_timing_score_numba,
         refine_local_causal_timing_lines,
     )
     from LicketyFit.multilateration_seeding import (
@@ -36220,16 +37450,21 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             allow_adaptive=True,
             initial_steps_override=None,
             run_final_t0_profile=True,
+            objective_override=None,
         ):
             exact_fval, index, proxy_result, start_values, exact_chart, initial_t0_profile = row
             start_hypothesis = _seed_start_hypothesis(event_seeds[int(index)])
-            exact_objective = make_objective(
-                obs_pes,
-                obs_ts,
-                exact_chart,
-                exact_mode,
-                proxy=False,
-                start_hypothesis=start_hypothesis,
+            exact_objective = (
+                objective_override
+                if objective_override is not None
+                else make_objective(
+                    obs_pes,
+                    obs_ts,
+                    exact_chart,
+                    exact_mode,
+                    proxy=False,
+                    start_hypothesis=start_hypothesis,
+                )
             )
             exact_result = track_aligned_block_optimize(
                 exact_objective,
@@ -36300,6 +37535,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 allow_adaptive=False,
                 initial_steps_override=_optimizer_continuation_steps(source),
                 run_final_t0_profile=False,
+                objective_override=(
+                    fit_payload["objective"]
+                    if _env_bool("LF_EXACT_OBJECTIVE_REUSE", True)
+                    else None
+                ),
             )
             target = continued["result"]
             target.nfcn += int(source.nfcn)
@@ -41619,11 +42859,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     ):
         """Compile/cache every production objective branch outside timed fits.
 
-        For ``NPROC == 1`` this runs in the serial process. For ``NPROC > 1`` it is
-        called by the worker initializer *after* the worker has been forked. It must
-        never run in the multiprocessing parent: several Numba and native receiver
-        kernels use GNU OpenMP, and forking after libgomp has entered a parallel
-        region is unsafe and terminates the children.
+        This runs only in a serial fit process or disposable serial bootstrap.
+        Production pool initializers deliberately never call it: workers load the
+        bootstrap's verified cache on their first task, keeping initialization
+        bounded and free of fallible physics work.
         """
         native_saved = bool(getattr(
             EMITTER_TEMPLATE, "photon_scatter_native_receiver", False
@@ -41639,6 +42878,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             )
             seed = dict(SEEDS[int(np.argmin(scores))])
             start_hypothesis = _seed_start_hypothesis(seed)
+            preload_robust_causal_timing_score_numba()
             values, chart = seed_values_and_chart_for_fit(seed)
             for name, value in FIXED_PARAMS.items():
                 if name != "direction" and name in values:
@@ -42536,12 +43776,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
 
 
     def _initialize_event_worker():
-        """Initialize thread runtimes and warm fit kernels inside a forked worker.
+        """Apply the bounded, no-physics worker thread contract.
 
-        The parent intentionally prepares only OpenMP-free geometry, event arrays,
-        tables and proxy state. Every worker then initializes GNU OpenMP/Numba and
-        the native molecular-scattering receiver in its own process. This preserves
-        copy-on-write sharing without the unsafe ``fork-after-OpenMP`` sequence.
+        Full kernel/model warm-up must not run in ``Pool`` initializers.  If a
+        fallible native or compiled warm-up exits here, ``multiprocessing.Pool``
+        silently respawns replacements and a blocking map can wait forever.  The
+        disposable bootstrap executes a real fit under the production NPROC
+        contract; production workers load its verified cache on their first task.
         """
         if NPROC > 1 and not ALLOW_NESTED_PARALLELISM:
             os.environ["OMP_NUM_THREADS"] = "1"
@@ -42552,33 +43793,29 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 pass
             if EMITTER_TEMPLATE is not None:
                 EMITTER_TEMPLATE.photon_scatter_native_threads = 1
-
-        if (
-            WARM_FIT_KERNELS
-            and OBS_PES_ALL is not None
-            and OBS_TS_ALL is not None
-            and OBS_PROMPT_MIN_ALL is not None
-            and OBS_PROMPT_MAX_ALL is not None
-            and len(OBS_PES_ALL) > 0
-        ):
-            warm_fit_kernels(
-                OBS_PES_ALL[0],
-                OBS_TS_ALL[0],
-                float(OBS_PROMPT_MIN_ALL[0]),
-                float(OBS_PROMPT_MAX_ALL[0]),
-                allow_native_receiver=True,
-            )
-
+        ready_dir = os.environ.get(
+            "LF_RUNTIME_BOOTSTRAP_WORKER_READY_DIR", ""
+        ).strip()
+        if ready_dir:
+            try:
+                (Path(ready_dir) / f"{os.getpid()}.ready").write_text(
+                    f"{os.getpid()}\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
 
     def _create_persistent_event_pool(n_events):
         """Create one fork pool for the complete fit loop.
 
-        The pool is created only after geometry, tables, proxy shapes, prepared event
-        arrays and JIT warm-up have completed in the parent. Forked children inherit
-        those large read-only objects copy-on-write. Reusing one pool across batches
-        avoids repeatedly paying worker startup costs.
+        The pool is created after geometry, tables, proxy shapes, and prepared
+        event arrays are ready. Forked children inherit those large read-only
+        objects copy-on-write. Reusing one pool across batches avoids repeatedly
+        paying worker startup costs.
         """
-        worker_count = min(int(NPROC), max(1, int(n_events)))
+        if _env_bool("LF_RUNTIME_BOOTSTRAP_FORCE_ALL_WORKERS", False):
+            worker_count = max(1, int(NPROC))
+        else:
+            worker_count = min(int(NPROC), max(1, int(n_events)))
         if worker_count <= 1:
             return None
         if MP_START_METHOD != "fork":
@@ -42602,7 +43839,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         )
 
 
-    def run_event_batch_multiprocess(event_indices, event_pool=None):
+    def run_event_batch_multiprocess(
+        event_indices,
+        event_pool=None,
+        *,
+        on_result=None,
+    ):
         """Fit a batch serially or through the persistent event process pool.
 
         Only integer event indices enter the queue. Detector geometry, response
@@ -42614,12 +43856,49 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         if not indices:
             return []
         if event_pool is None:
-            return [fit_one_event_by_index(index) for index in indices]
-        return event_pool.map(
+            serial_results = []
+            for index in indices:
+                result = fit_one_event_by_index(index)
+                serial_results.append(result)
+                if on_result is not None:
+                    on_result(result)
+            return serial_results
+
+        # Stream individual results so completed events are observable and a
+        # lost native-worker result cannot block the whole wave indefinitely.
+        iterator = event_pool.imap_unordered(
             fit_one_event_by_index,
             indices,
-            chunksize=int(MP_CHUNKSIZE),
+            chunksize=1,
         )
+        completed = []
+        last_result_at = time.monotonic()
+        while len(completed) < len(indices):
+            timeout = float(EVENT_RESULT_STALL_TIMEOUT_SECONDS)
+            remaining = timeout - (time.monotonic() - last_result_at)
+            if remaining <= 0.0:
+                finished = {
+                    int(result["event_index"]) for result in completed
+                }
+                unresolved = [
+                    int(OBS_SOURCE_INPUT_INDEX_ALL[index])
+                    for index in indices
+                    if index not in finished
+                ]
+                raise RuntimeError(
+                    "event-worker pool produced no result for "
+                    f"{timeout:.0f} s; unresolved source event indices: "
+                    f"{unresolved}"
+                )
+            try:
+                result = iterator.next(timeout=min(5.0, remaining))
+            except mp.TimeoutError:
+                continue
+            completed.append(result)
+            last_result_at = time.monotonic()
+            if on_result is not None:
+                on_result(result)
+        return completed
 
 
     def _shutdown_event_pool(event_pool):
@@ -43101,6 +44380,11 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                     WCTE_USE_EXPECTED_ENERGY_HINT
                 ),
                 "fit_mode": FIT_MODE_LABEL,
+                "seeding_mode": _PUBLIC_SEEDING_MODE,
+                "interaction_mode": _PUBLIC_INTERACTION_MODE,
+                "fit_parameter_count": (
+                    8 if _PUBLIC_INTERACTION_MODE == "absorption" else 7
+                ),
                 "optical_track_end_mode": FIT_MODE,
                 "track_topology": (
                     "automatic_finite_range_geometry_clipping"
@@ -43986,8 +45270,9 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
         n_events = int(len(prepared))
 
         # JIT/cache work is deliberately outside the measured event loop. The
-        # serial process can warm here. In multiprocessing mode the parent remains
-        # OpenMP-free until after fork; each worker warms in its initializer.
+        # serial bootstrap phase performs the complete warm-up. Multiprocessing
+        # production parents stay OpenMP-free until after fork and their workers
+        # load the already-verified cache on the first submitted event.
         warm_wall_s = 0.0
         if WARM_FIT_KERNELS and prepared and int(NPROC) <= 1:
             warm0 = time.perf_counter()
@@ -44094,10 +45379,24 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
             )
 
         fit_loop_start = time.perf_counter()
+        progress_completed = 0
+
+        def record_fit_progress(_result):
+            nonlocal progress_completed
+            previous_completed = progress_completed
+            progress_completed += 1
+            _publish_simple_fit_progress(
+                previous_completed,
+                progress_completed,
+                total=n_events,
+            )
+
         event_pool = _create_persistent_event_pool(n_events)
         try:
             results = run_event_batch_multiprocess(
-                list(range(n_events)), event_pool=event_pool
+                list(range(n_events)),
+                event_pool=event_pool,
+                on_result=record_fit_progress,
             )
         finally:
             if event_pool is not None:
