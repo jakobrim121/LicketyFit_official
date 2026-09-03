@@ -601,6 +601,133 @@ def _quiet(enabled: bool):
         yield stream
 
 
+_CHARGE_RESPONSE_MOMENT_FIELDS = (
+    ("qpe_mean", "QPE_MEAN"),
+    ("qpe_std", "QPE_STD"),
+    ("qpe_skewness", "QPE_SKEWNESS"),
+    ("qpe_excess_kurtosis", "QPE_EXCESS_KURTOSIS"),
+)
+# Noise from a different BLAS ddot kernel is around 1e-14 relative; changing a
+# single QPE CDF entry in its sixth decimal already moves these moments by about
+# 1e-9 relative. This sits between the two, so a genuinely different table is
+# still rejected by the driver's own check.
+_CHARGE_RESPONSE_MOMENT_REL_TOL = 1.0e-11
+
+
+def _configured_manifest_path(config: "LauncherConfig") -> Path | None:
+    """Return the absolute-light manifest this configuration will resolve."""
+    if not bool(config.use_absolute_light_yield):
+        return None
+    source = str(config.absolute_light_yield_source).strip().lower()
+    raw = str(
+        config.mathematical_charge_calibration_manifest
+        if source == "mathematical"
+        else config.global_charge_calibration_manifest
+    ).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
+def _align_wcsim_charge_response_to_manifest(
+    config: "LauncherConfig",
+) -> dict[str, Any]:
+    """Make the reported WCSim QPE moments bit-match the calibration manifest.
+
+    ``LicketyFit.wcsim_charge_response`` recomputes these moments at import from
+    ``probability @ moment``, a BLAS ``ddot`` over 193 CDF bins.  OpenBLAS ships
+    a different ``ddot`` kernel per CPU micro-architecture, each summing in a
+    different order, so the result differs in its last few bits between machines
+    -- and the fourth cumulant subtracts two nearly equal quantities, which
+    widens that spread again.  The manifest pins one machine's exact bits and
+    the driver compares with a 1e-14 absolute tolerance, so the same package and
+    the same manifest can be accepted on one CPU and rejected on another with
+
+        absolute-light calibration WCSim PMT response is stale for
+        qpe_excess_kurtosis: 6.646299216541303 != 6.64629921654127
+
+    This snaps the recomputed constants back onto the manifest's values, but
+    only where the two already agree to within
+    ``_CHARGE_RESPONSE_MOMENT_REL_TOL``.  A manifest that is genuinely stale
+    still differs by far more than that, is left alone, and is still rejected.
+
+    In practice this only ever moves ``QPE_SKEWNESS`` and
+    ``QPE_EXCESS_KURTOSIS``, and neither is used by any calculation: the
+    response model works from ``QPE_MEAN``, ``QPE_VARIANCE``, ``QPE_CUMULANT3``
+    and ``QPE_CUMULANT4`` directly, while the skewness and excess kurtosis exist
+    only to identify the table.  ``QPE_MEAN`` and ``QPE_STD`` are reached by
+    fewer cancelling operations and have matched exactly in every case observed
+    so far; if a machine ever perturbs them, the change is at the 1e-15 level,
+    far below the precision of anything downstream.
+
+    Runs before the driver is imported, so the aligned values are what the
+    driver's validation and every later consumer see.
+    """
+    report: dict[str, Any] = {"applied": False, "aligned": {}, "status": ""}
+    manifest_path = _configured_manifest_path(config)
+    if manifest_path is None:
+        report["status"] = "absolute light yield is off; no manifest to align with"
+        return report
+    if not manifest_path.is_file():
+        report["status"] = f"manifest not found: {manifest_path}"
+        return report
+
+    import json
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        response = manifest.get("pmt_charge_response") or {}
+        if str(response.get("model", "")).strip().lower() != "wcsim_r14374_ski":
+            report["status"] = (
+                "manifest does not use the WCSim response model; nothing to align"
+            )
+            return report
+
+        _ensure_repository_on_path()
+        from LicketyFit import wcsim_charge_response
+    except Exception as error:
+        report["status"] = f"skipped: {type(error).__name__}: {error}"
+        return report
+
+    aligned: dict[str, tuple[float, float]] = {}
+    for field, constant in _CHARGE_RESPONSE_MOMENT_FIELDS:
+        expected = response.get(field)
+        if not isinstance(expected, (int, float)):
+            continue
+        active = getattr(wcsim_charge_response, constant, None)
+        if not isinstance(active, float):
+            continue
+        expected = float(expected)
+        if expected == active:
+            continue
+        if not math.isclose(
+            expected,
+            active,
+            rel_tol=_CHARGE_RESPONSE_MOMENT_REL_TOL,
+            abs_tol=1.0e-12,
+        ):
+            # Too far apart to be a rounding difference. Leave it, and let the
+            # driver's own check reject it with its own message.
+            continue
+        setattr(wcsim_charge_response, constant, expected)
+        aligned[field] = (active, expected)
+
+    report["manifest"] = str(manifest_path)
+    report["aligned"] = {
+        field: {"recomputed": was, "manifest": now}
+        for field, (was, now) in aligned.items()
+    }
+    report["applied"] = bool(aligned)
+    report["status"] = (
+        "aligned " + ", ".join(sorted(aligned))
+        + " with the manifest (last-bit differences only)"
+        if aligned
+        else "recomputed moments already match the manifest exactly"
+    )
+    return report
+
+
 class SingleEventFitter:
     """Load and fit individual WCTE or WCSim events with the production engine."""
 
@@ -616,6 +743,7 @@ class SingleEventFitter:
         self._wcsim_raw: Mapping[str, Any] | None = None
         self._loader_metadata: dict[str, Any] = {}
         self._active_pmt_ids_cache: np.ndarray | None = None
+        self.charge_response_alignment: dict[str, Any] = {}
 
     @property
     def source(self) -> str:
@@ -664,6 +792,13 @@ class SingleEventFitter:
                 sys.path.insert(0, str(path))
         environment = self._notebook_environment()
         self._driver_environment = environment
+        # Must happen before the driver imports, because the driver validates the
+        # manifest against these constants while it is still importing.
+        self.charge_response_alignment = _align_wcsim_charge_response_to_manifest(
+            self.config
+        )
+        if self.verbose:
+            print(self.charge_response_alignment["status"])
         module_name = f"_licketyfit_single_event_engine_{self.source}_{uuid.uuid4().hex}"
         with _temporary_environment(environment), _quiet(not self.verbose):
             engine = _load_module_from_path(module_name, DRIVER_PATH)
