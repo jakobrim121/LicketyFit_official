@@ -12,6 +12,22 @@ The configuration classes mirror every public setting in ``run_wcte.py`` and
 The notebook layer forces serial execution and
 suppresses batch checkpoint/output behavior because one interactive fit runs in
 the notebook process.
+
+Reconstruction mode is two independent public axes, not one ``FIT_MODE``:
+
+===================  ==================  ===========================
+``seeding_mode``     ``interaction_mode``  retired ``FIT_MODE`` name
+===================  ==================  ===========================
+``beam``             ``full_length``     ``full_length`` / ``beam``
+``general``          ``full_length``     ``cosmic``
+``general``          ``absorption``      ``absorption``
+``beam``             ``absorption``      (had no legacy name)
+===================  ==================  ===========================
+
+``LauncherConfig.reconstruction()`` reports how a chosen pair routes through the
+shared rules in :mod:`LicketyFit.run_configuration`, including which MCS
+selector is actually live.  Passing the retired ``fit_mode`` keyword raises a
+message naming the replacement pair instead of a generic unknown-option list.
 """
 
 from __future__ import annotations
@@ -39,6 +55,35 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 DRIVER_PATH = SCRIPT_DIR / "batch_fit_driver.py"
 
 _LAUNCHER_CACHE: dict[str, ModuleType] = {}
+
+# Settings that older notebooks and launch scripts still pass.  A generic
+# "unknown option" message followed by a hundred valid names is not useful here,
+# so name the replacement directly.
+_LEGACY_FIT_MODE_REPLACEMENT = {
+    "beam": "seeding_mode='beam', interaction_mode='full_length'",
+    "full_length": "seeding_mode='beam', interaction_mode='full_length'",
+    "cosmic": "seeding_mode='general', interaction_mode='full_length'",
+    "general": "seeding_mode='general', interaction_mode='full_length'",
+    "absorption": "seeding_mode='general', interaction_mode='absorption'",
+}
+_RETIRED_OPTION_GUIDANCE = {
+    "FIT_MODE": (
+        "Seed coverage and endpoint physics are now independent axes. Use "
+        "seeding_mode='beam' or 'general' together with "
+        "interaction_mode='full_length' or 'absorption'. The retired names map "
+        "as: "
+        + "; ".join(
+            f"{legacy!r} -> {replacement}"
+            for legacy, replacement in _LEGACY_FIT_MODE_REPLACEMENT.items()
+        )
+        + ". Read the resolved routing back with config.reconstruction()."
+    ),
+    "SEED_MODE": (
+        "The general-mode navigator setting is now "
+        "cosmic_multilateration_seed_mode ('off', 'hybrid', 'guided', "
+        "'additive', or 'primary')."
+    ),
+}
 
 
 def _canonical_internal_fit_mode(
@@ -137,9 +182,111 @@ class LauncherConfig:
         """Return launcher defaults keyed by notebook-style lowercase names."""
         return {name.lower(): value for name, value in cls.default_values().items()}
 
+    @classmethod
+    def search_options(cls, substring: str) -> dict[str, Any]:
+        """Return the launcher defaults whose option name contains ``substring``.
+
+        ``available_options()`` returns roughly a hundred names.  This narrows
+        that list when looking for, for example, every ``pid`` or ``tof``
+        setting without opening ``run_wcte.py``.
+        """
+        needle = str(substring).strip().lower()
+        return {
+            name: value
+            for name, value in cls.defaults().items()
+            if needle in name
+        }
+
+    def reconstruction(self):
+        """Return how this configuration routes through the shared model rules.
+
+        The result is the :class:`LicketyFit.run_configuration.\
+ReconstructionConfiguration` produced by the same function both launchers call.
+        Reading it before a fit shows which selectors are actually live: in
+        ``general`` + ``full_length`` the primary-MCS and coherent-implementation
+        choices are inert and ``cosmic_mcs_continuation`` is what applies, while
+        every other pair is the reverse.  It also raises the same errors the
+        launcher would, so an incompatible combination fails here instead of
+        after geometry and table setup.
+        """
+        _launcher(self.kind)  # Loaded for its sys.path side effect.
+        from LicketyFit.run_configuration import (
+            resolve_reconstruction_configuration,
+        )
+
+        return resolve_reconstruction_configuration(
+            likelihood_mode=self.likelihood_mode,
+            enable_mcs=bool(self.enable_mcs),
+            seed_mode=self.cosmic_multilateration_seed_mode,
+            primary_mcs_model=self.primary_mcs_model,
+            coherent_mcs_implementation=self.coherent_mcs_implementation,
+            cosmic_mcs_continuation=self.cosmic_mcs_continuation,
+            cosmic_joint_inference_method=self.cosmic_joint_inference_method,
+            seeding_mode=self.seeding_mode,
+            interaction_mode=self.interaction_mode,
+        )
+
+    def describe(self) -> dict[str, Any]:
+        """Return the headline settings plus the resolved reconstruction routing."""
+        resolved = self.reconstruction()
+        summary: dict[str, Any] = {
+            "source": self.kind,
+            "fit_particle": self.fit_particle,
+            "seeding_mode": resolved.seeding_mode,
+            "interaction_mode": resolved.interaction_mode,
+            "public_mode_label": resolved.public_mode_label,
+            "internal_engine_mode": resolved.internal_engine_mode,
+            "likelihood_mode": resolved.likelihood_mode,
+            "enable_delta_electrons": bool(self.enable_delta_electrons),
+            "enable_mcs": bool(self.enable_mcs),
+            "enable_reflection": bool(self.enable_reflection),
+            "enable_photon_scattering": bool(self.enable_photon_scattering),
+            "primary_mcs_model": resolved.primary_mcs_model,
+            "coherent_mcs_implementation": resolved.coherent_mcs_implementation,
+            "effective_cosmic_mcs_continuation": (
+                resolved.effective_cosmic_mcs_continuation
+            ),
+            "navigation_mode": resolved.navigation_mode,
+            "use_absolute_light_yield": bool(self.use_absolute_light_yield),
+            "absolute_light_yield_source": self.absolute_light_yield_source,
+            "charge_likelihood": self.charge_likelihood,
+            "fixed_parameters": dict(self.fixed_parameters),
+        }
+        if self.kind == "wcte":
+            summary.update({
+                "run": int(self.run),
+                "event_source": self.event_source,
+                "good_pmt_source": self.good_pmt_source,
+                "particle_selection_label": self.particle_selection_label,
+                "selection_mode": self.selection_mode,
+                "light_particle_pid_mode": self.light_particle_pid_mode,
+                "relative_efficiency_mode": self.relative_efficiency_mode,
+                "geometry_placement": self.geometry_placement,
+                "prompt_window_mode": self.prompt_window_mode,
+                "time_reference_mode": self.time_reference_mode,
+            })
+        else:
+            summary.update({
+                "input_file": self.input_file,
+                "energy_label_mev": float(self.energy_label_mev),
+                "use_wcte_geometry": bool(self.use_wcte_geometry),
+                "use_iwcd_geometry": bool(self.use_iwcd_geometry),
+                "use_truth_root": bool(self.use_truth_root),
+                "apply_wcsim_visible_range_convention": bool(
+                    self.apply_wcsim_visible_range_convention
+                ),
+            })
+        return summary
+
     def _canonical_name(self, name: str) -> str:
         canonical = str(name).strip().upper()
         if canonical not in self._values:
+            guidance = _RETIRED_OPTION_GUIDANCE.get(canonical)
+            if guidance is not None:
+                raise TypeError(
+                    f"{canonical} is no longer a {self.kind.upper()} "
+                    f"configuration option. {guidance}"
+                )
             choices = ", ".join(self.available_options())
             raise TypeError(
                 f"Unknown {self.kind.upper()} configuration option {name!r}. "
@@ -608,6 +755,69 @@ class SingleEventFitter:
         self._events = EventCollection(records, metadata=metadata)
         return self._events
 
+    def selection_summary(self) -> dict[str, Any]:
+        """Return the beam PID and cuts that produced the loaded WCTE events.
+
+        ``LIGHT_PARTICLE_PID_MODE`` decides a policy, not a fixed cut: the
+        electron/muon and muon/pion TOF boundaries are resolved per ROOT input.
+        This reports the requested mode, the mode actually applied to this
+        sample, the resolved boundaries and where each came from, whether the
+        per-boundary ACT fallback was used, and the cut list handed to
+        ``BeamSelection``.  A boundary of ``None`` was not usable for this run
+        and is not a value to copy into another run's override.
+        """
+        if self.source != "wcte":
+            raise RuntimeError(
+                "selection_summary() describes WCTE beam selection; WCSim NPZ "
+                "input has no BeamSelection stage"
+            )
+        metadata = dict(self._loader_metadata)
+        if not metadata:
+            raise RuntimeError("No events are loaded. Call load_events() first.")
+        thresholds = dict(metadata.get("selection_thresholds", {}) or {})
+        summary: dict[str, Any] = {
+            "run": int(self.config.run),
+            "event_source": str(metadata.get("event_source", self.config.event_source)),
+            "particle_selection_label": str(metadata.get("particle", "")),
+            "selection_mode": str(metadata.get("selection_mode", "")),
+            "light_particle_pid_mode": metadata.get("light_particle_pid_mode"),
+            # None here means the sample is not a nominal light-particle
+            # population, so the PID mode did not apply to it at all.
+            "light_particle_pid_mode_applied": metadata.get(
+                "light_particle_pid_mode_applied"
+            ),
+            "act_fallback_used": bool(
+                thresholds.get("light_particle_tof_fallback_used", False)
+            ),
+            "unavailable_tof_boundaries": list(
+                thresholds.get("light_particle_tof_unavailable_boundaries", ()) or ()
+            ),
+            "selection_cut_specs": list(metadata.get("selection_cut_specs", []) or []),
+            "events_returned": metadata.get("events_returned"),
+            "selected_before_hit_time_cut": metadata.get(
+                "selected_before_hit_time_cut"
+            ),
+        }
+        for name in (
+            "electron_muon_tof_boundary_ns",
+            "muon_pion_tof_boundary_ns",
+            "proton_tof_cut_ns",
+            "act_eveto_cut_pe",
+            "act_tagger_cut_pe",
+            "mu_tag_cut",
+        ):
+            summary[name] = thresholds.get(name)
+            source_name = name.replace("_ns", "").replace("_pe", "") + "_source"
+            if source_name in thresholds:
+                summary[source_name] = thresholds.get(source_name)
+        for name in (
+            "electron_muon_tof_boundary_error",
+            "muon_pion_tof_boundary_error",
+        ):
+            if thresholds.get(name):
+                summary[name] = thresholds.get(name)
+        return summary
+
     def _resolve_event(self, event: int | EventRecord) -> EventRecord:
         if isinstance(event, EventRecord):
             if event.source != self.source:
@@ -988,6 +1198,14 @@ class SingleEventFitter:
             "fit_accepted": fit_accepted,
             "objective_finite": bool(math.isfinite(fitted_fval)),
             "fval": fitted_fval,
+            # "not_requested" means MCS was switched off or routed to a stage
+            # this mode does not use; "not_applied" means it was requested and
+            # no stage produced a result. Neither is a failure by itself.
+            "mcs_status": str(raw_result.get("mcs_status", "not_requested")),
+            "mcs_applied": bool(raw_result.get("mcs_applied", False)),
+            "straight_fit_fval": float(
+                raw_result.get("straight_fit_fval", math.nan)
+            ),
             "optimizer": str(raw_result.get("optimizer", "unknown")),
             "total_objective_evaluations": int(raw_result.get("total_nfcn", 0)),
             "fit_attempts": int(len(basins) if isinstance(basins, Sequence) else 0),
@@ -1129,6 +1347,182 @@ class SingleEventFitter:
         )
 
 
+_PDG_TO_FIT_PARTICLE = {11: "electron", 13: "muon", 211: "pion", 321: "kaon", 2212: "proton"}
+
+
+def _ensure_repository_on_path() -> None:
+    """Make the packaged modules importable without first loading an engine."""
+    for path in (PROJECT_ROOT, SCRIPT_DIR):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+
+def wcsim_npz_primary_truth(
+    npz_path: str | Path,
+    event_index: int,
+    *,
+    detector: str = "wcte",
+) -> dict[str, Any]:
+    """Return one WCSim NPZ event's primary-particle truth in fitter coordinates.
+
+    This reads only the per-event primary arrays a digitized NPZ already
+    carries (``pid``, ``position``, ``direction``, ``energy``).  It is a
+    convenience for validating a fit against the sample that produced it; it is
+    not the ``AllSecondaries`` truth path, which needs the ROOT file and
+    ``use_truth_root=True``.  Nothing here is available to, or used by, the
+    likelihood.
+
+    NPZ positions are centimetres in the WCSim frame.  The fitter works in
+    millimetres in the geometry frame, and for WCTE the two differ by the prism
+    y-centre, so the transform applied is the driver's own
+    ``x_detector = 10 * x_wcsim_cm + offset_mm``.
+
+    ``csda_range_mm`` is the packaged range table evaluated at the truth kinetic
+    energy: the electromagnetic CSDA distance down to the Cherenkov threshold,
+    which is the quantity a ``full_length`` fit estimates.  WCSim muons are
+    known to travel slightly less far above threshold than this table predicts
+    (roughly 8 mm at 200 MeV rising to 27 mm at 400 MeV), so a small negative
+    length residual against this number is expected rather than a fit bias.
+    ``run_wcsim.py``'s ``APPLY_WCSIM_VISIBLE_RANGE_CONVENTION`` applies that
+    measured offset as a reporting-only correction.
+    """
+    import numpy as _np
+
+    _ensure_repository_on_path()
+    path = Path(npz_path).expanduser()
+    with _np.load(path, allow_pickle=True) as raw:
+        missing = [
+            name for name in ("pid", "position", "direction", "energy")
+            if name not in raw.files
+        ]
+        if missing:
+            raise KeyError(
+                f"{path.name} has no primary-truth arrays {missing}; it may be a "
+                "digitized-only file"
+            )
+        index = int(event_index)
+        available = int(len(raw["pid"]))
+        if not 0 <= index < available:
+            raise IndexError(
+                f"event_index {index} is outside the {available} events in {path.name}"
+            )
+        pdg = int(raw["pid"][index])
+        position_cm = _np.asarray(raw["position"][index], dtype=_np.float64)
+        direction = _np.asarray(raw["direction"][index], dtype=_np.float64)
+        total_energy_mev = float(raw["energy"][index])
+
+    kind = str(detector).strip().lower()
+    if kind == "wcte":
+        from LicketyFit.detector_geometry import WCTE_PRISM_Y_CENTER_MM
+
+        offset_mm = _np.array([0.0, float(WCTE_PRISM_Y_CENTER_MM), 0.0])
+        offset_source = "wcte_prism_y_center"
+    else:
+        offset_mm = _np.zeros(3, dtype=_np.float64)
+        offset_source = "identity_non_wcte"
+
+    norm = float(_np.linalg.norm(direction))
+    unit_direction = direction / norm if norm > 0.0 else direction
+    particle = _PDG_TO_FIT_PARTICLE.get(abs(pdg))
+
+    from particle_range_lookup import (
+        PARTICLE_MASS_MEV,
+        cherenkov_threshold_kinetic_mev,
+        particle_energy_to_range_mm,
+    )
+
+    truth: dict[str, Any] = {
+        "source_event_index": index,
+        "pdg_code": pdg,
+        "particle": particle,
+        "vertex_mm": (10.0 * position_cm + offset_mm),
+        "direction": unit_direction,
+        "total_energy_mev": total_energy_mev,
+        "coordinate_offset_mm": offset_mm,
+        "coordinate_offset_source": offset_source,
+        "coordinate_transform": "x_detector = 10*x_wcsim_cm + coordinate_offset_mm",
+        "kinetic_energy_mev": math.nan,
+        "cherenkov_threshold_kinetic_mev": math.nan,
+        "csda_range_mm": math.nan,
+    }
+    if particle is None or particle not in PARTICLE_MASS_MEV:
+        return truth
+    kinetic = total_energy_mev - float(PARTICLE_MASS_MEV[particle])
+    truth["kinetic_energy_mev"] = kinetic
+    try:
+        truth["cherenkov_threshold_kinetic_mev"] = float(
+            cherenkov_threshold_kinetic_mev(particle)
+        )
+        truth["csda_range_mm"] = float(
+            particle_energy_to_range_mm(particle, kinetic)
+        )
+    except (KeyError, ValueError, FileNotFoundError, NotImplementedError):
+        # No packaged range table for this hypothesis; the geometry truth above
+        # is still valid.
+        pass
+    return truth
+
+
+def truth_residuals(result: FitResult, truth: Mapping[str, Any]):
+    """Return fitted-minus-truth residuals for one event as a pandas table.
+
+    ``truth`` is a mapping like :func:`wcsim_npz_primary_truth` returns.  The
+    length row compares the fitted longitudinal coordinate with the truth CSDA
+    range, so read it with the WCSim range-convention caveat in that function's
+    documentation.  One event's residuals are not a bias measurement; that needs
+    the mean and the width over an ensemble.
+    """
+    import pandas as pd
+
+    if not isinstance(result, FitResult):
+        raise TypeError("result must be a FitResult")
+    estimates = dict(result.estimates)
+    vertex = np.asarray(truth["vertex_mm"], dtype=np.float64)
+    direction = np.asarray(truth["direction"], dtype=np.float64)
+    rows: list[dict[str, Any]] = []
+    for name, true_value in (
+        ("x0", vertex[0]), ("y0", vertex[1]), ("z0", vertex[2]),
+        ("cx", direction[0]), ("cy", direction[1]), ("cz", direction[2]),
+    ):
+        if name in estimates:
+            fitted = float(estimates[name])
+            rows.append({
+                "parameter": name,
+                "fitted": fitted,
+                "truth": float(true_value),
+                "residual": fitted - float(true_value),
+            })
+    length_name = next(
+        (name for name in ("length", "full_range") if name in estimates), None
+    )
+    csda = float(truth.get("csda_range_mm", math.nan))
+    if length_name is not None and math.isfinite(csda):
+        fitted_length = float(estimates[length_name])
+        rows.append({
+            "parameter": f"{length_name} vs CSDA range",
+            "fitted": fitted_length,
+            "truth": csda,
+            "residual": fitted_length - csda,
+        })
+    fitted_dir = np.asarray(
+        [estimates.get(name, math.nan) for name in ("cx", "cy", "cz")],
+        dtype=np.float64,
+    )
+    if np.all(np.isfinite(fitted_dir)) and np.linalg.norm(direction) > 0.0:
+        cosine = float(np.clip(
+            np.dot(fitted_dir, direction)
+            / (np.linalg.norm(fitted_dir) * np.linalg.norm(direction)),
+            -1.0, 1.0,
+        ))
+        rows.append({
+            "parameter": "opening angle [deg]",
+            "fitted": math.nan,
+            "truth": 0.0,
+            "residual": math.degrees(math.acos(cosine)),
+        })
+    return pd.DataFrame(rows).set_index("parameter")
+
+
 def summarize_fit(result: FitResult):
     """Display a compact statistics table and return it as a pandas Series."""
     if not isinstance(result, FitResult):
@@ -1154,4 +1548,6 @@ __all__ = [
     "FitResult",
     "SingleEventFitter",
     "summarize_fit",
+    "truth_residuals",
+    "wcsim_npz_primary_truth",
 ]
