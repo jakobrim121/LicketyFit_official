@@ -419,6 +419,72 @@ class EventCollection(Sequence[EventRecord]):
         return f"EventCollection(source={source!r}, n_events={len(self)})"
 
 
+@dataclass(frozen=True)
+class PreparedEvent:
+    """One event exactly as the likelihood sees it, before any fit.
+
+    ``EventRecord`` is raw loader output: every hit the selection or the
+    digitizer produced, over the full readout window.  This is what survives
+    LicketyFit's own preparation -- the prompt-time window, the active-PMT mask,
+    ADC-to-PE conversion and relative efficiency for WCTE, and the event
+    time-reference shift.  Displaying this rather than the raw record is what
+    makes an event display look like the data the fit actually used.
+
+    The arrays are PMT-aligned over the active PMTs in the fitter's ordering, so
+    ``charges`` is ``0.0`` and ``times_ns`` is ``NaN`` for an active PMT with no
+    prompt hit.  That is the same convention as :class:`FitResult`.
+    """
+
+    source: str
+    source_index: int
+    pmt_ids: np.ndarray
+    charges: np.ndarray
+    times_ns: np.ndarray
+    prompt_min_ns: float
+    prompt_max_ns: float
+    pmt_id_mode: str = "wcte"
+    metadata: Mapping[str, Any] = field(default_factory=dict, compare=False)
+
+    # Aliases so the same attribute names work here and on FitResult.  Note
+    # there is deliberately no ``expected_pe``: plot_event uses that pair to
+    # recognize a fit result, and this object has no model prediction.
+    @property
+    def observed_pe(self) -> np.ndarray:
+        return self.charges
+
+    @property
+    def observed_time_ns(self) -> np.ndarray:
+        return self.times_ns
+
+    def hit_table(self) -> np.ndarray:
+        """Return columns ``[PMT id, PE, time_ns]`` for PMTs with prompt charge."""
+        hit = self.charges > 0.0
+        return np.column_stack(
+            (self.pmt_ids[hit], self.charges[hit], self.times_ns[hit])
+        )
+
+    @property
+    def n_hit_pmts(self) -> int:
+        return int(np.count_nonzero(self.charges > 0.0))
+
+    @property
+    def n_active_pmts(self) -> int:
+        return int(self.charges.size)
+
+    @property
+    def total_pe(self) -> float:
+        return float(np.sum(self.charges))
+
+    def __repr__(self) -> str:
+        return (
+            f"PreparedEvent(source={self.source!r}, "
+            f"source_index={self.source_index}, "
+            f"hit_pmts={self.n_hit_pmts}/{self.n_active_pmts}, "
+            f"total_pe={self.total_pe:.6g}, "
+            f"prompt_window_ns=({self.prompt_min_ns:.3g}, {self.prompt_max_ns:.3g}))"
+        )
+
+
 @dataclass
 class FitResult:
     """Compact notebook result plus full production diagnostics."""
@@ -601,6 +667,18 @@ class SingleEventFitter:
         module_name = f"_licketyfit_single_event_engine_{self.source}_{uuid.uuid4().hex}"
         with _temporary_environment(environment), _quiet(not self.verbose):
             engine = _load_module_from_path(module_name, DRIVER_PATH)
+            # The driver derives further variables and publishes them into the
+            # environment while it imports: FIT_MODE from the resolved engine
+            # mode, the SPE response model, and every _setdefault_text value.
+            # Keep the environment as the driver left it, because Emitter, PMT
+            # and several driver stages re-read those variables when they are
+            # constructed in initialize(). Restoring the pre-import environment
+            # instead would let the physics state resolved at construction
+            # disagree with the state the module resolved at import -- which the
+            # driver detects and rejects, most visibly as the primary-MCS master
+            # state mismatch in general/cosmic mode, where FIT_MODE is what
+            # decides whether primary MCS is active at all.
+            self._driver_environment = dict(os.environ)
         if getattr(engine, "_UNIFIED_DATA_SOURCE", None) != self.source:
             raise RuntimeError("The embedded driver selected the wrong data source")
         expected_mode = _canonical_internal_fit_mode(
@@ -817,6 +895,88 @@ class SingleEventFitter:
             if thresholds.get(name):
                 summary[name] = thresholds.get(name)
         return summary
+
+    def _prepare_observables(self, record: EventRecord) -> tuple[ModuleType, tuple]:
+        """Run the production channel/prompt/time-reference preparation once."""
+        self.initialize()
+        assert self._engine is not None
+        engine = self._engine
+        with self._runtime_environment():
+            # Particle tables live in shared imported modules. Reassert this
+            # engine's hypothesis so alternating two notebook fitters remains
+            # deterministic even when they use different particles.
+            engine.set_active_particle(engine.FIT_PARTICLE)
+            prepared = engine.prepare_event_observables(
+                record.raw, record.source_index
+            )
+        if prepared is None:
+            raise RuntimeError(
+                "The selected event has no finite active PE after the production "
+                "channel, prompt-window, and time-reference preparation."
+            )
+        return engine, prepared
+
+    def _cached_active_pmt_ids(self, engine: ModuleType) -> np.ndarray:
+        if self._active_pmt_ids_cache is None:
+            cached_pmt_ids = self._active_pmt_ids(engine)
+            cached_pmt_ids.setflags(write=False)
+            self._active_pmt_ids_cache = cached_pmt_ids
+        # Callers historically received a writable diagnostic array. Keep the
+        # immutable resolution cached internally without sharing that storage.
+        return np.array(self._active_pmt_ids_cache, copy=True)
+
+    def prepare_event(self, event: int | EventRecord) -> PreparedEvent:
+        """Return one event's post-cut observables without fitting it.
+
+        This is the display and sanity-check counterpart to :meth:`fit`: it runs
+        the identical production preparation and stops there, so an event
+        display built from the result shows the prompt-window, active-PMT and
+        calibration state the likelihood is given rather than the whole readout.
+
+        Like the first :meth:`fit` call, this initializes geometry, tables,
+        seeds and the proxy library, so the first call is slow and later ones on
+        the same fitter are not.
+        """
+        record = self._resolve_event(event)
+        engine, prepared = self._prepare_observables(record)
+        pmt_ids = self._cached_active_pmt_ids(engine)
+        observed_pe = np.asarray(prepared[0], dtype=np.float64)
+        observed_time_ns = np.asarray(prepared[1], dtype=np.float64)
+        if not (pmt_ids.shape == observed_pe.shape == observed_time_ns.shape):
+            raise RuntimeError("Prepared observables are not aligned with the PMT ordering")
+
+        metadata: dict[str, Any] = {
+            "source": record.source,
+            "loader_hits": int(record.n_hits),
+            "prompt_window_source": (
+                "production peak-relative or configured fixed window"
+            ),
+        }
+        metadata.update(dict(record.metadata))
+        if record.source == "wcte" and len(prepared) >= 9:
+            metadata.update({
+                "source_event_id": int(prepared[4]),
+                "source_root_entry_index": int(prepared[5]),
+                # Removed from the input times; the prompt bounds below and
+                # times_ns are already in the event-relative reference.
+                "global_time_offset_ns": float(prepared[6]),
+                "raw_hit_count": int(prepared[7]),
+                "prompt_hit_count": int(prepared[8]),
+            })
+        return PreparedEvent(
+            source=record.source,
+            source_index=int(record.source_index),
+            pmt_ids=pmt_ids,
+            charges=observed_pe,
+            times_ns=observed_time_ns,
+            prompt_min_ns=float(prepared[2]),
+            prompt_max_ns=float(prepared[3]),
+            # Prepared arrays are indexed by the fitter's active-PMT ordering,
+            # whose IDs are global 100*slot + position for both sources. WCSim
+            # tube numbers have already been mapped away at this point.
+            pmt_id_mode="wcte",
+            metadata=metadata,
+        )
 
     def _resolve_event(self, event: int | EventRecord) -> EventRecord:
         if isinstance(event, EventRecord):
@@ -1253,21 +1413,7 @@ class SingleEventFitter:
     def fit(self, event: int | EventRecord) -> FitResult:
         """Fit one loaded event and evaluate PMT predictions at the estimate."""
         record = self._resolve_event(event)
-        self.initialize()
-        assert self._engine is not None
-        engine = self._engine
-
-        with self._runtime_environment():
-            # Particle tables live in shared imported modules. Reassert this
-            # engine's hypothesis so alternating two notebook fitters remains
-            # deterministic even when they use different particles.
-            engine.set_active_particle(engine.FIT_PARTICLE)
-            prepared = engine.prepare_event_observables(record.raw, record.source_index)
-        if prepared is None:
-            raise RuntimeError(
-                "The selected event has no finite active PE after the production "
-                "channel, prompt-window, and time-reference preparation."
-            )
+        engine, prepared = self._prepare_observables(record)
         self._set_prepared_arrays(engine, prepared, record)
 
         captured: dict[str, Any] = {}
@@ -1299,13 +1445,7 @@ class SingleEventFitter:
                     captured.get("winner"),
                 )
             )
-        if self._active_pmt_ids_cache is None:
-            cached_pmt_ids = self._active_pmt_ids(engine)
-            cached_pmt_ids.setflags(write=False)
-            self._active_pmt_ids_cache = cached_pmt_ids
-        # FitResult historically exposed a writable diagnostic array. Keep the
-        # immutable resolution cached internally without sharing that storage.
-        pmt_ids = np.array(self._active_pmt_ids_cache, copy=True)
+        pmt_ids = self._cached_active_pmt_ids(engine)
         pmt_slots = np.asarray(engine.PMT_SLOTS, dtype=np.int64)
         pmt_positions = pmt_ids % 100
         pmt_coordinates = np.asarray(engine.P_LOCATIONS, dtype=np.float64)
@@ -1523,6 +1663,245 @@ def truth_residuals(result: FitResult, truth: Mapping[str, Any]):
     return pd.DataFrame(rows).set_index("parameter")
 
 
+def kernel_cache_locations(*, create: bool = False) -> dict[str, Any]:
+    """Resolve where this account's generated kernels and caches live.
+
+    The compiled Numba kernels go under ``<runtime root>/numba-portable`` unless
+    ``LF_NUMBA_PORTABLE_CACHE_DIR`` overrides it.  That portable cache is the
+    interesting one: its entries are keyed on the *package-relative* source
+    directory and stamped with a SHA-256 of the source file's contents, so a
+    cache built in one clone is valid in another clone of the same release, at a
+    different path, with different mtimes.  That is what makes it copyable
+    between accounts.
+    """
+    _ensure_repository_on_path()
+    from LicketyFit.runtime_cache import resolve_runtime_cache_location
+
+    location = resolve_runtime_cache_location(PROJECT_ROOT, create=bool(create))
+    explicit = str(os.environ.get("LF_NUMBA_PORTABLE_CACHE_DIR", "")).strip()
+    portable = (
+        Path(explicit).expanduser() if explicit else location.root / "numba-portable"
+    )
+    return {
+        "runtime_root": location.root,
+        "persistent": bool(location.persistent),
+        "source": location.source,
+        "portable_numba": portable,
+        "native": location.root / "native",
+        "tables": PROJECT_ROOT / "tables",
+    }
+
+
+# Subdirectories of a bundle, and where each is copied from/to. Derived table
+# mirrors are deliberately excluded: they are large and save under a second,
+# whereas the compiled kernels are small and save minutes.
+_BUNDLE_PARTS = ("numba-portable", "native")
+_BUNDLE_PROXY_GLOB = "*_track_proxy_*_v3.npz"
+
+
+def publish_cache_bundle(destination: str | Path) -> dict[str, Any]:
+    """Copy this account's compiled kernels and proxy libraries into a bundle.
+
+    Run this once, after a warm-up, to produce a directory that other accounts
+    can prime from with :func:`prime_cache_bundle`.  Put it anywhere readable --
+    it does not need to be writable by the people who consume it, which is the
+    point: numba's own cache-directory check requires write access, so pointing
+    many users at one shared cache directly is fragile, while copying is not.
+    """
+    import shutil
+
+    target = Path(destination).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    locations = kernel_cache_locations(create=False)
+    report: dict[str, Any] = {"bundle": str(target), "copied": [], "skipped": []}
+
+    for name in _BUNDLE_PARTS:
+        source = locations["runtime_root"] / name
+        if name == "numba-portable":
+            source = locations["portable_numba"]
+        if source.is_dir() and any(source.rglob("*")):
+            shutil.copytree(source, target / name, dirs_exist_ok=True)
+            report["copied"].append(name)
+        else:
+            report["skipped"].append(f"{name} (nothing built yet)")
+
+    proxies = sorted(locations["tables"].glob(_BUNDLE_PROXY_GLOB))
+    if proxies:
+        (target / "tables").mkdir(parents=True, exist_ok=True)
+        for path in proxies:
+            shutil.copy2(path, target / "tables" / path.name)
+        report["copied"].append(f"tables ({len(proxies)} proxy librar"
+                                f"{'y' if len(proxies) == 1 else 'ies'})")
+    else:
+        report["skipped"].append("tables (no proxy library built yet)")
+
+    report["bundle_mb"] = round(
+        sum(p.stat().st_size for p in target.rglob("*") if p.is_file()) / 1.0e6, 1
+    )
+    return report
+
+
+def prime_cache_bundle(source: str | Path, *, overwrite: bool = False) -> dict[str, Any]:
+    """Copy a published bundle into this account's own cache locations.
+
+    This is the cheap alternative to compiling: seconds of file copying instead
+    of minutes of Numba compilation.  It is idempotent and safe to call at the
+    top of a notebook -- if the bundle is missing it reports that and changes
+    nothing.
+
+    Entries that do not apply are simply ignored later rather than causing
+    errors: numba validates each cached entry against the source hash, the numba
+    version and the host CPU features, and recompiles anything that does not
+    match.  The native library is keyed on the CPU model as well, so it is
+    copied hopefully rather than expectantly and rebuilds in seconds if it
+    misses.
+    """
+    import shutil
+
+    bundle = Path(source).expanduser()
+    report: dict[str, Any] = {"bundle": str(bundle), "copied": [], "skipped": []}
+    if not bundle.is_dir():
+        report["status"] = "bundle not found; nothing copied"
+        report["primed"] = False
+        return report
+
+    locations = kernel_cache_locations(create=True)
+    for name in _BUNDLE_PARTS:
+        incoming = bundle / name
+        if not incoming.is_dir():
+            report["skipped"].append(f"{name} (not in bundle)")
+            continue
+        destination = (
+            locations["portable_numba"] if name == "numba-portable"
+            else locations["runtime_root"] / name
+        )
+        if destination.is_dir() and any(destination.rglob("*")) and not overwrite:
+            report["skipped"].append(f"{name} (already present locally)")
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(incoming, destination, dirs_exist_ok=True)
+        report["copied"].append(f"{name} -> {destination}")
+
+    incoming_tables = bundle / "tables"
+    if incoming_tables.is_dir():
+        locations["tables"].mkdir(parents=True, exist_ok=True)
+        for path in sorted(incoming_tables.glob(_BUNDLE_PROXY_GLOB)):
+            destination = locations["tables"] / path.name
+            if destination.exists() and not overwrite:
+                report["skipped"].append(f"{path.name} (already present)")
+                continue
+            shutil.copy2(path, destination)
+            report["copied"].append(f"{path.name} -> tables/")
+    else:
+        report["skipped"].append("tables (not in bundle)")
+
+    report["primed"] = bool(report["copied"])
+    report["status"] = (
+        "primed from the bundle" if report["copied"]
+        else "nothing to copy; local caches already present"
+    )
+    return report
+
+
+def runtime_cache_report() -> dict[str, Any]:
+    """Report whether the generated caches a first fit needs are already built.
+
+    Nothing here loads the driver or imports numba, so it is cheap and safe to
+    call before deciding to wait for a fit.
+
+    A first fit on a cold cache spends most of its wall time on work that is not
+    the fit: compiling the Numba kernels, compiling the small native scattering
+    receiver, mirroring the large range/receiver tables, and building the seed
+    proxy library.  All of it is cached, so it is paid once -- but "once" means
+    once per user, per package content, and per Python/numba ABI.
+
+    Of those, only the proxy library is shareable.  It lives in ``tables/`` and
+    is keyed by a content digest of the configuration, so a prebuilt file
+    dropped in beside the others is picked up by anyone.  The runtime cache root
+    is deliberately private (mode 0700, ownership checked), so a Numba cache
+    cannot be shared between accounts -- each user warms it once.
+
+    Use ``scripts/warm_up_cache.py`` to do that warm-up out of band.
+    """
+    _ensure_repository_on_path()
+    report: dict[str, Any] = {
+        "project_root": str(PROJECT_ROOT),
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
+
+    for distribution in ("numba", "llvmlite", "numpy"):
+        try:
+            from importlib import metadata as importlib_metadata
+
+            report[f"{distribution}_version"] = importlib_metadata.version(distribution)
+        except Exception:
+            report[f"{distribution}_version"] = "missing"
+
+    numba_warm = False
+    try:
+        from LicketyFit.runtime_cache import (
+            resolve_runtime_cache_location,
+            runtime_cache_content_tag,
+        )
+
+        location = resolve_runtime_cache_location(PROJECT_ROOT, create=False)
+        entries = list(location.root.rglob("*.nbi")) if location.root.is_dir() else []
+        numba_warm = bool(entries)
+        portable = kernel_cache_locations(create=False)["portable_numba"]
+        report["portable_numba_cache"] = str(portable)
+        report["portable_numba_entries"] = (
+            len(list(portable.rglob("*.nbi"))) if portable.is_dir() else 0
+        )
+        report.update({
+            "runtime_cache_root": str(location.root),
+            # A non-persistent root is under TMPDIR and will not survive the
+            # node, so the warm-up would be repaid on every session.
+            "runtime_cache_persistent": bool(location.persistent),
+            "runtime_cache_source": location.source,
+            "runtime_cache_content_tag": runtime_cache_content_tag(PROJECT_ROOT),
+            "compiled_numba_entries": len(entries),
+        })
+    except Exception as error:
+        report["runtime_cache_error"] = f"{type(error).__name__}: {error}"
+
+    native_present = False
+    try:
+        from LicketyFit import photon_scattering_native
+
+        expected = photon_scattering_native._library_path()
+        native_present = expected.is_file()
+        report.update({
+            # Keyed on source hash, Python ABI, platform and CPU model, because
+            # the library is built with -march=native. A copy built elsewhere
+            # will not match, and it is rebuilt in seconds rather than minutes.
+            "native_receiver_expected": expected.name,
+            "native_receiver_built": native_present,
+        })
+    except Exception as error:
+        report["native_receiver_error"] = f"{type(error).__name__}: {error}"
+
+    proxies = sorted((PROJECT_ROOT / "tables").glob("*_track_proxy_*_v3.npz"))
+    report["proxy_libraries"] = [path.name for path in proxies]
+    report["proxy_library_count"] = len(proxies)
+    report["proxy_library_mb"] = round(
+        sum(path.stat().st_size for path in proxies) / 1.0e6, 1
+    )
+
+    # A proxy library is per configuration, so having some is not proof that the
+    # one this configuration needs is present; only a fit resolves that digest.
+    report["numba_kernels_warm"] = numba_warm
+    report["native_receiver_warm"] = native_present
+    report["verdict"] = (
+        "warm: the shared kernels are compiled; a first fit still builds a proxy "
+        "library if none matches this exact configuration"
+        if numba_warm and native_present
+        else "cold: expect the first fit to spend a few minutes compiling before "
+        "it fits anything -- run scripts/warm_up_cache.py once to pay this "
+        "outside the notebook"
+    )
+    return report
+
+
 def summarize_fit(result: FitResult):
     """Display a compact statistics table and return it as a pandas Series."""
     if not isinstance(result, FitResult):
@@ -1545,8 +1924,13 @@ __all__ = [
     "WCSimConfig",
     "EventRecord",
     "EventCollection",
+    "kernel_cache_locations",
+    "prime_cache_bundle",
+    "publish_cache_bundle",
+    "PreparedEvent",
     "FitResult",
     "SingleEventFitter",
+    "runtime_cache_report",
     "summarize_fit",
     "truth_residuals",
     "wcsim_npz_primary_truth",
