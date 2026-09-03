@@ -1,6 +1,6 @@
 {
   "calibration_basis": "ground_up_mathematical",
-  "calibration_id": "sha256:835173fa465d79ac8229fa6a26f4aee22f50979e79f8c3a462ade83125d87a91",
+  "calibration_id": "sha256:327d2377b95a8e0d3e72c2d6a56b8319534d5a100fba2f54a1674724a42de184",
   "calibration_provenance_files_sha256": {
     "analysis/build_ground_up_light_manifests.py": "46fb2673937de6960169f4ef9dc9c5bb1ca4ed6f9a6fc5903e97fe05a6d9843f"
   },
@@ -63,7 +63,7 @@
     "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
     "LicketyFit/ground_up_light_calibration.py": "433cf6fc895f3407e75d8e48fb00a826d618e79f3f4878eaae16ac87247c9a59",
     "LicketyFit/wcsim_charge_response.py": "438b6da2dedc48a4caee3e7272a1d4c8390a6d8a36a67d8bc93fb708d0dde9bd",
-    "scripts/batch_fit_driver.py": "8e033055c9611a556dbec648e3092274b458979355b0b31c116e881fca346745",
+    "scripts/batch_fit_driver.py": "97cc1ea09ddd0645794c4c4a3d98fea05384b4760be548b272701e08042096a4",
     "scripts/particle_range_lookup.py": "af2dae14d1de11fc08386f91cb8fa52995ab0a9b614d0a8da4329aa28fd88c83",
     "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
     "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
@@ -107,6 +107,22 @@
       "new_sha256": "8e033055c9611a556dbec648e3092274b458979355b0b31c116e881fca346745",
       "old_sha256": "4b262ab271c0918c95992b92e9321c0d9bbef092e90c1042ba21c1724f39f868",
       "reason": "Console/orchestration-only rebind: compact milestone reporting and launcher-managed display were added. Event PMTs, event preparation, optical and scattering predictions, likelihood equations, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-02",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "5d486a2b01c56c30f28f9ca42ba5bc403ab3a084592c0f1413fa12ad6eab55a2",
+      "old_sha256": "8e033055c9611a556dbec648e3092274b458979355b0b31c116e881fca346745",
+      "reason": "WCTE-input-selection-only rebind: v1.45 adds configurable run-calibrated electron/muon/pion beam PID before reconstruction. WCSim event input and all per-event photon predictions, detector response, likelihood equations, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-03",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "97cc1ea09ddd0645794c4c4a3d98fea05384b4760be548b272701e08042096a4",
+      "old_sha256": "5d486a2b01c56c30f28f9ca42ba5bc403ab3a084592c0f1413fa12ad6eab55a2",
+      "reason": "WCTE-input-selection and warm-up-orchestration-only rebind: v1.45.1 degrades safely when an adjacent run TOF boundary is unavailable and aligns deferred coherent warm-up handling across engine variants. WCSim event input and all per-event photon predictions, detector response, likelihood equations, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
       "scale_or_prediction_changed": false
     }
   ],

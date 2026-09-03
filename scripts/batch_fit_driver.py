@@ -216,7 +216,7 @@ def _prepare_numba_thread_budget(requested: int) -> int:
     return min(requested, maximum)
 
 
-UNIFIED_DRIVER_RELEASE = "2026-09-02-v1.44.0-mode-axes"
+UNIFIED_DRIVER_RELEASE = "2026-09-03-v1.45.1-adaptive-wcte-pid-fallback"
 
 
 _REMOVED_COSMIC_MODEL_ENV_SWITCHES = (
@@ -387,6 +387,7 @@ DEFAULT_WCTE_APPLY_T5_DQ = True
 # selection requires a positive scalar or an explicit override.
 DEFAULT_WCTE_USE_ACT_EVETO_CUT = True
 DEFAULT_WCTE_USE_ACT_TAGGER_CUT = True
+DEFAULT_WCTE_LIGHT_PARTICLE_PID_MODE = "act_tof"  # "act", "act_tof", or "tof"
 DEFAULT_WCTE_TOF_CUT_MODE = "auto"       # "auto", "require", or "disable"
 DEFAULT_WCTE_PROTON_TOF_WINDOW_NS = 10.0
 DEFAULT_WCTE_REQUIRE_MUON_TAGGER = False
@@ -395,6 +396,8 @@ DEFAULT_WCTE_ACT_EVETO_CUT_OVERRIDE_PE = None
 DEFAULT_WCTE_ACT_TAGGER_CUT_OVERRIDE_PE = None
 DEFAULT_WCTE_PROTON_TOF_CUT_OVERRIDE_NS = None
 DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE = None
+DEFAULT_WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS = None
+DEFAULT_WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS = None
 # Each item is (variable, operator, value), exactly as accepted by
 # BeamSelection.selection. In nominal mode these are appended; in custom mode
 # they are the complete selection. Example:
@@ -2650,6 +2653,23 @@ def run_wcte_cosmic_supervisor(script_dir: Path) -> bool:
         prepared_metadata = pickle.load(stream)
     if not isinstance(prepared_metadata, dict):
         raise RuntimeError("WCTE cosmic preparation provenance is not a dictionary")
+    prepared_loader_metadata = dict(
+        prepared_metadata.get("wcte_data_loader", {})
+    )
+    prepared_thresholds = dict(
+        prepared_loader_metadata.get("selection_thresholds", {})
+    )
+    unavailable_boundaries = prepared_thresholds.get(
+        "light_particle_tof_unavailable_boundaries", ()
+    )
+    if unavailable_boundaries:
+        joined = ", ".join(str(item) for item in unavailable_boundaries)
+        print(
+            f"WCTE PID fallback: run {original_run} has no usable {joined} "
+            "TOF boundary; ACT identity and the remaining valid TOF cuts "
+            "will be used.",
+            flush=True,
+        )
 
     available = _read_prepared_count(prepared_path)
     requested = max(0, available - source_start)
@@ -21153,7 +21173,12 @@ elif _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE == "cosmic":
                 _coherent_warmup = coherent_warmup_action(
                     MCS_COHERENT_IMPLEMENTATION
                 )
-                if _coherent_warmup == "fast12_profile":
+                if _coherent_warmup == "defer_physics_reference":
+                    # This is a complete scientific continuation, not a
+                    # compile-only kernel. It is initialized by the first real
+                    # event instead of being duplicated on the proxy seed.
+                    pass
+                elif _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -23875,6 +23900,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     USE_ACT_TAGGER_CUT = _env_bool(
         "WCTE_USE_ACT_TAGGER_CUT", DEFAULT_WCTE_USE_ACT_TAGGER_CUT
     )
+    LIGHT_PARTICLE_PID_MODE = os.environ.get(
+        "WCTE_LIGHT_PARTICLE_PID_MODE",
+        DEFAULT_WCTE_LIGHT_PARTICLE_PID_MODE,
+    ).strip().lower().replace("-", "_").replace("+", "_")
     TOF_CUT_MODE = os.environ.get(
         "WCTE_TOF_CUT_MODE", DEFAULT_WCTE_TOF_CUT_MODE
     ).strip().lower().replace("-", "_")
@@ -23895,6 +23924,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     )
     MUON_TAG_CUT_OVERRIDE = _env_optional_float(
         "WCTE_MUON_TAG_CUT_OVERRIDE", DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE
+    )
+    ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS = _env_optional_float(
+        "WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS",
+        DEFAULT_WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS,
+    )
+    MUON_PION_TOF_BOUNDARY_OVERRIDE_NS = _env_optional_float(
+        "WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS",
+        DEFAULT_WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS,
     )
     EXTRA_SELECTION_CUTS = _selection_cut_specs_from_env(
         "WCTE_EXTRA_SELECTION_CUTS_JSON", DEFAULT_WCTE_EXTRA_SELECTION_CUTS
@@ -28206,6 +28243,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 apply_vme_event_quality_cuts=bool(APPLY_VME_EVENT_QUALITY_CUTS),
                 apply_t5_event_quality_cuts=bool(APPLY_T5_EVENT_QUALITY_CUTS),
                 selection_mode=str(SELECTION_MODE),
+                light_particle_pid_mode=str(LIGHT_PARTICLE_PID_MODE),
                 use_act_eveto_cut=bool(USE_ACT_EVETO_CUT),
                 use_act_tagger_cut=bool(USE_ACT_TAGGER_CUT),
                 tof_cut_mode=str(TOF_CUT_MODE),
@@ -28215,6 +28253,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 act_tagger_cut_override_pe=ACT_TAGGER_CUT_OVERRIDE_PE,
                 proton_tof_cut_override_ns=PROTON_TOF_CUT_OVERRIDE_NS,
                 muon_tag_cut_override=MUON_TAG_CUT_OVERRIDE,
+                electron_muon_tof_boundary_override_ns=(
+                    ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS
+                ),
+                muon_pion_tof_boundary_override_ns=(
+                    MUON_PION_TOF_BOUNDARY_OVERRIDE_NS
+                ),
                 extra_selection_cuts=EXTRA_SELECTION_CUTS,
                 print_selection_description=bool(PRINT_SELECTION_DESCRIPTION),
                 print_cherenkov_thresholds=bool(PRINT_CHERENKOV_THRESHOLDS),
@@ -28403,7 +28447,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                 _coherent_warmup = coherent_warmup_action(
                     MCS_COHERENT_IMPLEMENTATION
                 )
-                if _coherent_warmup == "fast12_profile":
+                if _coherent_warmup == "defer_physics_reference":
+                    # This is a complete scientific continuation, not a
+                    # compile-only kernel. It is initialized by the first real
+                    # event instead of being duplicated on the proxy seed.
+                    pass
+                elif _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -29230,6 +29279,13 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                         if EVENT_SOURCE == "selection" else None
                     ),
                     "requested_selection_mode": str(SELECTION_MODE),
+                    "light_particle_pid_mode": (
+                        str(LIGHT_PARTICLE_PID_MODE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_light_particle_pid_mode": str(
+                        LIGHT_PARTICLE_PID_MODE
+                    ),
                     "use_act_eveto_cut": bool(
                         USE_ACT_EVETO_CUT if EVENT_SOURCE == "selection" else False
                     ),
@@ -29248,6 +29304,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     "act_tagger_cut_override_pe": ACT_TAGGER_CUT_OVERRIDE_PE,
                     "proton_tof_cut_override_ns": PROTON_TOF_CUT_OVERRIDE_NS,
                     "muon_tag_cut_override": MUON_TAG_CUT_OVERRIDE,
+                    "electron_muon_tof_boundary_override_ns": (
+                        ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS
+                    ),
+                    "muon_pion_tof_boundary_override_ns": (
+                        MUON_PION_TOF_BOUNDARY_OVERRIDE_NS
+                    ),
                     "extra_selection_cuts": [
                         list(spec) for spec in EXTRA_SELECTION_CUTS
                     ],
@@ -30128,6 +30190,10 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     USE_ACT_TAGGER_CUT = _env_bool(
         "WCTE_USE_ACT_TAGGER_CUT", DEFAULT_WCTE_USE_ACT_TAGGER_CUT
     )
+    LIGHT_PARTICLE_PID_MODE = os.environ.get(
+        "WCTE_LIGHT_PARTICLE_PID_MODE",
+        DEFAULT_WCTE_LIGHT_PARTICLE_PID_MODE,
+    ).strip().lower().replace("-", "_").replace("+", "_")
     TOF_CUT_MODE = os.environ.get(
         "WCTE_TOF_CUT_MODE", DEFAULT_WCTE_TOF_CUT_MODE
     ).strip().lower().replace("-", "_")
@@ -30148,6 +30214,14 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
     )
     MUON_TAG_CUT_OVERRIDE = _env_optional_float(
         "WCTE_MUON_TAG_CUT_OVERRIDE", DEFAULT_WCTE_MUON_TAG_CUT_OVERRIDE
+    )
+    ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS = _env_optional_float(
+        "WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS",
+        DEFAULT_WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS,
+    )
+    MUON_PION_TOF_BOUNDARY_OVERRIDE_NS = _env_optional_float(
+        "WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS",
+        DEFAULT_WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS,
     )
     EXTRA_SELECTION_CUTS = _selection_cut_specs_from_env(
         "WCTE_EXTRA_SELECTION_CUTS_JSON", DEFAULT_WCTE_EXTRA_SELECTION_CUTS
@@ -42713,6 +42787,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 apply_vme_event_quality_cuts=bool(APPLY_VME_EVENT_QUALITY_CUTS),
                 apply_t5_event_quality_cuts=bool(APPLY_T5_EVENT_QUALITY_CUTS),
                 selection_mode=str(SELECTION_MODE),
+                light_particle_pid_mode=str(LIGHT_PARTICLE_PID_MODE),
                 use_act_eveto_cut=bool(USE_ACT_EVETO_CUT),
                 use_act_tagger_cut=bool(USE_ACT_TAGGER_CUT),
                 tof_cut_mode=str(TOF_CUT_MODE),
@@ -42722,6 +42797,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 act_tagger_cut_override_pe=ACT_TAGGER_CUT_OVERRIDE_PE,
                 proton_tof_cut_override_ns=PROTON_TOF_CUT_OVERRIDE_NS,
                 muon_tag_cut_override=MUON_TAG_CUT_OVERRIDE,
+                electron_muon_tof_boundary_override_ns=(
+                    ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS
+                ),
+                muon_pion_tof_boundary_override_ns=(
+                    MUON_PION_TOF_BOUNDARY_OVERRIDE_NS
+                ),
                 extra_selection_cuts=EXTRA_SELECTION_CUTS,
                 print_selection_description=bool(PRINT_SELECTION_DESCRIPTION),
                 print_cherenkov_thresholds=bool(PRINT_CHERENKOV_THRESHOLDS),
@@ -42959,7 +43040,12 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 _coherent_warmup = coherent_warmup_action(
                     MCS_COHERENT_IMPLEMENTATION
                 )
-                if _coherent_warmup == "fast12_profile":
+                if _coherent_warmup == "defer_physics_reference":
+                    # This is a complete scientific continuation, not a
+                    # compile-only kernel. It is initialized by the first real
+                    # event instead of being duplicated on the proxy seed.
+                    pass
+                elif _coherent_warmup == "fast12_profile":
                     _ = run_fast12_coherent_update(
                         EMITTER_TEMPLATE, values=coherent_values, chart=chart,
                         detector=DETECTOR, wcd=WCD, pmt_model=PMT_MODEL,
@@ -44530,6 +44616,19 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE == "cosmic":
                 "n_events_skipped_during_preparation": int(len(SKIPPED_EVENT_RECORDS)),
                 "skipped_event_records": list(SKIPPED_EVENT_RECORDS),
                 "selection": {
+                    "light_particle_pid_mode": (
+                        str(LIGHT_PARTICLE_PID_MODE)
+                        if EVENT_SOURCE == "selection" else None
+                    ),
+                    "requested_light_particle_pid_mode": str(
+                        LIGHT_PARTICLE_PID_MODE
+                    ),
+                    "electron_muon_tof_boundary_override_ns": (
+                        ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS
+                    ),
+                    "muon_pion_tof_boundary_override_ns": (
+                        MUON_PION_TOF_BOUNDARY_OVERRIDE_NS
+                    ),
                     "applied": bool(EVENT_SOURCE == "selection"),
                     "bypassed_reason": (
                         None if EVENT_SOURCE == "selection" else

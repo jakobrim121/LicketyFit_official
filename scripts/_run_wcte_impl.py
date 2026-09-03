@@ -61,7 +61,7 @@ from LicketyFit.run_console import (
 )
 
 
-_PUBLIC_DRIVER_RELEASE = "2026-09-02-v1.44.0-mode-axes"
+_PUBLIC_DRIVER_RELEASE = "2026-09-03-v1.45.1-adaptive-wcte-pid-fallback"
 _DEDICATED_RECONSTRUCTION_ENV = {
     "FIT_MODE",
     "LF_SEEDING_MODE",
@@ -423,6 +423,10 @@ def _validate(*, check_paths: bool) -> None:
         raise ValueError("EVENT_START_INDEX must be nonnegative")
     if SELECTION_MODE not in {"nominal", "custom"}:
         raise ValueError("SELECTION_MODE must be 'nominal' or 'custom'")
+    if LIGHT_PARTICLE_PID_MODE not in {"act", "act_tof", "tof"}:
+        raise ValueError(
+            "LIGHT_PARTICLE_PID_MODE must be 'act', 'act_tof', or 'tof'"
+        )
     if TOF_CUT_MODE not in {"auto", "require", "disable"}:
         raise ValueError("TOF_CUT_MODE must be 'auto', 'require', or 'disable'")
     if GEOMETRY_PLACEMENT not in {"est", "design"}:
@@ -683,6 +687,7 @@ def _configuration_items() -> list[tuple[str, object]]:
         ("WCTE_APPLY_T5_EVENT_QUALITY_CUTS", APPLY_T5_EVENT_QUALITY_CUTS),
         ("WCTE_USE_ACT_EVETO_CUT", USE_ACT_EVETO_CUT),
         ("WCTE_USE_ACT_TAGGER_CUT", USE_ACT_TAGGER_CUT),
+        ("WCTE_LIGHT_PARTICLE_PID_MODE", LIGHT_PARTICLE_PID_MODE),
         ("WCTE_TOF_CUT_MODE", TOF_CUT_MODE),
         ("WCTE_PROTON_TOF_WINDOW_NS", PROTON_TOF_WINDOW_NS),
         ("WCTE_REQUIRE_MUON_TAGGER", REQUIRE_MUON_TAGGER),
@@ -690,6 +695,14 @@ def _configuration_items() -> list[tuple[str, object]]:
         ("WCTE_ACT_TAGGER_CUT_OVERRIDE_PE", ACT_TAGGER_CUT_OVERRIDE_PE),
         ("WCTE_PROTON_TOF_CUT_OVERRIDE_NS", PROTON_TOF_CUT_OVERRIDE_NS),
         ("WCTE_MUON_TAG_CUT_OVERRIDE", MUON_TAG_CUT_OVERRIDE),
+        (
+            "WCTE_ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS",
+            ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS,
+        ),
+        (
+            "WCTE_MUON_PION_TOF_BOUNDARY_OVERRIDE_NS",
+            MUON_PION_TOF_BOUNDARY_OVERRIDE_NS,
+        ),
         ("BEAM_P", BEAM_MOMENTUM_MEV_C),
         ("WCTE_EXPECTED_KE_MEV", EXPECTED_KINETIC_ENERGY_MEV),
         ("WCTE_USE_EXPECTED_ENERGY_HINT", USE_EXPECTED_ENERGY_SEED_HINT),
@@ -872,6 +885,17 @@ def _print_run_summary(output_file: str) -> None:
     ]
     if str(PARTICLE_SELECTION_LABEL) != str(FIT_PARTICLE):
         details.append(("Selected sample", PARTICLE_SELECTION_LABEL))
+    if (
+        EVENT_SOURCE == "selection"
+        and SELECTION_MODE == "nominal"
+        and str(PARTICLE_SELECTION_LABEL).strip().lower()
+        in {
+            "electron", "e", "e-", "e+",
+            "muon", "mu", "mu-", "mu+",
+            "pion", "pi", "pi-", "pi+",
+        }
+    ):
+        details.append(("Beam PID", LIGHT_PARTICLE_PID_MODE))
     details.extend(
         (
             ("Likelihood", LIKELIHOOD_MODE),

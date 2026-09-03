@@ -14,12 +14,25 @@ output.  This module owns only the production ROOT input layer:
 * convert selected jagged hits to LicketyFit's compact ``N x 5`` table
   ``[global_pmt_id, charge_adc, calibrated_time_ns, root_entry, event_number]``.
 
-The nominal selections reproduce the supplied analysis-tools examples:
+The nominal light-particle selections support three explicit PID policies:
 
-* electron: ``act_eveto > cut`` and optional fast-TOF cut;
-* muon: ``act_eveto < cut``, ``act_tagger > cut``, optional fast-TOF cut,
-  and optional muon-tagger cut;
-* pion: ``act_eveto < cut``, ``act_tagger < cut``, optional fast-TOF cut;
+* ``act``: reproduce the supplied analysis-tools ACT examples, with the
+  optional proton/fast-particle TOF veto;
+* ``act_tof``: retain those ACT requirements and add every usable
+  run-calibrated, hypothesis-specific electron/muon/pion TOF boundary. If a
+  boundary is not physically defined for a run, retain the ACT identity and
+  the remaining usable TOF cuts instead of inventing a threshold;
+* ``tof``: use only the hypothesis-specific light-particle TOF interval.
+
+The adjacent light-particle boundaries are taken from explicit scalar cut
+values when a future production supplies them. Otherwise they are calculated
+as the equal-density intersections of the run's fitted ``tof_mean_*`` and
+``tof_std_*`` populations. They are never copied between runs. ``tof`` mode is
+strict because it has no ACT identity fallback; it reports an actionable error
+when a required boundary is unavailable.
+
+The remaining nominal selection is:
+
 * proton: TOF in ``[proton_tof_cut, proton_tof_cut + window]``.
 
 The examples explicitly say these nominal cuts must be adapted to the run.  The
@@ -77,6 +90,8 @@ _PARTICLE_ALIASES = {
 _NOMINAL_PARTICLES = frozenset({"muon", "pion", "electron", "proton"})
 _SELECTION_MODES = frozenset({"nominal", "custom"})
 _TOF_CUT_MODES = frozenset({"auto", "require", "disable"})
+_LIGHT_PARTICLE_PID_MODES = frozenset({"act", "act_tof", "tof"})
+_LIGHT_PARTICLES = frozenset({"electron", "muon", "pion"})
 _SUPPORTED_OPERATORS = frozenset({">", "<", ">=", "<=", "==", "!=", "between"})
 
 _BASE_HIT_BRANCHES = (
@@ -121,6 +136,11 @@ class WCTESelectionConfig:
     # PID construction. ``nominal`` follows the repository examples. ``custom``
     # applies only ``extra_selection_cuts`` and is required for a kaon label.
     selection_mode: str = "nominal"
+    # act: legacy ACT identity with only the optional proton/fast TOF veto;
+    # act_tof: ACT identity plus every usable run-calibrated TOF boundary;
+    #           an unusable boundary falls back to ACT for that separation;
+    # tof: run-calibrated e/mu/pi TOF boundaries without ACT identity cuts.
+    light_particle_pid_mode: str = "act_tof"
     use_act_eveto_cut: bool = True
     use_act_tagger_cut: bool = True
     # auto: use run scalar when >0, otherwise omit for fast particles;
@@ -134,6 +154,8 @@ class WCTESelectionConfig:
     act_tagger_cut_override_pe: float | None = None
     proton_tof_cut_override_ns: float | None = None
     muon_tag_cut_override: float | None = None
+    electron_muon_tof_boundary_override_ns: float | None = None
+    muon_pion_tof_boundary_override_ns: float | None = None
 
     # Each item is [variable, operator, value], exactly as accepted by
     # BeamSelection.selection. In nominal mode these are appended; in custom mode
@@ -192,6 +214,21 @@ def _canonical_tof_mode(value: str) -> str:
     mode = aliases.get(mode, mode)
     if mode not in _TOF_CUT_MODES:
         raise ValueError("WCTE tof_cut_mode must be auto, require, or disable")
+    return mode
+
+
+def _canonical_light_particle_pid_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_").replace("+", "_")
+    aliases = {
+        "legacy": "act",
+        "combined": "act_tof",
+        "tof_only": "tof",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in _LIGHT_PARTICLE_PID_MODES:
+        raise ValueError(
+            "WCTE light_particle_pid_mode must be 'act', 'act_tof', or 'tof'"
+        )
     return mode
 
 
@@ -704,6 +741,71 @@ def _optional_override(value: float | None, label: str) -> float | None:
     return number
 
 
+def _equal_pdf_boundary(
+    left_name: str,
+    left_mean: float,
+    left_sigma: float,
+    right_name: str,
+    right_mean: float,
+    right_sigma: float,
+) -> float:
+    """Return the equal-density Gaussian boundary between adjacent peaks.
+
+    A boundary is accepted only when the fitted means are ordered and the two
+    densities cross between them. Silently falling back to an arbitrary
+    midpoint would conceal a failed or incompatible run calibration.
+    """
+    numbers = (left_mean, left_sigma, right_mean, right_sigma)
+    if not all(math.isfinite(float(value)) for value in numbers):
+        raise RuntimeError(
+            f"The {left_name}/{right_name} TOF calibration contains non-finite values"
+        )
+    left_mean = float(left_mean)
+    right_mean = float(right_mean)
+    left_sigma = float(left_sigma)
+    right_sigma = float(right_sigma)
+    if left_sigma <= 0.0 or right_sigma <= 0.0:
+        raise RuntimeError(
+            f"The {left_name}/{right_name} TOF widths must both be positive"
+        )
+    if left_mean >= right_mean:
+        raise RuntimeError(
+            f"The run TOF means are not ordered for {left_name}/{right_name}: "
+            f"{left_mean:.6g} ns >= {right_mean:.6g} ns"
+        )
+
+    def log_density_difference(value: float) -> float:
+        left = -math.log(left_sigma) - 0.5 * (
+            (value - left_mean) / left_sigma
+        ) ** 2
+        right = -math.log(right_sigma) - 0.5 * (
+            (value - right_mean) / right_sigma
+        ) ** 2
+        return left - right
+
+    lo, hi = left_mean, right_mean
+    f_lo, f_hi = log_density_difference(lo), log_density_difference(hi)
+    if f_lo == 0.0:
+        return lo
+    if f_hi == 0.0:
+        return hi
+    if f_lo * f_hi > 0.0:
+        raise RuntimeError(
+            f"The fitted {left_name}/{right_name} TOF Gaussians do not have an "
+            "equal-density crossing between their means"
+        )
+    for _ in range(80):
+        midpoint = 0.5 * (lo + hi)
+        f_mid = log_density_difference(midpoint)
+        if f_mid == 0.0:
+            return midpoint
+        if f_lo * f_mid > 0.0:
+            lo, f_lo = midpoint, f_mid
+        else:
+            hi = midpoint
+    return 0.5 * (lo + hi)
+
+
 def _selection_thresholds(
     loader: Any, cfg: WCTESelectionConfig, particle: str
 ) -> dict[str, Any]:
@@ -716,6 +818,9 @@ def _selection_thresholds(
     values = loader.get_vme_analysis_scalar_results()
     mode = _canonical_selection_mode(cfg.selection_mode)
     tof_mode = _canonical_tof_mode(cfg.tof_cut_mode)
+    light_pid_mode = _canonical_light_particle_pid_mode(
+        cfg.light_particle_pid_mode
+    )
 
     eveto_override = _optional_override(
         cfg.act_eveto_cut_override_pe, "act_eveto_cut_pe"
@@ -727,6 +832,14 @@ def _selection_thresholds(
         cfg.proton_tof_cut_override_ns, "proton_tof_cut_ns"
     )
     mu_override = _optional_override(cfg.muon_tag_cut_override, "mu_tag_cut")
+    electron_muon_override = _optional_override(
+        cfg.electron_muon_tof_boundary_override_ns,
+        "electron_muon_tof_boundary_ns",
+    )
+    muon_pion_override = _optional_override(
+        cfg.muon_pion_tof_boundary_override_ns,
+        "muon_pion_tof_boundary_ns",
+    )
 
     def read_scalar(key: str, label: str, *, required: bool) -> float | None:
         try:
@@ -740,14 +853,37 @@ def _selection_thresholds(
                 )
             return None
 
+    def read_first_scalar(
+        keys: Sequence[str], label: str, *, required: bool
+    ) -> tuple[float | None, str | None]:
+        errors: list[str] = []
+        for key in keys:
+            try:
+                return _scalar(values[key], label), key
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+        if required:
+            choices = ", ".join(repr(key) for key in keys)
+            raise RuntimeError(
+                f"The nominal {particle} selection requires one of {choices} "
+                f"for {label}, but none is usable. " + "; ".join(errors)
+            )
+        return None, None
+
     nominal = mode == "nominal"
+    uses_act_identity = bool(
+        particle in _LIGHT_PARTICLES and light_pid_mode in {"act", "act_tof"}
+    )
+    uses_light_tof = bool(
+        nominal and particle in _LIGHT_PARTICLES and light_pid_mode != "act"
+    )
     need_eveto = bool(
-        nominal and cfg.use_act_eveto_cut
+        nominal and uses_act_identity and cfg.use_act_eveto_cut
         and particle in {"muon", "pion", "electron"}
         and eveto_override is None
     )
     need_tagger = bool(
-        nominal and cfg.use_act_tagger_cut
+        nominal and uses_act_identity and cfg.use_act_tagger_cut
         and particle in {"muon", "pion"}
         and tagger_override is None
     )
@@ -757,7 +893,11 @@ def _selection_thresholds(
     )
     need_tof = bool(
         nominal and tof_mode != "disable" and tof_override is None
-        and (particle == "proton" or tof_mode == "require")
+        and (
+            particle == "proton"
+            or (particle == "pion" and uses_light_tof)
+            or tof_mode == "require"
+        )
     )
 
     raw_tof = read_scalar(
@@ -814,7 +954,180 @@ def _selection_thresholds(
     mu_tag, mu_source = resolve_value(
         raw_mu_tag, mu_override, "mu_tag_cut", need_mu_tag
     )
+    boundary_metadata: dict[str, Any] = {
+        "raw_electron_muon_tof_boundary_ns": None,
+        "raw_muon_pion_tof_boundary_ns": None,
+        "electron_muon_tof_boundary_error": None,
+        "muon_pion_tof_boundary_error": None,
+        "electron_muon_tof_peak_separation_sigma": None,
+        "muon_pion_tof_peak_separation_sigma": None,
+        "tof_mean_electron_ns": None,
+        "tof_std_electron_ns": None,
+        "tof_mean_muon_ns": None,
+        "tof_std_muon_ns": None,
+        "tof_mean_pion_ns": None,
+        "tof_std_pion_ns": None,
+    }
+
+    def resolve_light_boundary(
+        *,
+        boundary_name: str,
+        left_name: str,
+        right_name: str,
+        explicit_keys: Sequence[str],
+        override: float | None,
+        required: bool,
+    ) -> tuple[float | None, str]:
+        if not required:
+            return None, "not_required"
+        if override is not None:
+            return float(override), "user_override"
+
+        explicit, explicit_key = read_first_scalar(
+            explicit_keys, boundary_name, required=False
+        )
+        boundary_metadata[f"raw_{boundary_name}_ns"] = explicit
+        if explicit is not None:
+            return float(explicit), f"vme_analysis_scalar_results:{explicit_key}"
+
+        try:
+            left_mean, left_mean_key = read_first_scalar(
+                (f"tof_mean_{left_name}", f"{left_name}_tof_mean"),
+                f"{left_name} TOF mean",
+                required=True,
+            )
+            left_sigma, left_sigma_key = read_first_scalar(
+                (f"tof_std_{left_name}", f"{left_name}_tof_std"),
+                f"{left_name} TOF width",
+                required=True,
+            )
+            right_mean, right_mean_key = read_first_scalar(
+                (f"tof_mean_{right_name}", f"{right_name}_tof_mean"),
+                f"{right_name} TOF mean",
+                required=True,
+            )
+            right_sigma, right_sigma_key = read_first_scalar(
+                (f"tof_std_{right_name}", f"{right_name}_tof_std"),
+                f"{right_name} TOF width",
+                required=True,
+            )
+            boundary_metadata[f"tof_mean_{left_name}_ns"] = left_mean
+            boundary_metadata[f"tof_std_{left_name}_ns"] = left_sigma
+            boundary_metadata[f"tof_mean_{right_name}_ns"] = right_mean
+            boundary_metadata[f"tof_std_{right_name}_ns"] = right_sigma
+            pooled_sigma = math.sqrt(
+                0.5 * (float(left_sigma) ** 2 + float(right_sigma) ** 2)
+            )
+            if pooled_sigma > 0.0:
+                boundary_metadata[
+                    f"{left_name}_{right_name}_tof_peak_separation_sigma"
+                ] = abs(float(right_mean) - float(left_mean)) / pooled_sigma
+            boundary = _equal_pdf_boundary(
+                left_name,
+                float(left_mean),
+                float(left_sigma),
+                right_name,
+                float(right_mean),
+                float(right_sigma),
+            )
+        except Exception as exc:
+            message = str(exc)
+            boundary_metadata[f"{boundary_name}_error"] = message
+            if light_pid_mode == "tof":
+                raise RuntimeError(
+                    f"TOF-only {particle} PID cannot construct the required "
+                    f"{left_name}/{right_name} boundary for run {cfg.run}: "
+                    f"{message}. Use LIGHT_PARTICLE_PID_MODE='act_tof' to "
+                    "retain ACT identity and fall back only for this unusable "
+                    "boundary, or supply a validated boundary override."
+                ) from exc
+            return None, "unavailable_run_calibration"
+        scalar_keys = ",".join(
+            (
+                str(left_mean_key),
+                str(left_sigma_key),
+                str(right_mean_key),
+                str(right_sigma_key),
+            )
+        )
+        return boundary, f"equal_pdf_intersection:{scalar_keys}"
+
+    need_electron_muon_boundary = bool(
+        uses_light_tof and particle in {"electron", "muon"}
+    )
+    need_muon_pion_boundary = bool(
+        uses_light_tof and particle in {"muon", "pion"}
+    )
+    electron_muon_boundary, electron_muon_source = resolve_light_boundary(
+        boundary_name="electron_muon_tof_boundary",
+        left_name="electron",
+        right_name="muon",
+        explicit_keys=(
+            "tof_cut_electron_muon",
+            "electron_muon_tof_cut",
+            "muon_tof_cut",
+        ),
+        override=electron_muon_override,
+        required=need_electron_muon_boundary,
+    )
+    muon_pion_boundary, muon_pion_source = resolve_light_boundary(
+        boundary_name="muon_pion_tof_boundary",
+        left_name="muon",
+        right_name="pion",
+        explicit_keys=(
+            "tof_cut_muon_pion",
+            "muon_pion_tof_cut",
+            "pion_tof_cut",
+        ),
+        override=muon_pion_override,
+        required=need_muon_pion_boundary,
+    )
+    if (
+        electron_muon_boundary is not None
+        and muon_pion_boundary is not None
+        and electron_muon_boundary >= muon_pion_boundary
+    ):
+        message = (
+            "The resolved light-particle TOF boundaries are not ordered: "
+            f"electron/muon={electron_muon_boundary:.6g} ns, "
+            f"muon/pion={muon_pion_boundary:.6g} ns"
+        )
+        if (
+            light_pid_mode == "tof"
+            or electron_muon_override is not None
+            or muon_pion_override is not None
+        ):
+            raise RuntimeError(message)
+        boundary_metadata["electron_muon_tof_boundary_error"] = message
+        boundary_metadata["muon_pion_tof_boundary_error"] = message
+        electron_muon_boundary = None
+        muon_pion_boundary = None
+        electron_muon_source = "unavailable_run_calibration"
+        muon_pion_source = "unavailable_run_calibration"
+    if (
+        particle == "pion"
+        and uses_light_tof
+        and resolved_tof is not None
+        and muon_pion_boundary is not None
+        and muon_pion_boundary >= resolved_tof
+    ):
+        message = (
+            "The resolved muon/pion TOF boundary must be below proton_tof_cut: "
+            f"{muon_pion_boundary:.6g} ns >= {resolved_tof:.6g} ns"
+        )
+        if light_pid_mode == "tof" or muon_pion_override is not None:
+            raise RuntimeError(message)
+        boundary_metadata["muon_pion_tof_boundary_error"] = message
+        muon_pion_boundary = None
+        muon_pion_source = "unavailable_run_calibration"
+
+    unavailable_boundaries = []
+    if need_electron_muon_boundary and electron_muon_boundary is None:
+        unavailable_boundaries.append("electron/muon")
+    if need_muon_pion_boundary and muon_pion_boundary is None:
+        unavailable_boundaries.append("muon/pion")
     return {
+        "light_particle_pid_mode": light_pid_mode,
         "raw_proton_tof_cut_ns": raw_tof,
         "raw_act_eveto_cut_pe": raw_eveto,
         "raw_act_tagger_cut_pe": raw_tagger,
@@ -827,6 +1140,15 @@ def _selection_thresholds(
         "act_tagger_cut_source": tagger_source,
         "mu_tag_cut": mu_tag,
         "mu_tag_cut_source": mu_source,
+        "electron_muon_tof_boundary_ns": electron_muon_boundary,
+        "electron_muon_tof_boundary_source": electron_muon_source,
+        "muon_pion_tof_boundary_ns": muon_pion_boundary,
+        "muon_pion_tof_boundary_source": muon_pion_source,
+        "light_particle_tof_fallback_used": bool(
+            light_pid_mode == "act_tof" and unavailable_boundaries
+        ),
+        "light_particle_tof_unavailable_boundaries": unavailable_boundaries,
+        **boundary_metadata,
     }
 
 
@@ -860,29 +1182,102 @@ def _selection_specs(
     tagger = cuts.get("act_tagger_cut_pe")
     tof = cuts.get("proton_tof_cut_ns")
     mu_tag = cuts.get("mu_tag_cut")
+    electron_muon_tof = cuts.get("electron_muon_tof_boundary_ns")
+    muon_pion_tof = cuts.get("muon_pion_tof_boundary_ns")
+    light_pid_mode = _canonical_light_particle_pid_mode(
+        cfg.light_particle_pid_mode
+    )
+    uses_act_identity = light_pid_mode in {"act", "act_tof"}
     specs: list[list[Any]] = []
 
     if particle == "muon":
-        if cfg.use_act_eveto_cut:
+        if uses_act_identity and cfg.use_act_eveto_cut:
             specs.append(["vme_act_eveto", "<", float(eveto)])
-        if cfg.use_act_tagger_cut:
+        if uses_act_identity and cfg.use_act_tagger_cut:
             specs.append(["vme_act_tagger", ">", float(tagger)])
-        if tof is not None:
+        if light_pid_mode == "tof":
+            if electron_muon_tof is None or muon_pion_tof is None:
+                raise RuntimeError(
+                    "TOF-only muon PID requires both the electron/muon and "
+                    "muon/pion TOF boundaries"
+                )
+            specs.append([
+                "vme_tof_corr",
+                "between",
+                [float(electron_muon_tof), float(muon_pion_tof)],
+            ])
+        elif light_pid_mode == "act_tof":
+            lower = electron_muon_tof
+            upper = muon_pion_tof if muon_pion_tof is not None else tof
+            if lower is not None and upper is not None:
+                if float(lower) >= float(upper):
+                    raise RuntimeError(
+                        "The nominal muon TOF bounds are not ordered: "
+                        f"{float(lower):.6g} ns >= {float(upper):.6g} ns"
+                    )
+                specs.append([
+                    "vme_tof_corr",
+                    "between",
+                    [float(lower), float(upper)],
+                ])
+            elif lower is not None:
+                specs.append(["vme_tof_corr", ">", float(lower)])
+            elif upper is not None:
+                specs.append(["vme_tof_corr", "<", float(upper)])
+        elif tof is not None:
             specs.append(["vme_tof_corr", "<", float(tof)])
         if cfg.require_muon_tagger:
             specs.append(["vme_mu_tag_total", ">", float(mu_tag)])
     elif particle == "pion":
-        if cfg.use_act_eveto_cut:
+        if uses_act_identity and cfg.use_act_eveto_cut:
             specs.append(["vme_act_eveto", "<", float(eveto)])
-        if cfg.use_act_tagger_cut:
+        if uses_act_identity and cfg.use_act_tagger_cut:
             specs.append(["vme_act_tagger", "<", float(tagger)])
-        if tof is not None:
+        if light_pid_mode == "tof":
+            if muon_pion_tof is None:
+                raise RuntimeError(
+                    "TOF-only pion PID requires the muon/pion TOF boundary"
+                )
+            if tof is None:
+                raise RuntimeError(
+                    "TOF-only pion PID requires a "
+                    "positive proton_tof_cut. Use WCTE_TOF_CUT_MODE='auto' or "
+                    "'require' with a valid scalar/override, or select "
+                    "LIGHT_PARTICLE_PID_MODE='act'."
+                )
+            specs.append([
+                "vme_tof_corr",
+                "between",
+                [float(muon_pion_tof), float(tof)],
+            ])
+        elif light_pid_mode == "act_tof":
+            if muon_pion_tof is not None and tof is not None:
+                specs.append([
+                    "vme_tof_corr",
+                    "between",
+                    [float(muon_pion_tof), float(tof)],
+                ])
+            elif muon_pion_tof is not None:
+                specs.append(["vme_tof_corr", ">", float(muon_pion_tof)])
+            elif tof is not None:
+                specs.append(["vme_tof_corr", "<", float(tof)])
+        elif tof is not None:
             specs.append(["vme_tof_corr", "<", float(tof)])
     elif particle == "electron":
-        if cfg.use_act_eveto_cut:
+        if uses_act_identity and cfg.use_act_eveto_cut:
             specs.append(["vme_act_eveto", ">", float(eveto)])
         # The nominal example does not use act_tagger for electrons.
-        if tof is not None:
+        if light_pid_mode == "tof":
+            if electron_muon_tof is None:
+                raise RuntimeError(
+                    "TOF-only electron PID requires the electron/muon TOF boundary"
+                )
+            specs.append(["vme_tof_corr", "<", float(electron_muon_tof)])
+        elif light_pid_mode == "act_tof":
+            upper = electron_muon_tof if electron_muon_tof is not None else tof
+            if upper is not None:
+                specs.append(["vme_tof_corr", "<", float(upper)])
+        elif tof is not None:
             specs.append(["vme_tof_corr", "<", float(tof)])
     elif particle == "proton":
         if tof is None:
@@ -1347,6 +1742,9 @@ def load_selected_events(
     particle = _canonical_particle(config.particle)
     mode = _canonical_selection_mode(config.selection_mode)
     tof_mode = _canonical_tof_mode(config.tof_cut_mode)
+    light_pid_mode = _canonical_light_particle_pid_mode(
+        config.light_particle_pid_mode
+    )
     normalised_extra = tuple(
         tuple(_normalise_cut_spec(spec)) for spec in config.extra_selection_cuts
     )
@@ -1355,6 +1753,7 @@ def load_selected_events(
         "particle": particle,
         "selection_mode": mode,
         "tof_cut_mode": tof_mode,
+        "light_particle_pid_mode": light_pid_mode,
         "extra_selection_cuts": normalised_extra,
     })
     DataLoader, BeamSelection, print_thresholds, import_metadata = (
@@ -1384,6 +1783,18 @@ def load_selected_events(
 
     specs = _selection_specs(particle, cuts, cfg)
     selection = _build_selection(BeamSelection, particle, specs)
+
+    unavailable_boundaries = cuts.get(
+        "light_particle_tof_unavailable_boundaries", ()
+    )
+    if cfg.verbose and unavailable_boundaries:
+        joined = ", ".join(str(item) for item in unavailable_boundaries)
+        print(
+            f"WCTE PID fallback: run {cfg.run} has no usable {joined} TOF "
+            "boundary; ACT identity and the remaining valid TOF cuts will be "
+            "used."
+        )
+        print("")
 
     if cfg.verbose and cfg.print_cherenkov_thresholds and run_info_record is not None:
         try:
@@ -1467,6 +1878,12 @@ def load_selected_events(
         "root_file": cfg.root_file,
         "particle": particle,
         "selection_mode": mode,
+        "light_particle_pid_mode": light_pid_mode,
+        "light_particle_pid_mode_applied": (
+            light_pid_mode
+            if mode == "nominal" and particle in _LIGHT_PARTICLES
+            else None
+        ),
         "selection_cut_specs": [list(spec) for spec in specs],
         "selection_cut_branches": [_selection_branch_name(spec[0]) for spec in specs],
         "branches_requested": branches,

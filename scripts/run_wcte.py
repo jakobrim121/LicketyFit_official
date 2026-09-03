@@ -18,13 +18,19 @@ from __future__ import annotations
 EVENT_SOURCE = "selection"
 
 # Collaboration run and optional exact merged-production ROOT override.
-RUN = 2079
+RUN = 1855
 COLLABORATION_ROOT_FILE = ""
 
 # Nominal analysis_tools populations: muon, pion, electron, proton. Kaon
 # requires SELECTION_MODE="custom" and explicit cuts below.
 PARTICLE_SELECTION_LABEL = "muon"
 SELECTION_MODE = "nominal"
+
+# Light-particle PID policy for nominal electron/muon/pion samples:
+# "act_tof" combines the usual ACT identity with run-calibrated TOF boundaries;
+# "tof" uses those TOF boundaries alone; "act" preserves the legacy ACT cuts.
+# Proton selection remains TOF-based and kaons still require custom cuts.
+LIGHT_PARTICLE_PID_MODE = "act_tof"
 
 # Supported fit hypotheses: "muon", "pion", "kaon", or "proton".
 FIT_PARTICLE = "muon"
@@ -41,7 +47,7 @@ INTERACTION_MODE = "full_length"  # "full_length" or "absorption"
 LIKELIHOOD_MODE = "charge_time"
 
 # Beam metadata and optional seed guidance; neither value is event truth.
-BEAM_MOMENTUM_MEV_C = 430.0
+BEAM_MOMENTUM_MEV_C = 780
 EXPECTED_KINETIC_ENERGY_MEV = 300.0
 USE_EXPECTED_ENERGY_SEED_HINT = False
 
@@ -60,7 +66,7 @@ EVENT_START_INDEX = 0
 OUTPUT_FILE = ""
 
 # Number of independent event workers.
-NPROC = 8
+NPROC = 16
 
 
 # --- 2. Physical constraints and models -------------------------------------
@@ -175,6 +181,8 @@ APPLY_T5_EVENT_QUALITY_CUTS = True
 
 USE_ACT_EVETO_CUT = True
 USE_ACT_TAGGER_CUT = True
+# Availability policy for the proton/fast-particle boundary. Light e/mu/pi
+# separation is controlled independently by LIGHT_PARTICLE_PID_MODE above.
 TOF_CUT_MODE = "auto"  # "auto", "require", or "disable"
 PROTON_TOF_WINDOW_NS = 10.0
 REQUIRE_MUON_TAGGER = False
@@ -184,6 +192,8 @@ ACT_EVETO_CUT_OVERRIDE_PE = None
 ACT_TAGGER_CUT_OVERRIDE_PE = None
 PROTON_TOF_CUT_OVERRIDE_NS = None
 MUON_TAG_CUT_OVERRIDE = None
+ELECTRON_MUON_TOF_BOUNDARY_OVERRIDE_NS = None
+MUON_PION_TOF_BOUNDARY_OVERRIDE_NS = None
 
 # --- 5. Real-data preparation and calibration --------------------------------
 

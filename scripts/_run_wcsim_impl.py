@@ -71,7 +71,7 @@ from LicketyFit.run_console import (
 )
 
 
-_PUBLIC_DRIVER_RELEASE = "2026-09-02-v1.44.0-mode-axes"
+_PUBLIC_DRIVER_RELEASE = "2026-09-03-v1.45.1-adaptive-wcte-pid-fallback"
 _RUNTIME_BOOTSTRAP_PROTOCOL = 3
 _MULTIPROCESS_RUNTIME_ENV = {
     "BLIS_NUM_THREADS": "1",
