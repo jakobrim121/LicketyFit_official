@@ -75,6 +75,8 @@ from pathlib import Path
 import signal
 import sys
 
+import numpy as np
+
 _DRIVER_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_DRIVER_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRIVER_PROJECT_ROOT))
@@ -107,6 +109,42 @@ from LicketyFit.absolute_light_calibration import (
     validate_pmt_charge_response_context,
     validate_wcte_runtime_context,
 )
+
+
+def _absorption_fe_payload(result):
+    """Serialize the analytic low-rank absorption FE/GEE continuation."""
+    return {
+        "model": "standard_analytic_fermi_eyges_process",
+        "central_estimator": (
+            "Fisher/GEE update with Poisson plus analytic correlated "
+            "Fermi--Eyges process covariance"
+        ),
+        "initial_values": dict(result.initial_values),
+        "updated_values": result.output_values(),
+        "applied": bool(result.applied),
+        "process_posterior_mean": np.asarray(
+            result.process_posterior_mean
+        ).tolist(),
+        "process_posterior_covariance": np.asarray(
+            result.process_posterior_covariance
+        ).tolist(),
+        "naive_covariance_local": np.asarray(
+            result.naive_covariance_local
+        ).tolist(),
+        "robust_covariance_local": np.asarray(
+            result.robust_covariance_local
+        ).tolist(),
+        "robust_covariance_global": np.asarray(
+            result.robust_covariance_global
+        ).tolist(),
+        "raw_delta_local": np.asarray(result.raw_delta_local).tolist(),
+        "applied_delta_local": np.asarray(
+            result.applied_delta_local
+        ).tolist(),
+        "physical_step_scale": float(result.physical_step_scale),
+        "wall_s": float(result.wall_s),
+        "diagnostics": dict(result.diagnostics),
+    }
 
 
 def _terminate_event_pool(event_pool) -> None:
@@ -4007,13 +4045,16 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
         "MCS_COHERENT_IMPLEMENTATION", "physics_reference"
     ).strip().lower().replace("-", "_")
     if MCS_COHERENT_IMPLEMENTATION not in {
-        "physics_reference", "fast12_profile", "legacy_fisher"
+        "physics_reference", "fast12_profile", "standard_fe_process",
+        "legacy_fisher"
     }:
         raise ValueError(
             "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
-            "fast12_profile, or legacy_fisher"
+            "fast12_profile, standard_fe_process, or legacy_fisher"
         )
-    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION in {
+        "fast12_profile", "standard_fe_process"
+    }
     MCS_PROCESS_GRID_POINTS = _env_int(
         "MCS_PROCESS_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
     )
@@ -4218,6 +4259,7 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
     from LicketyFit.mcs_coherent_fisher import run_coherent_fisher_update
     from LicketyFit.mcs_fast12_continuation import run_fast12_coherent_update
     from LicketyFit.mcs_physics_continuation import run_physics_coherent_update
+    from LicketyFit.mcs_absorption_fe import run_absorption_fermi_eyges_update
     from LicketyFit.fast_track_fit import (
         BlockOptimizerResult,
         ConvexDetectorVolume,
@@ -4333,19 +4375,27 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             MCS_PROCESS_GRID_POINTS,
             MCS_COHERENT_GRID_POINTS,
         )
-    _ABSORPTION_FAST12_COHERENT = bool(
+    _ABSORPTION_STANDARD_FE = bool(
         FIT_MODE == "absorption"
         and USE_COHERENT_FISHER
-        and MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+        and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
     )
+    if (
+        USE_COHERENT_FISHER
+        and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
+        and FIT_MODE != "absorption"
+    ):
+        raise ValueError(
+            "standard_fe_process is defined only for absorption mode"
+        )
     if (
         (USE_FERMI_EYGES or USE_COHERENT_FISHER)
         and FIT_MODE != "full_length"
-        and not _ABSORPTION_FAST12_COHERENT
+        and not _ABSORPTION_STANDARD_FE
     ):
         raise ValueError(
             "Fermi--Eyges reconstruction requires full_length mode, except "
-            "for the absorption-compatible fast12 coherent profile"
+            "for the analytic standard_fe_process absorption continuation"
         )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and LIKELIHOOD_MODE == "timing_only":
         raise ValueError("Fermi--Eyges reconstruction requires a charge-capable fit")
@@ -6893,7 +6943,73 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
 
         if USE_COHERENT_FISHER:
             mcs_status = "attempted"
-            if MCS_COHERENT_IMPLEMENTATION == "physics_reference":
+            if MCS_COHERENT_IMPLEMENTATION == "standard_fe_process":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_absorption_fermi_eyges_update(
+                        EMITTER_TEMPLATE,
+                        values=coherent_input_values,
+                        chart=exact_result.chart,
+                        detector=DETECTOR,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        range_to_energy=RANGE_LOOKUP.range_mm_to_energy,
+                        fixed_params=coherent_fixed_params,
+                        update_indices=(5,),
+                        process_modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                        process_grid_points=MCS_PROCESS_GRID_POINTS,
+                        xyz_step_mm=MCS_FD_XYZ_MM,
+                        direction_step=MCS_FD_DIRECTION,
+                        length_step_mm=MCS_FD_LENGTH_MM,
+                        full_range_step_mm=MCS_FD_LENGTH_MM,
+                        length_limits=length_limits,
+                        full_range_limits=(
+                            1.0,
+                            float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                        ),
+                        charge_floor_pe=float(getattr(
+                            EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4
+                        )),
+                    )
+                )
+                if coherent_result is not None:
+                    coherent_output_values = coherent_result.output_values()
+                    final_values = dict(straight_values)
+                    final_values["visible_length"] = float(
+                        coherent_output_values["visible_length"]
+                    )
+                    final_values["length"] = float(
+                        coherent_output_values["visible_length"]
+                    )
+                    final_values["full_range"] = float(
+                        straight_values["full_range"]
+                    )
+                    final_values.update({
+                        name: coherent_output_values[name]
+                        for name in (
+                            "dir_u", "dir_v", "direction_chart",
+                            "direction_chart_u", "direction_chart_v",
+                            "cx", "cy", "cz", "cz_sign",
+                        )
+                        if name in coherent_output_values
+                    })
+                    errors = dict(straight_errors)
+                    visible_variance = float(
+                        coherent_result.robust_covariance_global[6, 6]
+                    )
+                    if np.isfinite(visible_variance) and visible_variance >= 0.0:
+                        visible_error = float(math.sqrt(visible_variance))
+                        errors["visible_length"] = visible_error
+                        errors["length"] = visible_error
+                    final_fval = straight_fval
+                    fval_definition = (
+                        "accepted straight-track production NLL at "
+                        "straight_fit_values; final geometry is the standard "
+                        "analytic Fermi-Eyges marginal-process GEE estimate"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "physics_reference":
                 coherent_result, mcs_failure = _attempt_coherent_stage(
                     lambda: run_physics_coherent_update(
                     EMITTER_TEMPLATE,
@@ -7231,12 +7347,16 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
             "mcs_process": (
                 None if coherent_result is None
                 else (
-                    physics_profile_payload(coherent_result)
-                    if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                    _absorption_fe_payload(coherent_result)
+                    if MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
                     else (
-                        fast12_profile_payload(coherent_result)
-                        if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
-                        else coherent_fisher_payload(coherent_result)
+                        physics_profile_payload(coherent_result)
+                        if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                        else (
+                            fast12_profile_payload(coherent_result)
+                            if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+                            else coherent_fisher_payload(coherent_result)
+                        )
                     )
                 )
             ),
@@ -7349,6 +7469,43 @@ if _UNIFIED_DATA_SOURCE == "wcsim" and _UNIFIED_FIT_MODE != "cosmic":
                     length_step_mm=MCS_FD_LENGTH_MM,
                     length_limits=track_length_limits(),
                     charge_floor_pe=float(getattr(EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4)),
+                )
+            if (
+                USE_COHERENT_FISHER
+                and FIT_MODE == "absorption"
+                and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
+            ):
+                absorption_values = dict(values)
+                absorption_values["length"] = float(
+                    absorption_values["visible_length"]
+                )
+                _ = run_absorption_fermi_eyges_update(
+                    EMITTER_TEMPLATE,
+                    values=absorption_values,
+                    chart=chart,
+                    detector=DETECTOR,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    range_to_energy=RANGE_LOOKUP.range_mm_to_energy,
+                    fixed_params=FIXED_PARAMS,
+                    update_indices=(5,),
+                    process_modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                    process_grid_points=MCS_PROCESS_GRID_POINTS,
+                    xyz_step_mm=MCS_FD_XYZ_MM,
+                    direction_step=MCS_FD_DIRECTION,
+                    length_step_mm=MCS_FD_LENGTH_MM,
+                    full_range_step_mm=MCS_FD_LENGTH_MM,
+                    length_limits=track_length_limits(),
+                    full_range_limits=(
+                        1.0,
+                        float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                    ),
+                    charge_floor_pe=float(getattr(
+                        EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4
+                    )),
                 )
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)
@@ -24400,13 +24557,16 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
         "MCS_COHERENT_IMPLEMENTATION", "physics_reference"
     ).strip().lower().replace("-", "_")
     if MCS_COHERENT_IMPLEMENTATION not in {
-        "physics_reference", "fast12_profile", "legacy_fisher"
+        "physics_reference", "fast12_profile", "standard_fe_process",
+        "legacy_fisher"
     }:
         raise ValueError(
             "MCS_COHERENT_IMPLEMENTATION must be physics_reference, "
-            "fast12_profile, or legacy_fisher"
+            "fast12_profile, standard_fe_process, or legacy_fisher"
         )
-    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+    _FAST12_NUMERICAL_DEFAULTS = MCS_COHERENT_IMPLEMENTATION in {
+        "fast12_profile", "standard_fe_process"
+    }
     MCS_PROCESS_GRID_POINTS = _env_int(
         "MCS_PROCESS_GRID_POINTS", 41 if _FAST12_NUMERICAL_DEFAULTS else 241
     )
@@ -24614,6 +24774,7 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
     from LicketyFit.mcs_coherent_fisher import run_coherent_fisher_update
     from LicketyFit.mcs_fast12_continuation import run_fast12_coherent_update
     from LicketyFit.mcs_physics_continuation import run_physics_coherent_update
+    from LicketyFit.mcs_absorption_fe import run_absorption_fermi_eyges_update
     from LicketyFit.fast_track_fit import (
         BlockOptimizerResult,
         ConvexDetectorVolume,
@@ -24805,19 +24966,27 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             MCS_PROCESS_GRID_POINTS,
             MCS_COHERENT_GRID_POINTS,
         )
-    _ABSORPTION_FAST12_COHERENT = bool(
+    _ABSORPTION_STANDARD_FE = bool(
         FIT_MODE == "absorption"
         and USE_COHERENT_FISHER
-        and MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+        and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
     )
+    if (
+        USE_COHERENT_FISHER
+        and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
+        and FIT_MODE != "absorption"
+    ):
+        raise ValueError(
+            "standard_fe_process is defined only for absorption mode"
+        )
     if (
         (USE_FERMI_EYGES or USE_COHERENT_FISHER)
         and FIT_MODE != "full_length"
-        and not _ABSORPTION_FAST12_COHERENT
+        and not _ABSORPTION_STANDARD_FE
     ):
         raise ValueError(
             "Fermi--Eyges reconstruction requires full_length mode, except "
-            "for the absorption-compatible fast12 coherent profile"
+            "for the analytic standard_fe_process absorption continuation"
         )
     if (USE_FERMI_EYGES or USE_COHERENT_FISHER) and LIKELIHOOD_MODE == "timing_only":
         raise ValueError("Fermi--Eyges reconstruction requires a charge-capable fit")
@@ -27737,7 +27906,74 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
 
         if USE_COHERENT_FISHER:
             mcs_status = "attempted"
-            if MCS_COHERENT_IMPLEMENTATION == "physics_reference":
+            if MCS_COHERENT_IMPLEMENTATION == "standard_fe_process":
+                coherent_result, mcs_failure = _attempt_coherent_stage(
+                    lambda: run_absorption_fermi_eyges_update(
+                        EMITTER_TEMPLATE,
+                        values=coherent_input_values,
+                        chart=exact_result.chart,
+                        detector=DETECTOR,
+                        wcd=WCD,
+                        pmt_model=PMT_MODEL,
+                        p_locations=P_LOCATIONS,
+                        pmt_normals=PMT_NORMALS,
+                        obs_pes=obs_pes,
+                        range_to_energy=RANGE_LOOKUP.range_mm_to_energy,
+                        mpmt_types=MPMT_TYPE_CODES,
+                        fixed_params=coherent_fixed_params,
+                        update_indices=(5,),
+                        process_modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                        process_grid_points=MCS_PROCESS_GRID_POINTS,
+                        xyz_step_mm=MCS_FD_XYZ_MM,
+                        direction_step=MCS_FD_DIRECTION,
+                        length_step_mm=MCS_FD_LENGTH_MM,
+                        full_range_step_mm=MCS_FD_LENGTH_MM,
+                        length_limits=length_limits,
+                        full_range_limits=(
+                            1.0,
+                            float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                        ),
+                        charge_floor_pe=float(getattr(
+                            EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4
+                        )),
+                    )
+                )
+                if coherent_result is not None:
+                    coherent_output_values = coherent_result.output_values()
+                    final_values = dict(straight_values)
+                    final_values["visible_length"] = float(
+                        coherent_output_values["visible_length"]
+                    )
+                    final_values["length"] = float(
+                        coherent_output_values["visible_length"]
+                    )
+                    final_values["full_range"] = float(
+                        straight_values["full_range"]
+                    )
+                    final_values.update({
+                        name: coherent_output_values[name]
+                        for name in (
+                            "dir_u", "dir_v", "direction_chart",
+                            "direction_chart_u", "direction_chart_v",
+                            "cx", "cy", "cz", "cz_sign",
+                        )
+                        if name in coherent_output_values
+                    })
+                    errors = dict(straight_errors)
+                    visible_variance = float(
+                        coherent_result.robust_covariance_global[6, 6]
+                    )
+                    if np.isfinite(visible_variance) and visible_variance >= 0.0:
+                        visible_error = float(math.sqrt(visible_variance))
+                        errors["visible_length"] = visible_error
+                        errors["length"] = visible_error
+                    final_fval = straight_fval
+                    fval_definition = (
+                        "accepted straight-track production NLL at "
+                        "straight_fit_values; final geometry is the standard "
+                        "analytic Fermi-Eyges marginal-process GEE estimate"
+                    )
+            elif MCS_COHERENT_IMPLEMENTATION == "physics_reference":
                 coherent_result, mcs_failure = _attempt_coherent_stage(
                     lambda: run_physics_coherent_update(
                     EMITTER_TEMPLATE,
@@ -28078,12 +28314,16 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
             "mcs_process": (
                 None if coherent_result is None
                 else (
-                    physics_profile_payload(coherent_result)
-                    if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                    _absorption_fe_payload(coherent_result)
+                    if MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
                     else (
-                        fast12_profile_payload(coherent_result)
-                        if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
-                        else coherent_fisher_payload(coherent_result)
+                        physics_profile_payload(coherent_result)
+                        if MCS_COHERENT_IMPLEMENTATION == "physics_reference"
+                        else (
+                            fast12_profile_payload(coherent_result)
+                            if MCS_COHERENT_IMPLEMENTATION == "fast12_profile"
+                            else coherent_fisher_payload(coherent_result)
+                        )
                     )
                 )
             ),
@@ -28440,6 +28680,44 @@ elif _UNIFIED_DATA_SOURCE == "wcte" and _UNIFIED_FIT_MODE != "cosmic":
                     length_step_mm=MCS_FD_LENGTH_MM,
                     length_limits=track_length_limits(),
                     charge_floor_pe=float(getattr(EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4)),
+                )
+            if (
+                USE_COHERENT_FISHER
+                and FIT_MODE == "absorption"
+                and MCS_COHERENT_IMPLEMENTATION == "standard_fe_process"
+            ):
+                absorption_values = dict(values)
+                absorption_values["length"] = float(
+                    absorption_values["visible_length"]
+                )
+                _ = run_absorption_fermi_eyges_update(
+                    EMITTER_TEMPLATE,
+                    values=absorption_values,
+                    chart=chart,
+                    detector=DETECTOR,
+                    wcd=WCD,
+                    pmt_model=PMT_MODEL,
+                    p_locations=P_LOCATIONS,
+                    pmt_normals=PMT_NORMALS,
+                    obs_pes=obs_pes,
+                    range_to_energy=RANGE_LOOKUP.range_mm_to_energy,
+                    mpmt_types=MPMT_TYPE_CODES,
+                    fixed_params=FIXED_PARAMS,
+                    update_indices=(5,),
+                    process_modes_per_plane=MCS_PROCESS_MODES_PER_PLANE,
+                    process_grid_points=MCS_PROCESS_GRID_POINTS,
+                    xyz_step_mm=MCS_FD_XYZ_MM,
+                    direction_step=MCS_FD_DIRECTION,
+                    length_step_mm=MCS_FD_LENGTH_MM,
+                    full_range_step_mm=MCS_FD_LENGTH_MM,
+                    length_limits=track_length_limits(),
+                    full_range_limits=(
+                        1.0,
+                        float(RANGE_LOOKUP.overall_distances_mm[-1]),
+                    ),
+                    charge_floor_pe=float(getattr(
+                        EMITTER_TEMPLATE, "charge_floor_pe", 1.0e-4
+                    )),
                 )
             if USE_COHERENT_FISHER and FIT_MODE == "full_length":
                 coherent_values = dict(values)

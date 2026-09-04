@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .mcs_configuration import normalize_coherent_implementation
+from .mcs_configuration import (
+    STANDARD_FE_PROCESS,
+    normalize_coherent_implementation,
+)
 
 
 # Public reconstruction vocabulary.  Seeding coverage and endpoint physics are
@@ -266,8 +269,10 @@ def resolve_reconstruction_configuration(
     )
     coherent_requested = _canonical(coherent_mcs_implementation)
     coherent = (
-        "physics_reference"
-        if (seeding, interaction) == ("beam", "full_length")
+        STANDARD_FE_PROCESS
+        if interaction == "absorption"
+        else "physics_reference"
+        if seeding == "beam"
         else "fast12_profile"
     ) if coherent_requested == "auto" else normalize_coherent_implementation(
         coherent_requested
@@ -325,13 +330,22 @@ def resolve_reconstruction_configuration(
                 "INTERACTION_MODE='full_length'"
             )
         if primary == "coherent_fisher" and (
-            interaction == "absorption" and coherent != "fast12_profile"
+            interaction == "absorption" and coherent != STANDARD_FE_PROCESS
         ):
             raise ValueError(
                 "Coherent primary MCS in INTERACTION_MODE='absorption' requires "
-                "COHERENT_MCS_IMPLEMENTATION='fast12_profile'; the physics "
-                "reference and legacy Fisher continuations assume a threshold "
-                "endpoint"
+                "COHERENT_MCS_IMPLEMENTATION='standard_fe_process'. This is the "
+                "analytic abrupt-endpoint Fermi--Eyges process continuation; "
+                "the other coherent continuations have different endpoint or "
+                "inference semantics."
+            )
+        if primary == "coherent_fisher" and (
+            interaction == "full_length" and coherent == STANDARD_FE_PROCESS
+        ):
+            raise ValueError(
+                "COHERENT_MCS_IMPLEMENTATION='standard_fe_process' is the "
+                "abrupt-endpoint absorption continuation and cannot be used "
+                "with INTERACTION_MODE='full_length'"
             )
         if likelihood == "timing_only" and primary in {
             "coherent_fisher",

@@ -83,9 +83,10 @@ ENABLE_PHOTON_SCATTERING = True
 
 # Standard-engine primary-MCS model: "coherent_fisher",
 # "fermi_eyges_process", or "legacy".  The coherent implementation can be
-# "auto", "physics_reference", "fast12_profile", or "legacy_fisher".  Auto
-# selects physics_reference for beam+full_length and fast12_profile for either
-# absorption combination. Both selectors are inactive only in
+# "auto", "physics_reference", "fast12_profile", "standard_fe_process", or
+# "legacy_fisher". Auto selects physics_reference for beam+full_length and the
+# standard analytic FE process for either absorption combination. Both
+# selectors are inactive only in
 # general+full_length; its scattering is selected independently below.
 PRIMARY_MCS_MODEL = "coherent_fisher"
 COHERENT_MCS_IMPLEMENTATION = "auto"

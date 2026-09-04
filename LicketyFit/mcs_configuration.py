@@ -9,23 +9,33 @@ from __future__ import annotations
 
 PHYSICS_REFERENCE = "physics_reference"
 FAST12_PROFILE = "fast12_profile"
+STANDARD_FE_PROCESS = "standard_fe_process"
 LEGACY_FISHER = "legacy_fisher"
 COHERENT_IMPLEMENTATIONS = (
     PHYSICS_REFERENCE,
     FAST12_PROFILE,
+    STANDARD_FE_PROCESS,
     LEGACY_FISHER,
 )
 
 _MODES_PER_PLANE = {
     PHYSICS_REFERENCE: 12,
     FAST12_PROFILE: 12,
+    STANDARD_FE_PROCESS: 12,
     LEGACY_FISHER: 4,
+}
+
+_IMPLEMENTATION_ALIASES = {
+    "standard_fe": STANDARD_FE_PROCESS,
+    "absorption_fe": STANDARD_FE_PROCESS,
+    "analytic_fe_process": STANDARD_FE_PROCESS,
 }
 
 
 def normalize_coherent_implementation(implementation: str) -> str:
     """Return a canonical implementation name or reject it explicitly."""
     name = str(implementation).strip().lower().replace("-", "_")
+    name = _IMPLEMENTATION_ALIASES.get(name, name)
     if name not in COHERENT_IMPLEMENTATIONS:
         choices = ", ".join(COHERENT_IMPLEMENTATIONS)
         raise ValueError(
@@ -81,6 +91,10 @@ def validate_coherent_configuration(
             "241 points; coarser grids do not meet the validated optical-field "
             "convergence criterion"
         )
+    if name == STANDARD_FE_PROCESS and process_grid != 41:
+        raise ValueError(
+            "standard_fe_process requires the validated 41-point analytic FE grid"
+        )
     return name
 
 
@@ -96,6 +110,8 @@ def coherent_warmup_action(implementation: str) -> str:
         return "defer_physics_reference"
     if name == FAST12_PROFILE:
         return FAST12_PROFILE
+    if name == STANDARD_FE_PROCESS:
+        return STANDARD_FE_PROCESS
     if name == LEGACY_FISHER:
         return LEGACY_FISHER
     raise AssertionError(f"unreachable coherent implementation {name!r}")

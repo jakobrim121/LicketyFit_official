@@ -18,7 +18,7 @@ from __future__ import annotations
 EVENT_SOURCE = "selection"
 
 # Collaboration run and optional exact merged-production ROOT override.
-RUN = 1855
+RUN = 2079
 COLLABORATION_ROOT_FILE = ""
 
 # Nominal analysis_tools populations: muon, pion, electron, proton. Kaon
@@ -27,8 +27,10 @@ PARTICLE_SELECTION_LABEL = "muon"
 SELECTION_MODE = "nominal"
 
 # Light-particle PID policy for nominal electron/muon/pion samples:
-# "act_tof" combines the usual ACT identity with run-calibrated TOF boundaries;
-# "tof" uses those TOF boundaries alone; "act" preserves the legacy ACT cuts.
+# "act_tof" combines the usual ACT identity with every physically usable
+# run-calibrated TOF boundary. If one is unavailable, it keeps ACT plus the
+# remaining valid TOF cuts and records the fallback. "tof" is strict because
+# it has no ACT fallback; "act" preserves the legacy ACT cuts.
 # Proton selection remains TOF-based and kaons still require custom cuts.
 LIGHT_PARTICLE_PID_MODE = "act_tof"
 
@@ -47,7 +49,7 @@ INTERACTION_MODE = "full_length"  # "full_length" or "absorption"
 LIKELIHOOD_MODE = "charge_time"
 
 # Beam metadata and optional seed guidance; neither value is event truth.
-BEAM_MOMENTUM_MEV_C = 780
+BEAM_MOMENTUM_MEV_C = 430.0
 EXPECTED_KINETIC_ENERGY_MEV = 300.0
 USE_EXPECTED_ENERGY_SEED_HINT = False
 
@@ -66,7 +68,7 @@ EVENT_START_INDEX = 0
 OUTPUT_FILE = ""
 
 # Number of independent event workers.
-NPROC = 16
+NPROC = 8
 
 
 # --- 2. Physical constraints and models -------------------------------------
@@ -101,9 +103,10 @@ ENABLE_PHOTON_SCATTERING = True
 
 # Standard-engine primary-MCS model: "coherent_fisher",
 # "fermi_eyges_process", or "legacy".  The coherent implementation can be
-# "auto", "physics_reference", "fast12_profile", or "legacy_fisher".  Auto
-# selects physics_reference for beam+full_length and fast12_profile for either
-# absorption combination. Both selectors are inactive only in
+# "auto", "physics_reference", "fast12_profile", "standard_fe_process", or
+# "legacy_fisher". Auto selects physics_reference for beam+full_length and the
+# standard analytic FE process for either absorption combination. Both
+# selectors are inactive only in
 # general+full_length; its scattering is selected independently below.
 PRIMARY_MCS_MODEL = "coherent_fisher"
 COHERENT_MCS_IMPLEMENTATION = "auto"

@@ -1,5 +1,5 @@
 {
-  "calibration_id": "sha256:0f54a914fde431ca9bf0c2554490121cafdb022ba2ade83dabc1953a50dd34fa",
+  "calibration_id": "sha256:50485a3a547ffe31fd0a9d817ad8dd72910f12a202628f9f11a053feba5f3fc1",
   "calibration_provenance_files_sha256": {
     "analysis/calibrate_muon_absolute_light.py": "8ce4ea71dcddc472d2e13b9b52f70e930d31c2653ccb203f181df9417179542b",
     "analysis/wcsim_pe_yield_truth.py": "93ebe5bd7bd95861aea5aac7d6aa5cd71ead8ea0c097efb8de6357514db13138"
@@ -66,7 +66,7 @@
     "LicketyFit/PMT.py": "60b04bfef2c6380c315be5d76cd59a01454694c258a527f730cacbdf7d14ef03",
     "LicketyFit/absolute_light_calibration.py": "9d4a3406801e608d7e27f271c31c590c2ca670d4d70eb7b1328993a2719a1cc4",
     "LicketyFit/wcsim_charge_response.py": "438b6da2dedc48a4caee3e7272a1d4c8390a6d8a36a67d8bc93fb708d0dde9bd",
-    "scripts/batch_fit_driver.py": "97cc1ea09ddd0645794c4c4a3d98fea05384b4760be548b272701e08042096a4",
+    "scripts/batch_fit_driver.py": "9de59ffb7f21fe14e32b1ffc9b0bf6e654cd6bfed1cc3b78eb181fab396de2e3",
     "scripts/particle_range_lookup.py": "af2dae14d1de11fc08386f91cb8fa52995ab0a9b614d0a8da4329aa28fd88c83",
     "tables/E_vs_dist_cm_muon.npy": "28f39059a7bb1f0d62b45c2cd7850c055950dd8fe5674d70dbe2dbde608fa58d",
     "tables/overall_distances_cm_muon.npy": "7f6d578fdd411a6f7260ae2767e18947b89ff5db18c0abe2d77f2ec37290ffa7"
@@ -126,6 +126,14 @@
       "new_sha256": "97cc1ea09ddd0645794c4c4a3d98fea05384b4760be548b272701e08042096a4",
       "old_sha256": "5d486a2b01c56c30f28f9ca42ba5bc403ab3a084592c0f1413fa12ad6eab55a2",
       "reason": "WCTE-input-selection and warm-up-orchestration-only rebind: v1.45.1 degrades safely when an adjacent run TOF boundary is unavailable and aligns deferred coherent warm-up handling across engine variants. WCSim event input and all per-event photon predictions, detector response, likelihood equations, optimizer steps, stopping criteria, and the frozen absolute-light scale are unchanged.",
+      "scale_or_prediction_changed": false
+    },
+    {
+      "date": "2026-09-04",
+      "file": "scripts/batch_fit_driver.py",
+      "new_sha256": "9de59ffb7f21fe14e32b1ffc9b0bf6e654cd6bfed1cc3b78eb181fab396de2e3",
+      "old_sha256": "97cc1ea09ddd0645794c4c4a3d98fea05384b4760be548b272701e08042096a4",
+      "reason": "Absorption-model-only rebind: adds the analytic standard Fermi--Eyges visible-endpoint continuation and routes absorption-plus-MCS fits to it. The calibrated straight-track photon prediction, detector response, likelihood, and frozen absolute-light scale are unchanged; full-length fits are unchanged.",
       "scale_or_prediction_changed": false
     }
   ],
