@@ -50,6 +50,7 @@ GLOBAL_NAMES = (
 DEFAULT_FINITE_DIFFERENCE_STEPS = (
     1.0, 1.0, 1.0, 2.0e-4, 2.0e-4, 1.0, 1.0
 )
+DEFAULT_ENDPOINT_TOLERANCE_MM = 1.0e-9
 
 
 @dataclass
@@ -75,8 +76,21 @@ class AbsorptionFEProcessResult:
         values = attach_direction_components(
             self.updated_values, chart=self.updated_chart
         )
-        values["visible_length"] = float(values["length"])
-        values["full_range"] = float(values["full_range"])
+        length = float(values["length"])
+        full_range = float(values["full_range"])
+        endpoint_excess = length - full_range
+        if endpoint_excess > DEFAULT_ENDPOINT_TOLERANCE_MM:
+            raise RuntimeError(
+                "absorption FE output exceeds its conditioned full range"
+            )
+        # The FE physical-domain search deliberately admits round-off at the
+        # active length <= full_range boundary.  The production likelihood is
+        # strict, so never leak that tolerance into a serialized fit point.
+        if endpoint_excess > 0.0:
+            length = full_range
+            values["length"] = length
+        values["visible_length"] = length
+        values["full_range"] = full_range
         return values
 
 
@@ -116,6 +130,36 @@ def _values_from_vector(
     return out
 
 
+def _canonicalize_endpoint(
+    values: Mapping[str, object],
+    *,
+    tolerance_mm: float = DEFAULT_ENDPOINT_TOLERANCE_MM,
+) -> tuple[dict[str, float], float]:
+    """Project only round-off-sized endpoint excess back onto the boundary.
+
+    The physical line search may use a small tolerance to distinguish a real
+    domain violation from floating-point noise.  Downstream production
+    objectives use the exact constraint ``visible_length <= full_range``.
+    Canonicalizing here keeps both contracts consistent without clipping a
+    physically meaningful proposal.
+    """
+    state = _canonical_values(values)
+    tolerance = float(tolerance_mm)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("endpoint tolerance must be finite and non-negative")
+    excess = float(state["length"] - state["full_range"])
+    if excess <= 0.0:
+        return state, 0.0
+    if excess > tolerance:
+        raise ValueError(
+            "absorption visible length exceeds full range by more than the "
+            "endpoint tolerance"
+        )
+    state["length"] = float(state["full_range"])
+    state["visible_length"] = float(state["full_range"])
+    return state, excess
+
+
 def _physical_state(
     values: Mapping[str, object],
     *,
@@ -124,7 +168,7 @@ def _physical_state(
     length_limits: tuple[float, float],
     full_range_limits: tuple[float, float] | None,
     max_tangent_radius: float = 2.0,
-    endpoint_tolerance_mm: float = 1.0e-9,
+    endpoint_tolerance_mm: float = DEFAULT_ENDPOINT_TOLERANCE_MM,
 ) -> bool:
     """Check the coupled absorption and detector domain without clipping."""
     try:
@@ -669,12 +713,23 @@ def run_absorption_fermi_eyges_update(
         maximum_backtracks=maximum_backtracks,
     )
     prediction_count += int(trust_predictions)
-    applied_delta = accepted_scale * raw_delta
-    updated_before_reanchor = _values_from_vector(
-        initial, center + applied_delta
+    proposed_applied_delta = accepted_scale * raw_delta
+    proposed_before_reanchor = _values_from_vector(
+        initial, center + proposed_applied_delta
     )
+    updated_before_reanchor, endpoint_canonicalization_mm = (
+        _canonicalize_endpoint(proposed_before_reanchor)
+    )
+    # This is the central update actually returned to production.  It can be
+    # exactly zero when an outward proposal meets an already-active endpoint
+    # constraint; the FE process covariance is still valid and retained.
+    applied_delta = _local_vector(updated_before_reanchor) - center
+    central_update_applied = bool(np.any(applied_delta != 0.0))
+    effective_step_scale = float(accepted_scale if central_update_applied else 0.0)
     updated, updated_chart = reanchor_values(updated_before_reanchor, chart)
     updated = _canonical_values(updated)
+    if float(updated["length"]) > float(updated["full_range"]):
+        raise RuntimeError("canonical absorption FE endpoint is outside the fit domain")
 
     naive = np.full((len(LOCAL_NAMES), len(LOCAL_NAMES)), np.nan, dtype=np.float64)
     robust = np.full_like(naive, np.nan)
@@ -697,10 +752,45 @@ def run_absorption_fermi_eyges_update(
 
     score = np.asarray(gee["score_block"], dtype=np.float64)
     information = np.asarray(gee["information_block"], dtype=np.float64)
-    block_raw = np.asarray(
-        [raw_delta[index] for index in free_indices], dtype=np.float64
+    applied_block = np.asarray(
+        [applied_delta[index] for index in free_indices], dtype=np.float64
     )
-    score_after = score - information @ (accepted_scale * block_raw)
+    score_after = score - information @ applied_block
+    effective_quadratic_improvement = float(
+        score @ applied_block - 0.5 * applied_block @ information @ applied_block
+    )
+    trust = dict(trust)
+    trust["accepted_scale_before_endpoint_canonicalization"] = float(
+        accepted_scale
+    )
+    trust["endpoint_canonicalized"] = bool(endpoint_canonicalization_mm > 0.0)
+    trust["endpoint_canonicalization_mm"] = float(
+        endpoint_canonicalization_mm
+    )
+    trust["central_update_applied"] = bool(central_update_applied)
+    if endpoint_canonicalization_mm > 0.0 and not central_update_applied:
+        trust["accepted_before_endpoint_canonicalization"] = bool(
+            trust.get("accepted", False)
+        )
+        trust["accepted"] = False
+        trust["accepted_scale"] = 0.0
+        trust["accepted_actual_improvement"] = 0.0
+        trust["accepted_predicted_improvement"] = 0.0
+        trust["accepted_actual_to_predicted_ratio"] = math.nan
+        trust["rejection_reason"] = (
+            "outward endpoint proposal canonicalized to the active "
+            "visible_length=full_range constraint"
+        )
+    if endpoint_canonicalization_mm > 0.0:
+        central_update_status = (
+            "updated_with_endpoint_canonicalization"
+            if central_update_applied
+            else "constrained_at_full_range"
+        )
+    elif central_update_applied:
+        central_update_status = "updated"
+    else:
+        central_update_status = "no_trusted_update"
     diagnostics: dict[str, object] = {
         "implementation": "standard_analytic_fermi_eyges_process_v1",
         "inference": "poisson_working_covariance_fisher_GEE",
@@ -721,13 +811,18 @@ def run_absorption_fermi_eyges_update(
         "process_response_frobenius_norm": float(np.linalg.norm(process_jacobian)),
         "working_score_norm_before": float(np.linalg.norm(score)),
         "working_score_norm_after_linear_step": float(np.linalg.norm(score_after)),
-        "working_quadratic_improvement": float(
-            trust["accepted_predicted_improvement"]
-        ),
+        "working_quadratic_improvement": effective_quadratic_improvement,
         "information_condition_raw": float(gee["information_condition_raw"]),
         "information_condition_scaled": float(gee["information_condition_scaled"]),
         "physical_domain_step_scale": float(physical_domain_scale),
-        "physical_step_scale": float(accepted_scale),
+        "physical_step_scale": effective_step_scale,
+        "trusted_step_scale_before_endpoint_canonicalization": float(
+            accepted_scale
+        ),
+        "endpoint_canonicalized": bool(endpoint_canonicalization_mm > 0.0),
+        "endpoint_canonicalization_mm": float(endpoint_canonicalization_mm),
+        "central_update_applied": bool(central_update_applied),
+        "central_update_status": central_update_status,
         "linearization_trust": trust,
         "uses_event_truth": False,
         "uses_random_sampling": False,
@@ -748,7 +843,7 @@ def run_absorption_fermi_eyges_update(
         robust_covariance_global=np.asarray(robust_global, dtype=np.float64),
         raw_delta_local=raw_delta,
         applied_delta_local=applied_delta,
-        physical_step_scale=float(accepted_scale),
+        physical_step_scale=effective_step_scale,
         wall_s=float(time.perf_counter() - wall0),
         diagnostics=diagnostics,
         applied=True,

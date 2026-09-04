@@ -61,7 +61,7 @@ from LicketyFit.run_console import (
 )
 
 
-_PUBLIC_DRIVER_RELEASE = "2026-09-03-v1.45.1-adaptive-wcte-pid-fallback"
+_PUBLIC_DRIVER_RELEASE = "2026-09-04-v1.45.2-absorption-endpoint-fix"
 _DEDICATED_RECONSTRUCTION_ENV = {
     "FIT_MODE",
     "LF_SEEDING_MODE",
