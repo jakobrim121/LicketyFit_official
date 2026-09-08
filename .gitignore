@@ -6,3 +6,43 @@
 /work_dir/
 
 /outputs/
+
+# BEGIN LicketyFit generated artifacts
+# Python and Numba caches; retain the Python/C++ sources
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+.native_cache/
+.cache/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Configuration-dependent caches and their temporary files
+*_track_proxy_*.npz*
+wcte_reflection_transfer_*.npz*
+wcsim-r14374-exact-*.npz*
+.wcsim-r14374-exact-*.npz*
+wcsim-r14374-exact-*.lock
+
+# Ignore new delta-cache variants, but keep the four shipped tables below
+refined_analytic_delta_table_*.npz*
+
+# Generated data/results belong in these working directories
+/work_dir/
+/outputs/
+/data/
+/WCSim_work_dir/
+estimates_*.dict
+*.dict.parts.*/
+*.log
+/event_display/Event_display_*.png
+.DS_Store
+
+# Portable physics tables remain versioned
+!/tables/refined_analytic_delta_table_kaon_n1p344_m493p677_v1.npz
+!/tables/refined_analytic_delta_table_muon_n1p344_m105p658376_v1.npz
+!/tables/refined_analytic_delta_table_pion_n1p344_m139p57039_v1.npz
+!/tables/refined_analytic_delta_table_proton_n1p344_m938p272088_v1.npz
+# END LicketyFit generated artifacts
