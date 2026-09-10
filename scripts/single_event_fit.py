@@ -522,19 +522,29 @@ class FitResult:
         return np.isfinite(self.observed_time_ns) & np.isfinite(self.expected_time_ns)
 
     def summary(self) -> dict[str, Any]:
-        """Return the intentionally small interactive fit summary."""
-        return dict(self.fit_statistics)
+        """Return the five diagnostics shown in the interactive fit summary.
+
+        The complete diagnostics remain available in ``fit_statistics``.
+        """
+        names = (
+            "minimum_valid", "fval", "fit_wall_s",
+            "n_active_pmts", "n_observed_pmts",
+        )
+        return {name: self.fit_statistics.get(name, math.nan) for name in names}
 
     def parameter_table(self):
-        """Return a pandas table of estimates and reported uncertainties."""
+        """Return physical track estimates and their reported uncertainties.
+
+        Direction is displayed as ``cx`` and ``cy``. Internal direction-chart
+        coordinates and topology diagnostics remain in ``estimates``.
+        """
         import pandas as pd
 
         preferred = (
-            "x0", "y0", "z0", "cx", "cy", "cz", "length",
-            "visible_length", "full_range", "t0", "track_topology",
+            "x0", "y0", "z0", "cx", "cy", "length",
+            "visible_length", "full_range", "initial_kinetic_energy_mev", "t0",
         )
         names = [name for name in preferred if name in self.estimates]
-        names.extend(name for name in self.estimates if name not in names and name in self.errors)
         rows = []
         for name in names:
             value = self.estimates[name]
@@ -2038,7 +2048,11 @@ def runtime_cache_report() -> dict[str, Any]:
 
 
 def summarize_fit(result: FitResult):
-    """Display a compact statistics table and return it as a pandas Series."""
+    """Display five fit diagnostics and the physical track parameter table.
+
+    Return the diagnostics as a pandas Series. Full details remain available
+    through ``result.fit_statistics``, ``result.estimates`` and ``result.errors``.
+    """
     if not isinstance(result, FitResult):
         raise TypeError("result must be a FitResult")
     import pandas as pd
